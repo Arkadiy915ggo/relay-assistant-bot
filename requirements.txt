@@ -1,0 +1,5 @@
+aiogram>=3.10,<4
+aiosqlite>=0.20,<1
+httpx>=0.27,<1
+openai>=1.40,<2
+python-dotenv>=1.0,<2
