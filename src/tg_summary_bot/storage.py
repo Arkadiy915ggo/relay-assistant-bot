@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -21,10 +22,15 @@ class StoredMessage:
 class MessageStore:
     def __init__(self, database_path: Path) -> None:
         self.database_path = database_path
+        self._write_lock = asyncio.Lock()
+
+    async def _prepare_connection(self, db: aiosqlite.Connection) -> None:
+        await db.execute("PRAGMA busy_timeout=10000")
 
     async def init(self) -> None:
         self.database_path.parent.mkdir(parents=True, exist_ok=True)
         async with aiosqlite.connect(self.database_path) as db:
+            await self._prepare_connection(db)
             await db.execute("PRAGMA journal_mode=WAL")
             await db.execute(
                 """
@@ -65,26 +71,28 @@ class MessageStore:
             created_at = created_at.replace(tzinfo=timezone.utc)
         created_at_iso = created_at.astimezone(timezone.utc).isoformat()
 
-        async with aiosqlite.connect(self.database_path) as db:
-            await db.execute(
-                """
-                INSERT OR IGNORE INTO messages (
-                    chat_id, message_id, chat_type, sender_id, sender_name,
-                    text, created_at, reply_to_message_id
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    chat_id,
-                    message_id,
-                    chat_type,
-                    sender_id,
-                    sender_name,
-                    text,
-                    created_at_iso,
-                    reply_to_message_id,
-                ),
-            )
-            await db.commit()
+        async with self._write_lock:
+            async with aiosqlite.connect(self.database_path) as db:
+                await self._prepare_connection(db)
+                await db.execute(
+                    """
+                    INSERT OR IGNORE INTO messages (
+                        chat_id, message_id, chat_type, sender_id, sender_name,
+                        text, created_at, reply_to_message_id
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        chat_id,
+                        message_id,
+                        chat_type,
+                        sender_id,
+                        sender_name,
+                        text,
+                        created_at_iso,
+                        reply_to_message_id,
+                    ),
+                )
+                await db.commit()
 
     async def get_messages_since(
         self,
@@ -100,10 +108,18 @@ class MessageStore:
         messages: list[StoredMessage] = []
         total_chars = 0
         async with aiosqlite.connect(self.database_path) as db:
+            await self._prepare_connection(db)
             db.row_factory = aiosqlite.Row
             cursor = await db.execute(
                 """
-                SELECT message_id, chat_id, chat_type, sender_name, text, created_at, reply_to_message_id
+                SELECT
+                    message_id,
+                    chat_id,
+                    chat_type,
+                    sender_name,
+                    text,
+                    created_at,
+                    reply_to_message_id
                 FROM messages
                 WHERE chat_id = ? AND created_at >= ?
                 ORDER BY created_at ASC, message_id ASC
@@ -131,7 +147,11 @@ class MessageStore:
 
     async def count_messages(self, chat_id: int) -> int:
         async with aiosqlite.connect(self.database_path) as db:
-            cursor = await db.execute("SELECT COUNT(*) FROM messages WHERE chat_id = ?", (chat_id,))
+            await self._prepare_connection(db)
+            cursor = await db.execute(
+                "SELECT COUNT(*) FROM messages WHERE chat_id = ?",
+                (chat_id,),
+            )
             row = await cursor.fetchone()
             await cursor.close()
         return int(row[0]) if row else 0

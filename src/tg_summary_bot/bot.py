@@ -362,7 +362,11 @@ async def main() -> None:
     dp = await create_dispatcher(settings, store, summarizer)
 
     logging.info("Bot started with LLM provider: %s", settings.resolved_llm_provider)
-    await dp.start_polling(bot, allowed_updates=["message", "channel_post"])
+    await dp.start_polling(
+        bot,
+        allowed_updates=["message", "channel_post"],
+        handle_as_tasks=False,
+    )
 
 
 if __name__ == "__main__":
