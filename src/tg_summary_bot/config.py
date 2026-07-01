@@ -36,6 +36,7 @@ class Settings:
     compare_models: list[str]
     database_path: Path
     log_file: Path
+    response_log_file: Path
     max_message_chars: int
     max_summary_input_chars: int
     chunk_chars: int
@@ -74,6 +75,7 @@ def load_settings() -> Settings:
         compare_models=_csv_strings(os.getenv("COMPARE_MODELS", "")),
         database_path=Path(os.getenv("DATABASE_PATH", "data/messages.sqlite3")),
         log_file=Path(os.getenv("LOG_FILE", "data/bot.log")),
+        response_log_file=Path(os.getenv("RESPONSE_LOG_FILE", "data/responses.log")),
         max_message_chars=int(os.getenv("MAX_MESSAGE_CHARS", "4000")),
         max_summary_input_chars=int(os.getenv("MAX_SUMMARY_INPUT_CHARS", "120000")),
         chunk_chars=int(os.getenv("CHUNK_CHARS", "18000")),
