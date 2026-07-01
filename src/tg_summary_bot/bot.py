@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import html
 import json
 import logging
+import re
 import time
 from datetime import datetime, timezone
 from logging.handlers import RotatingFileHandler
@@ -19,6 +21,13 @@ from tg_summary_bot.summarizer import Summarizer
 
 
 RESPONSE_LOGGER_NAME = "tg_summary_bot.responses"
+
+
+def telegram_html(text: str) -> str:
+    rendered = html.escape(text, quote=False)
+    rendered = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", rendered)
+    rendered = re.sub(r"`([^`\n]+)`", r"<code>\1</code>", rendered)
+    return rendered
 
 
 def is_allowed(settings: Settings, chat_id: int) -> bool:
@@ -113,7 +122,7 @@ def log_bot_response(
 
 
 async def answer_logged(message: Message, text: str) -> Message:
-    response = await message.answer(text)
+    response = await message.answer(telegram_html(text), parse_mode="HTML")
     log_bot_response(
         action="answer",
         text=text,
@@ -129,7 +138,7 @@ async def edit_text_logged(
     *,
     source_message: Message | None = None,
 ) -> None:
-    await message.edit_text(text)
+    await message.edit_text(telegram_html(text), parse_mode="HTML")
     log_bot_response(
         action="edit_text",
         text=text,
