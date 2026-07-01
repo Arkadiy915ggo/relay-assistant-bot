@@ -61,6 +61,13 @@ OPENAI_MODEL=gpt-4o-mini
 python -m tg_summary_bot
 ```
 
+Или через shell-скрипт из корня проекта:
+
+```bash
+./run.sh install
+./run.sh start
+```
+
 ## Настройка через BotFather
 
 1. Открой `@BotFather`.
