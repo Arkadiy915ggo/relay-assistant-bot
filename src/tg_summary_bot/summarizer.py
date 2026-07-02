@@ -72,6 +72,9 @@ class Summarizer:
 
         return await self._merge_summaries(partials, period_label)
 
+    async def unload(self) -> None:
+        await self.llm.unload()
+
     async def _summarize_chunk(
         self,
         chunk: str,

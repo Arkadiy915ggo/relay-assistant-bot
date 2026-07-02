@@ -68,6 +68,12 @@ python -m tg_summary_bot
 ./run.sh start
 ```
 
+Если нужна локальная расшифровка голосовых через Whisper:
+
+```bash
+./run.sh install-voice
+```
+
 ## Настройка через BotFather
 
 1. Открой `@BotFather`.
@@ -135,6 +141,67 @@ RESPONSE_LOG_FILE=data/responses.log
 ```
 
 Этот лог удобно использовать, чтобы анализировать качество саммари и дорабатывать промпты.
+
+## Голосовые сообщения
+
+Бот может локально расшифровывать Telegram voice/audio через `faster-whisper` и сохранять результат как обычное сообщение для будущих `/summary`.
+
+Установка voice-зависимостей для CPU:
+
+```bash
+./run.sh install-voice
+```
+
+Установка voice-зависимостей для NVIDIA GPU:
+
+```bash
+./run.sh install-voice-cuda
+```
+
+Настройки для сильной модели на NVIDIA GPU:
+
+```env
+TRANSCRIBE_VOICE=true
+WHISPER_MODEL=large-v3
+WHISPER_DEVICE=cuda
+WHISPER_COMPUTE_TYPE=float16
+WHISPER_LANGUAGE=ru
+MAX_VOICE_SECONDS=600
+OLLAMA_UNLOAD_AFTER_TASK=true
+```
+
+LLM-задачи и расшифровка используют общую GPU-очередь: бот не запускает Ollama и Whisper одновременно. После `/summary` или `/compare` Ollama-модель явно выгружается, затем Whisper может занять GPU для расшифровки.
+
+`run.sh` автоматически добавляет CUDA-библиотеки из `.venv` в `LD_LIBRARY_PATH`, если они установлены через `install-voice-cuda`.
+
+Если при `WHISPER_DEVICE=cuda` появляется ошибка:
+
+```text
+RuntimeError: Library libcublas.so.12 is not found or cannot be loaded
+```
+
+Поставь CUDA voice-зависимости и перезапусти бота:
+
+```bash
+./run.sh install-voice-cuda
+./run.sh start
+```
+
+Быстрая проверка, что библиотеки доступны:
+
+```bash
+SITE_PACKAGES="$(.venv/bin/python -c "import sysconfig; print(sysconfig.get_paths()['purelib'])")"
+LD_LIBRARY_PATH="$SITE_PACKAGES/nvidia/cublas/lib:$SITE_PACKAGES/nvidia/cudnn/lib:$SITE_PACKAGES/nvidia/cuda_nvrtc/lib" \
+  .venv/bin/python -c "import ctypes; ctypes.CDLL('libcublas.so.12'); ctypes.CDLL('libcudnn.so.9'); print('CUDA libs OK')"
+```
+
+Если `large-v3` окажется медленной или будет не хватать VRAM, понижай модель в таком порядке:
+
+```env
+WHISPER_MODEL=large-v3-turbo
+WHISPER_MODEL=medium
+WHISPER_MODEL=small
+```
 
 По умолчанию `/summary` использует период из `DEFAULT_SUMMARY_PERIOD`, сейчас это `24h`.
 

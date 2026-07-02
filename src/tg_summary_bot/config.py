@@ -20,6 +20,13 @@ def _csv_strings(value: str) -> list[str]:
     return [item.strip() for item in value.split(",") if item.strip()]
 
 
+def _bool(value: str, *, default: bool = False) -> bool:
+    normalized = value.strip().lower()
+    if not normalized:
+        return default
+    return normalized in {"1", "true", "yes", "on"}
+
+
 @dataclass(frozen=True)
 class Settings:
     telegram_bot_token: str
@@ -31,12 +38,20 @@ class Settings:
     ollama_model: str
     ollama_timeout_seconds: int
     ollama_keep_alive: str
+    ollama_unload_after_task: bool
     ollama_num_ctx: int
     ollama_num_predict: int
     compare_models: list[str]
     database_path: Path
     log_file: Path
     response_log_file: Path
+    transcribe_voice: bool
+    whisper_model: str
+    whisper_device: str
+    whisper_compute_type: str
+    whisper_language: str
+    max_voice_seconds: int
+    voice_download_dir: Path
     max_message_chars: int
     max_summary_input_chars: int
     chunk_chars: int
@@ -70,12 +85,20 @@ def load_settings() -> Settings:
         ollama_model=os.getenv("OLLAMA_MODEL", "llama3.1:8b").strip(),
         ollama_timeout_seconds=int(os.getenv("OLLAMA_TIMEOUT_SECONDS", "1800")),
         ollama_keep_alive=os.getenv("OLLAMA_KEEP_ALIVE", "30m").strip(),
+        ollama_unload_after_task=_bool(os.getenv("OLLAMA_UNLOAD_AFTER_TASK", "true")),
         ollama_num_ctx=int(os.getenv("OLLAMA_NUM_CTX", "4096")),
         ollama_num_predict=int(os.getenv("OLLAMA_NUM_PREDICT", "800")),
         compare_models=_csv_strings(os.getenv("COMPARE_MODELS", "")),
         database_path=Path(os.getenv("DATABASE_PATH", "data/messages.sqlite3")),
         log_file=Path(os.getenv("LOG_FILE", "data/bot.log")),
         response_log_file=Path(os.getenv("RESPONSE_LOG_FILE", "data/responses.log")),
+        transcribe_voice=_bool(os.getenv("TRANSCRIBE_VOICE", "false")),
+        whisper_model=os.getenv("WHISPER_MODEL", "large-v3").strip(),
+        whisper_device=os.getenv("WHISPER_DEVICE", "cuda").strip(),
+        whisper_compute_type=os.getenv("WHISPER_COMPUTE_TYPE", "float16").strip(),
+        whisper_language=os.getenv("WHISPER_LANGUAGE", "ru").strip(),
+        max_voice_seconds=int(os.getenv("MAX_VOICE_SECONDS", "600")),
+        voice_download_dir=Path(os.getenv("VOICE_DOWNLOAD_DIR", "data/voice")),
         max_message_chars=int(os.getenv("MAX_MESSAGE_CHARS", "4000")),
         max_summary_input_chars=int(os.getenv("MAX_SUMMARY_INPUT_CHARS", "120000")),
         chunk_chars=int(os.getenv("CHUNK_CHARS", "18000")),

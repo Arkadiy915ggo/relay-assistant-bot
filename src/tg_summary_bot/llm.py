@@ -14,6 +14,9 @@ class LLMClient(ABC):
     async def complete(self, *, system: str, user: str) -> str:
         raise NotImplementedError
 
+    async def unload(self) -> None:
+        return None
+
 
 class OpenAIClient(LLMClient):
     def __init__(self, api_key: str, model: str) -> None:
@@ -42,6 +45,7 @@ class OllamaClient(LLMClient):
         model: str,
         timeout_seconds: int,
         keep_alive: str,
+        unload_after_task: bool,
         num_ctx: int,
         num_predict: int,
     ) -> None:
@@ -49,6 +53,7 @@ class OllamaClient(LLMClient):
         self.model = model
         self.timeout_seconds = timeout_seconds
         self.keep_alive = keep_alive
+        self.unload_after_task = unload_after_task
         self.num_ctx = num_ctx
         self.num_predict = num_predict
 
@@ -92,6 +97,21 @@ class OllamaClient(LLMClient):
         )
         return str(data.get("message", {}).get("content", "")).strip()
 
+    async def unload(self) -> None:
+        if not self.unload_after_task:
+            return
+        async with httpx.AsyncClient(timeout=30) as client:
+            try:
+                response = await client.post(
+                    f"{self.base_url}/api/generate",
+                    json={"model": self.model, "prompt": "", "keep_alive": 0},
+                )
+                response.raise_for_status()
+            except Exception:  # noqa: BLE001
+                logging.exception("Failed to unload Ollama model %s", self.model)
+                return
+        logging.info("Ollama model unloaded model=%s", self.model)
+
 
 def build_llm_client(settings: Settings, *, model: str | None = None) -> LLMClient:
     provider = settings.resolved_llm_provider
@@ -103,6 +123,7 @@ def build_llm_client(settings: Settings, *, model: str | None = None) -> LLMClie
             model or settings.ollama_model,
             settings.ollama_timeout_seconds,
             settings.ollama_keep_alive,
+            settings.ollama_unload_after_task,
             settings.ollama_num_ctx,
             settings.ollama_num_predict,
         )

@@ -8,6 +8,7 @@ import re
 import time
 from datetime import datetime, timezone
 from logging.handlers import RotatingFileHandler
+from pathlib import Path
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
@@ -18,6 +19,7 @@ from tg_summary_bot.llm import build_llm_client
 from tg_summary_bot.periods import format_period, parse_period
 from tg_summary_bot.storage import MessageStore
 from tg_summary_bot.summarizer import Summarizer
+from tg_summary_bot.transcriber import FasterWhisperTranscriber
 
 
 RESPONSE_LOGGER_NAME = "tg_summary_bot.responses"
@@ -63,6 +65,22 @@ def split_telegram_text(text: str, limit: int = 3900) -> list[str]:
     if current:
         chunks.append(current.rstrip())
     return chunks or [text[:limit]]
+
+
+def audio_file_id(message: Message) -> str | None:
+    if message.voice:
+        return message.voice.file_id
+    if message.audio:
+        return message.audio.file_id
+    return None
+
+
+def audio_duration(message: Message) -> int | None:
+    if message.voice:
+        return message.voice.duration
+    if message.audio:
+        return message.audio.duration
+    return None
 
 
 def setup_logging(settings: Settings) -> None:
@@ -147,7 +165,13 @@ async def edit_text_logged(
     )
 
 
-async def create_dispatcher(settings: Settings, store: MessageStore, summarizer: Summarizer) -> Dispatcher:
+async def create_dispatcher(
+    settings: Settings,
+    store: MessageStore,
+    summarizer: Summarizer,
+    transcriber: FasterWhisperTranscriber | None,
+    gpu_lock: asyncio.Lock,
+) -> Dispatcher:
     dp = Dispatcher()
 
     @dp.message(Command("start", "help"))
@@ -181,7 +205,10 @@ async def create_dispatcher(settings: Settings, store: MessageStore, summarizer:
             f"ollama_model: `{settings.ollama_model}`\n"
             f"ollama_timeout_seconds: `{settings.ollama_timeout_seconds}`\n"
             f"ollama_num_ctx: `{settings.ollama_num_ctx}`\n"
-            f"ollama_num_predict: `{settings.ollama_num_predict}`"
+            f"ollama_num_predict: `{settings.ollama_num_predict}`\n"
+            f"transcribe_voice: `{settings.transcribe_voice}`\n"
+            f"whisper_model: `{settings.whisper_model}`\n"
+            f"whisper_device: `{settings.whisper_device}`"
         )
 
     @dp.message(Command("summary"))
@@ -208,12 +235,18 @@ async def create_dispatcher(settings: Settings, store: MessageStore, summarizer:
             "Summary started chat_id=%s period=%s model=%s messages=%s",
             message.chat.id,
             period_raw,
-            settings.ollama_model if settings.resolved_llm_provider == "ollama" else settings.openai_model,
+            settings.ollama_model
+            if settings.resolved_llm_provider == "ollama"
+            else settings.openai_model,
             len(messages),
         )
         started = time.perf_counter()
         try:
-            summary = await summarizer.summarize(messages, format_period(period_raw))
+            async with gpu_lock:
+                try:
+                    summary = await summarizer.summarize(messages, format_period(period_raw))
+                finally:
+                    await summarizer.unload()
         except Exception as exc:  # noqa: BLE001
             logging.exception("Summary failed")
             await edit_text_logged(
@@ -291,9 +324,19 @@ async def create_dispatcher(settings: Settings, store: MessageStore, summarizer:
                 model,
                 len(messages),
             )
-            model_summarizer = Summarizer(build_llm_client(settings, model=model), settings.chunk_chars)
+            model_summarizer = Summarizer(
+                build_llm_client(settings, model=model),
+                settings.chunk_chars,
+            )
             try:
-                summary = await model_summarizer.summarize(messages, format_period(period_raw))
+                async with gpu_lock:
+                    try:
+                        summary = await model_summarizer.summarize(
+                            messages,
+                            format_period(period_raw),
+                        )
+                    finally:
+                        await model_summarizer.unload()
             except Exception as exc:  # noqa: BLE001
                 logging.exception("Compare failed for model %s", model)
                 await answer_logged(
@@ -325,6 +368,67 @@ async def create_dispatcher(settings: Settings, store: MessageStore, summarizer:
             source_message=message,
         )
 
+    @dp.message(F.voice | F.audio)
+    async def transcribe_audio_message(message: Message, bot: Bot) -> None:
+        if not is_allowed(settings, message.chat.id):
+            return
+        if not settings.transcribe_voice:
+            return
+        if not transcriber:
+            await answer_logged(message, "Расшифровка голосовых не настроена.")
+            return
+
+        duration = audio_duration(message)
+        if duration and duration > settings.max_voice_seconds:
+            await answer_logged(
+                message,
+                "Голосовое слишком длинное: "
+                f"{duration} сек. Лимит: {settings.max_voice_seconds} сек.",
+            )
+            return
+
+        file_id = audio_file_id(message)
+        if not file_id:
+            return
+
+        status_message = await answer_logged(message, "🎙 Расшифровываю голосовое...")
+        audio_path: Path | None = None
+        started = time.perf_counter()
+        try:
+            audio_path = await download_audio_message(settings, bot, message, file_id)
+            async with gpu_lock:
+                transcript = await transcriber.transcribe(audio_path)
+        except Exception as exc:  # noqa: BLE001
+            logging.exception("Voice transcription failed")
+            await edit_text_logged(
+                status_message,
+                f"Не удалось расшифровать голосовое: `{type(exc).__name__}: {exc}`",
+                source_message=message,
+            )
+            return
+        finally:
+            if audio_path:
+                audio_path.unlink(missing_ok=True)
+
+        if not transcript:
+            await edit_text_logged(
+                status_message,
+                "Не удалось распознать речь в голосовом.",
+                source_message=message,
+            )
+            return
+
+        saved_text = f"🎙 Голосовое сообщение: {transcript}"
+        await save_message_text(settings, store, message, saved_text)
+        elapsed = time.perf_counter() - started
+        preview = saved_text[:900] + ("..." if len(saved_text) > 900 else "")
+        await edit_text_logged(
+            status_message,
+            "Голосовое расшифровано и сохранено для саммари "
+            f"за {elapsed:.1f} сек.\n\n{preview}",
+            source_message=message,
+        )
+
     @dp.channel_post(F.text | F.caption)
     async def save_channel_post(message: Message) -> None:
         await save_incoming_message(settings, store, message)
@@ -345,7 +449,16 @@ async def save_incoming_message(settings: Settings, store: MessageStore, message
     text = message_text(message)
     if not text:
         return
-    text = text[: settings.max_message_chars]
+    await save_message_text(settings, store, message, text)
+
+
+async def save_message_text(
+    settings: Settings,
+    store: MessageStore,
+    message: Message,
+    text: str,
+) -> None:
+    text = " ".join(text.split())[: settings.max_message_chars]
     sender_id, name = sender_name(message)
     await store.save_message(
         chat_id=message.chat.id,
@@ -355,8 +468,29 @@ async def save_incoming_message(settings: Settings, store: MessageStore, message
         sender_name=name,
         text=text,
         created_at=message.date,
-        reply_to_message_id=message.reply_to_message.message_id if message.reply_to_message else None,
+        reply_to_message_id=(
+            message.reply_to_message.message_id
+            if message.reply_to_message
+            else None
+        ),
     )
+
+
+async def download_audio_message(
+    settings: Settings,
+    bot: Bot,
+    message: Message,
+    file_id: str,
+) -> Path:
+    settings.voice_download_dir.mkdir(parents=True, exist_ok=True)
+    suffix = ".ogg"
+    if message.audio:
+        suffix = Path(message.audio.file_name or "audio.ogg").suffix
+    if not suffix:
+        suffix = ".ogg"
+    audio_path = settings.voice_download_dir / f"{message.chat.id}_{message.message_id}{suffix}"
+    await bot.download(file_id, destination=audio_path)
+    return audio_path
 
 
 async def main() -> None:
@@ -366,9 +500,11 @@ async def main() -> None:
     await store.init()
     llm = build_llm_client(settings)
     summarizer = Summarizer(llm, settings.chunk_chars)
+    transcriber = FasterWhisperTranscriber(settings) if settings.transcribe_voice else None
+    gpu_lock = asyncio.Lock()
 
     bot = Bot(token=settings.telegram_bot_token)
-    dp = await create_dispatcher(settings, store, summarizer)
+    dp = await create_dispatcher(settings, store, summarizer, transcriber, gpu_lock)
 
     logging.info("Bot started with LLM provider: %s", settings.resolved_llm_provider)
     await dp.start_polling(

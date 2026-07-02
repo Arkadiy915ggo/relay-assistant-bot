@@ -11,6 +11,16 @@ dependencies = [
     "python-dotenv>=1.0,<2",
 ]
 
+[project.optional-dependencies]
+voice = [
+    "faster-whisper>=1.1,<2",
+]
+voice-cuda = [
+    "faster-whisper>=1.1,<2",
+    "nvidia-cublas-cu12>=12,<13",
+    "nvidia-cudnn-cu12>=9,<10",
+]
+
 [build-system]
 requires = ["setuptools>=70"]
 build-backend = "setuptools.build_meta"
