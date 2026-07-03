@@ -150,6 +150,17 @@ async def answer_logged(message: Message, text: str) -> Message:
     return response
 
 
+async def reply_logged(message: Message, text: str) -> Message:
+    response = await message.reply(telegram_html(text), parse_mode="HTML")
+    log_bot_response(
+        action="reply",
+        text=text,
+        response_message=response,
+        source_message=message,
+    )
+    return response
+
+
 async def edit_text_logged(
     message: Message,
     text: str,
@@ -391,7 +402,11 @@ async def create_dispatcher(
         if not file_id:
             return
 
-        status_message = await answer_logged(message, "🎙 Расшифровываю голосовое...")
+        voice_sender_name = sender_name(message)[1].replace("*", "").strip() or "Unknown"
+        status_message = await reply_logged(
+            message,
+            f"🎙 Расшифровываю голосовое от **{voice_sender_name}**...",
+        )
         audio_path: Path | None = None
         started = time.perf_counter()
         try:
@@ -418,14 +433,15 @@ async def create_dispatcher(
             )
             return
 
-        saved_text = f"🎙 Голосовое сообщение: {transcript}"
+        saved_text = f"🎙 Голосовое сообщение от {voice_sender_name}: {transcript}"
         await save_message_text(settings, store, message, saved_text)
         elapsed = time.perf_counter() - started
-        preview = saved_text[:900] + ("..." if len(saved_text) > 900 else "")
+        preview = transcript[:900] + ("..." if len(transcript) > 900 else "")
         await edit_text_logged(
             status_message,
-            "Голосовое расшифровано и сохранено для саммари "
-            f"за {elapsed:.1f} сек.\n\n{preview}",
+            f"**Расшифровка голосового от {voice_sender_name}**\n"
+            f"Сохранено для саммари за {elapsed:.1f} сек.\n\n"
+            f"{preview}",
             source_message=message,
         )
 
