@@ -1,42 +1,43 @@
 # Telegram Summary Bot
 
-Безопасный Telegram-бот для краткой AI-выжимки обсуждений за период. Бот использует официальный Telegram Bot API, поэтому не логинится как пользователь и не читает старую историю чата.
+A safe Telegram bot that stores new chat messages and produces short AI summaries for a selected time period. The bot uses the official Telegram Bot API, so it does not log in as a user and cannot read chat history from before it was added.
 
-## Что умеет
+## Features
 
-- сохраняет новые текстовые сообщения и подписи к медиа в SQLite;
-- делает саммари по команде `/summary 24h`, `/summary 7d`, `/summary today`;
-- умеет сравнивать саммари разных Ollama-моделей через `/compare 10m`;
-- добавляет в отчет категорию `Лучшая шутка` и выбирает смешную реплику из обсуждения;
-- работает в личном чате с ботом, группах, супергруппах и каналах;
-- использует OpenAI API или локальную Ollama-модель;
-- режет длинные обсуждения на части и собирает финальное саммари;
-- ограничивает доступ через `ALLOWED_CHAT_IDS`.
+- stores new text messages and media captions in SQLite;
+- creates summaries with `/summary 24h`, `/summary 7d`, `/summary today`;
+- compares summaries from multiple Ollama models with `/compare 10m`;
+- includes a `Best joke` section in the generated report;
+- works in direct chats, groups, supergroups, and channels;
+- supports OpenAI API or a local Ollama model;
+- splits long discussions into chunks and merges the final summary;
+- restricts access with `ALLOWED_CHAT_IDS`;
+- optionally transcribes Telegram voice/audio messages locally with `faster-whisper`.
 
-## Важные ограничения Telegram
+## Telegram Limitations
 
-- Бот не видит сообщения, которые были написаны до его добавления.
-- В группах бот увидит все сообщения только если выключить `Group Privacy` в `@BotFather`.
-- В канале бот должен быть администратором. Он сможет получать новые посты канала, но не комментарии в привязанном discussion-чате, если его не добавить и туда.
-- В личных чатах бот видит только сообщения, отправленные ему напрямую.
+- The bot cannot see messages sent before it was added.
+- In groups, the bot sees all messages only if `Group Privacy` is disabled in `@BotFather`.
+- In channels, the bot must be an administrator. It can receive new channel posts, but it will not receive comments from a linked discussion group unless it is added there too.
+- In direct chats, the bot only sees messages sent directly to it.
 
-## OpenAI или подписка ChatGPT
+## OpenAI API vs ChatGPT Subscription
 
-Подписка ChatGPT Plus/Pro не является API-ключом. Для автоматического бота нужен `OPENAI_API_KEY` из OpenAI Platform, он оплачивается отдельно.
+A ChatGPT Plus/Pro subscription is not an API key. Automated bot usage requires `OPENAI_API_KEY` from OpenAI Platform, billed separately.
 
-Если API-ключ использовать не хочется, можно запустить локальную модель через Ollama. Качество саммари обычно ниже, но для приватного использования это безопаснее.
+If you do not want to use an API key, run a local model through Ollama. Local summaries may be lower quality, but they are safer for private use.
 
-## Быстрый старт
+## Quick Start
 
-Требования:
+Requirements:
 
 - Python 3.11+;
-- Telegram bot token от `@BotFather`;
-- один из вариантов LLM:
+- Telegram bot token from `@BotFather`;
+- one LLM option:
 - `OPENAI_API_KEY`;
-- или локальная Ollama.
+- or local Ollama.
 
-Установка:
+Install:
 
 ```bash
 cd telegram-summary-bot
@@ -46,7 +47,7 @@ pip install -e .
 cp .env.example .env
 ```
 
-Заполни `.env`:
+Fill `.env`:
 
 ```env
 TELEGRAM_BOT_TOKEN=123456789:your_real_token
@@ -55,51 +56,51 @@ OPENAI_API_KEY=sk-your-key
 OPENAI_MODEL=gpt-4o-mini
 ```
 
-Запуск:
+Run:
 
 ```bash
 python -m tg_summary_bot
 ```
 
-Или через shell-скрипт из корня проекта:
+Or use the shell helper from the project root:
 
 ```bash
 ./run.sh install
 ./run.sh start
 ```
 
-Если нужна локальная расшифровка голосовых через Whisper:
+For local voice transcription with Whisper:
 
 ```bash
 ./run.sh install-voice
 ```
 
-## Настройка через BotFather
+## BotFather Setup
 
-1. Открой `@BotFather`.
-2. Выполни `/newbot`.
-3. Задай имя и username бота.
-4. Скопируй token в `.env` как `TELEGRAM_BOT_TOKEN`.
-5. Для групп выключи privacy mode:
-   `@BotFather` -> `/mybots` -> твой бот -> `Bot Settings` -> `Group Privacy` -> `Turn off`.
+1. Open `@BotFather`.
+2. Run `/newbot`.
+3. Choose the bot name and username.
+4. Copy the token into `.env` as `TELEGRAM_BOT_TOKEN`.
+5. For groups, disable privacy mode:
+   `@BotFather` -> `/mybots` -> your bot -> `Bot Settings` -> `Group Privacy` -> `Turn off`.
 
-После этого добавь бота в нужный чат.
+Then add the bot to the target chat.
 
-## Безопасная настройка доступа
+## Access Control
 
-Первый запуск можно сделать с пустым `ALLOWED_CHAT_IDS`, чтобы узнать `chat_id`:
+The first run can use an empty `ALLOWED_CHAT_IDS` to discover the target `chat_id`:
 
 ```env
 ALLOWED_CHAT_IDS=
 ```
 
-В нужном чате напиши:
+Send this command in the target chat:
 
 ```text
 /stats
 ```
 
-Бот ответит примерно так:
+The bot will respond with something like:
 
 ```text
 chat_id: -1001234567890
@@ -108,15 +109,15 @@ saved_messages: 42
 llm_provider: openai
 ```
 
-После этого лучше ограничить доступ:
+After that, restrict access:
 
 ```env
 ALLOWED_CHAT_IDS=-1001234567890,123456789
 ```
 
-Перезапусти бота.
+Restart the bot.
 
-## Команды
+## Commands
 
 ```text
 /start
@@ -129,36 +130,38 @@ ALLOWED_CHAT_IDS=-1001234567890,123456789
 /summary 7d
 /summary 2w
 /summary today
+/question your question
+/question 24h your question
 /compare 10m
 ```
 
-## Логи ответов
+## Response Logs
 
-Ответы бота пишутся отдельными JSON-строками в `data/responses.log`. Путь можно изменить через:
+Bot replies are written as JSON Lines to `data/responses.log`. The path can be changed with:
 
 ```env
 RESPONSE_LOG_FILE=data/responses.log
 ```
 
-Этот лог удобно использовать, чтобы анализировать качество саммари и дорабатывать промпты.
+Use this log to inspect real bot answers and improve prompt quality.
 
-## Голосовые сообщения
+## Voice Messages
 
-Бот может локально расшифровывать Telegram voice/audio через `faster-whisper` и сохранять результат как обычное сообщение для будущих `/summary`.
+The bot can locally transcribe Telegram voice/audio messages through `faster-whisper` and store the transcript as a normal message for future `/summary` calls.
 
-Установка voice-зависимостей для CPU:
+Install CPU voice dependencies:
 
 ```bash
 ./run.sh install-voice
 ```
 
-Установка voice-зависимостей для NVIDIA GPU:
+Install NVIDIA GPU voice dependencies:
 
 ```bash
 ./run.sh install-voice-cuda
 ```
 
-Настройки для сильной модели на NVIDIA GPU:
+Recommended high-quality NVIDIA GPU settings:
 
 ```env
 TRANSCRIBE_VOICE=true
@@ -170,24 +173,24 @@ MAX_VOICE_SECONDS=600
 OLLAMA_UNLOAD_AFTER_TASK=true
 ```
 
-LLM-задачи и расшифровка используют общую GPU-очередь: бот не запускает Ollama и Whisper одновременно. После `/summary` или `/compare` Ollama-модель явно выгружается, затем Whisper может занять GPU для расшифровки.
+LLM tasks and transcription share a single GPU queue: the bot does not run Ollama and Whisper at the same time. After `/summary` or `/compare`, the Ollama model is explicitly unloaded so Whisper can use the GPU.
 
-`run.sh` автоматически добавляет CUDA-библиотеки из `.venv` в `LD_LIBRARY_PATH`, если они установлены через `install-voice-cuda`.
+`run.sh` automatically adds CUDA libraries from `.venv` to `LD_LIBRARY_PATH` when they are installed through `install-voice-cuda`.
 
-Если при `WHISPER_DEVICE=cuda` появляется ошибка:
+If `WHISPER_DEVICE=cuda` fails with:
 
 ```text
 RuntimeError: Library libcublas.so.12 is not found or cannot be loaded
 ```
 
-Поставь CUDA voice-зависимости и перезапусти бота:
+Install CUDA voice dependencies and restart the bot:
 
 ```bash
 ./run.sh install-voice-cuda
 ./run.sh start
 ```
 
-Быстрая проверка, что библиотеки доступны:
+Quick library check:
 
 ```bash
 SITE_PACKAGES="$(.venv/bin/python -c "import sysconfig; print(sysconfig.get_paths()['purelib'])")"
@@ -195,7 +198,7 @@ LD_LIBRARY_PATH="$SITE_PACKAGES/nvidia/cublas/lib:$SITE_PACKAGES/nvidia/cudnn/li
   .venv/bin/python -c "import ctypes; ctypes.CDLL('libcublas.so.12'); ctypes.CDLL('libcudnn.so.9'); print('CUDA libs OK')"
 ```
 
-Если `large-v3` окажется медленной или будет не хватать VRAM, понижай модель в таком порядке:
+If `large-v3` is too slow or VRAM is insufficient, downgrade in this order:
 
 ```env
 WHISPER_MODEL=large-v3-turbo
@@ -203,47 +206,49 @@ WHISPER_MODEL=medium
 WHISPER_MODEL=small
 ```
 
-По умолчанию `/summary` использует период из `DEFAULT_SUMMARY_PERIOD`, сейчас это `24h`.
+By default, `/summary` uses `DEFAULT_SUMMARY_PERIOD`, currently `24h`.
 
-`/compare` прогоняет один и тот же набор сообщений через модели из `COMPARE_MODELS`. Это удобно для сравнения качества, но может быть очень долго на 30B/70B моделях.
+`/question` lets you chat with the assistant. The bot uses stored messages from the default period as optional context, but it can also answer general questions when the chat history is not relevant. Add a period as the first argument to override the context window, for example `/question 24h what did we discuss about Ollama?`. Answers are generated in Russian.
 
-## Использование в личном чате
+`/compare` runs the same message set through models from `COMPARE_MODELS`. This is useful for quality comparison, but it can be slow with 30B/70B models.
 
-1. Открой бота в Telegram.
-2. Нажми `Start`.
-3. Пиши сообщения боту.
-4. Через время отправь `/summary 24h`.
+## Direct Chat Usage
 
-Важно: бот не может читать твои личные переписки с другими людьми. Он видит только диалог с самим ботом.
+1. Open the bot in Telegram.
+2. Press `Start`.
+3. Send messages to the bot.
+4. Later, run `/summary 24h`.
 
-## Использование в группе или супергруппе
+Important: the bot cannot read your private chats with other people. It only sees the direct chat with the bot itself.
 
-1. Выключи `Group Privacy` у бота в `@BotFather`.
-2. Добавь бота в группу.
-3. Желательно дать ему право читать сообщения. Админка обычно не обязательна для обычной группы, но помогает избежать ограничений.
-4. Напиши `/stats`, скопируй `chat_id` в `ALLOWED_CHAT_IDS`.
-5. Через несколько часов или дней используй `/summary 24h`.
+## Group And Supergroup Usage
 
-Важно: сообщения начнут сохраняться только после добавления бота и включения нужных прав.
+1. Disable `Group Privacy` for the bot in `@BotFather`.
+2. Add the bot to the group.
+3. Preferably give it permission to read messages. Administrator rights are usually not required for normal groups, but they help avoid restrictions.
+4. Run `/stats` and copy `chat_id` into `ALLOWED_CHAT_IDS`.
+5. After a few hours or days, run `/summary 24h`.
 
-## Использование в канале
+Important: messages are only stored after the bot is added and has the required access.
 
-1. Добавь бота в канал как администратора.
-2. Дай минимум право видеть/получать посты. Для ответа командами удобнее разрешить публикацию сообщений, но это зависит от сценария.
-3. Новые посты канала будут сохраняться как `channel_post`.
-4. Команду `/summary` удобнее вызывать в личном чате или группе, если канал не позволяет обычный диалог с ботом.
+## Channel Usage
 
-Если у канала есть discussion-группа с комментариями, добавь бота еще и в эту группу. Комментарии живут именно там.
+1. Add the bot to the channel as an administrator.
+2. Give it at least permission to receive channel posts. Allowing message publishing is useful if you want command responses, but this depends on the scenario.
+3. New channel posts are stored as `channel_post` updates.
+4. It is usually easier to call `/summary` from a direct chat or group if the channel does not allow bot dialogue.
 
-## Локальная модель через Ollama
+If the channel has a linked discussion group, add the bot to that group too. Comments live in the discussion group, not in the channel itself.
 
-Установи Ollama и скачай модель:
+## Local Ollama Model
+
+Install Ollama and pull a model:
 
 ```bash
 ollama pull llama3.1:8b
 ```
 
-В `.env`:
+In `.env`:
 
 ```env
 LLM_PROVIDER=ollama
@@ -256,41 +261,41 @@ OLLAMA_NUM_PREDICT=800
 COMPARE_MODELS=qwen3:14b,gemma3:27b,qwen3-coder:30b
 ```
 
-Запусти бота:
+Run the bot:
 
 ```bash
 python -m tg_summary_bot
 ```
 
-Если на компьютере есть другая модель, посмотри список:
+List locally installed models:
 
 ```bash
 ollama list
 ```
 
-И впиши ее имя в `OLLAMA_MODEL`.
+Then set the chosen model name in `OLLAMA_MODEL`.
 
-Если видишь ошибку `ReadTimeout`, чаще всего модель слишком долго грузится или отвечает. Для 30B/70B моделей это нормально на первом запросе. Что делать:
+If you see `ReadTimeout`, the model is usually loading or generating too slowly. This is normal on the first request for 30B/70B models. Options:
 
-- увеличь `OLLAMA_TIMEOUT_SECONDS`, например до `1800` или `3600`;
-- оставь `OLLAMA_KEEP_ALIVE=30m`, чтобы модель не выгружалась сразу;
-- для проверки скорости временно поставь `OLLAMA_MODEL=qwen3:14b`;
-- уменьши период саммари, например `/summary 10m` вместо `/summary 24h`.
+- increase `OLLAMA_TIMEOUT_SECONDS`, for example to `1800` or `3600`;
+- keep `OLLAMA_KEEP_ALIVE=30m` so the model is not unloaded immediately;
+- temporarily test speed with `OLLAMA_MODEL=qwen3:14b`;
+- reduce the summary period, for example `/summary 10m` instead of `/summary 24h`.
 
-## Оптимизация и приватность
+## Performance And Privacy
 
-- `MAX_MESSAGE_CHARS` обрезает слишком длинные сообщения перед сохранением.
-- `MAX_SUMMARY_INPUT_CHARS` ограничивает объем текста, отправляемого в модель за один запрос саммари.
-- `CHUNK_CHARS` задает размер частей для длинных обсуждений.
-- `OLLAMA_NUM_CTX` задает контекст Ollama. Если он маленький, слишком длинные чанки могут давать `400 Bad Request`.
-- `OLLAMA_NUM_PREDICT` ограничивает длину ответа модели. Для медленных 70B моделей это помогает не упираться в timeout.
-- `LOG_FILE` задает файл логов бота, по умолчанию `data/bot.log`.
-- SQLite включен в WAL-режиме, этого достаточно для небольшого и среднего чата.
-- Секреты лежат в `.env`, он добавлен в `.gitignore`.
+- `MAX_MESSAGE_CHARS` truncates very long messages before storage.
+- `MAX_SUMMARY_INPUT_CHARS` limits how much text is sent to the model for one summary request.
+- `CHUNK_CHARS` controls chunk size for long discussions.
+- `OLLAMA_NUM_CTX` controls the Ollama context size. If it is too small, long chunks can produce `400 Bad Request`.
+- `OLLAMA_NUM_PREDICT` limits response length. This helps avoid timeouts with slow 70B models.
+- `LOG_FILE` sets the bot log file, defaulting to `data/bot.log`.
+- SQLite uses WAL mode, which is enough for small and medium chats.
+- Secrets are stored in `.env`, which is ignored by git.
 
-## Продакшен-запуск
+## Production Run
 
-Для постоянной работы лучше запускать через `systemd`, `supervisor`, Docker или любой process manager. Минимально можно оставить в `tmux`:
+For long-running deployments, use `systemd`, `supervisor`, Docker, or another process manager. A minimal `tmux` session is also fine:
 
 ```bash
 cd telegram-summary-bot
@@ -298,12 +303,12 @@ source .venv/bin/activate
 python -m tg_summary_bot
 ```
 
-## Где лежат данные
+## Data Location
 
-По умолчанию база:
+Default database path:
 
 ```text
 telegram-summary-bot/data/messages.sqlite3
 ```
 
-Эту папку не стоит коммитить в git.
+Do not commit this directory to git.

@@ -35,7 +35,7 @@ class OpenAIClient(LLMClient):
             ],
         )
         content = response.choices[0].message.content
-        return content.strip() if content else "Не удалось получить ответ от модели."
+        return content.strip() if content else "Failed to get a response from the model."
 
 
 class OllamaClient(LLMClient):

@@ -14,6 +14,7 @@ from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
 from aiogram.types import Message
 
+from tg_summary_bot.assistant import ChatAssistant
 from tg_summary_bot.config import Settings, load_settings
 from tg_summary_bot.llm import build_llm_client
 from tg_summary_bot.periods import format_period, parse_period
@@ -81,6 +82,24 @@ def audio_duration(message: Message) -> int | None:
     if message.audio:
         return message.audio.duration
     return None
+
+
+def parse_question_command(text: str, default_period: str) -> tuple[str, str] | None:
+    args = text.split(maxsplit=1)
+    if len(args) < 2 or not args[1].strip():
+        return None
+
+    raw = args[1].strip()
+    parts = raw.split(maxsplit=1)
+    if len(parts) == 2:
+        try:
+            parse_period(parts[0])
+        except ValueError:
+            pass
+        else:
+            return parts[0], parts[1].strip()
+
+    return default_period, raw
 
 
 def setup_logging(settings: Settings) -> None:
@@ -180,6 +199,7 @@ async def create_dispatcher(
     settings: Settings,
     store: MessageStore,
     summarizer: Summarizer,
+    chat_assistant: ChatAssistant,
     transcriber: FasterWhisperTranscriber | None,
     gpu_lock: asyncio.Lock,
 ) -> Dispatcher:
@@ -191,15 +211,16 @@ async def create_dispatcher(
             return
         await answer_logged(
             message,
-            "Я сохраняю новые текстовые сообщения этого чата и делаю краткие саммари.\n\n"
-            "Команды:\n"
-            "`/summary` — саммари за период по умолчанию\n"
-            "`/summary 6h` — за 6 часов\n"
-            "`/summary 7d` — за 7 дней\n"
-            "`/summary today` — за сегодня UTC\n"
-            "`/compare 10m` — сравнить саммари разных Ollama-моделей\n"
-            "`/stats` — chat_id и число сохраненных сообщений\n\n"
-            f"Текущий chat_id: `{message.chat.id}`"
+            "I store new text messages from this chat and produce short summaries.\n\n"
+            "Commands:\n"
+            "`/summary` - summary for the default period\n"
+            "`/summary 6h` - last 6 hours\n"
+            "`/summary 7d` - last 7 days\n"
+            "`/summary today` - today in UTC\n"
+            "`/question 24h <text>` - chat with the assistant using recent context\n"
+            "`/compare 10m` - compare summaries across Ollama models\n"
+            "`/stats` - chat_id and stored message count\n\n"
+            f"Current chat_id: `{message.chat.id}`"
         )
 
     @dp.message(Command("stats"))
@@ -232,10 +253,10 @@ async def create_dispatcher(
         try:
             period = parse_period(period_raw)
         except ValueError as exc:
-            await answer_logged(message, f"Не понял период: {exc}")
+            await answer_logged(message, f"Could not parse period: {exc}")
             return
 
-        wait_message = await answer_logged(message, "Собираю сообщения и делаю саммари...")
+        wait_message = await answer_logged(message, "Collecting messages and building summary...")
         since = datetime.now(timezone.utc) - period
         messages = await store.get_messages_since(
             chat_id=message.chat.id,
@@ -262,7 +283,7 @@ async def create_dispatcher(
             logging.exception("Summary failed")
             await edit_text_logged(
                 wait_message,
-                f"Не удалось сделать саммари: `{type(exc).__name__}: {exc}`",
+                f"Failed to build summary: `{type(exc).__name__}: {exc}`",
                 source_message=message,
             )
             return
@@ -280,17 +301,83 @@ async def create_dispatcher(
         for part in parts[1:]:
             await answer_logged(message, part)
 
+    @dp.message(Command("question"))
+    async def question_command(message: Message) -> None:
+        if not is_allowed(settings, message.chat.id):
+            return
+
+        parsed = parse_question_command(message.text or "", settings.default_summary_period)
+        if not parsed:
+            await answer_logged(
+                message,
+                "Usage: `/question [period] your question`\n"
+                "Example: `/question 24h who promised to fix the issue?`",
+            )
+            return
+
+        period_raw, question = parsed
+        try:
+            period = parse_period(period_raw)
+        except ValueError as exc:
+            await answer_logged(message, f"Could not parse period: {exc}")
+            return
+
+        wait_message = await answer_logged(message, "Thinking...")
+        since = datetime.now(timezone.utc) - period
+        messages = await store.get_messages_since(
+            chat_id=message.chat.id,
+            since=since,
+            limit_chars=settings.max_summary_input_chars,
+        )
+        logging.info(
+            "Question started chat_id=%s period=%s messages=%s",
+            message.chat.id,
+            period_raw,
+            len(messages),
+        )
+        started = time.perf_counter()
+        try:
+            async with gpu_lock:
+                try:
+                    answer = await chat_assistant.ask(
+                        messages,
+                        format_period(period_raw),
+                        question,
+                    )
+                finally:
+                    await chat_assistant.unload()
+        except Exception as exc:  # noqa: BLE001
+            logging.exception("Question failed")
+            await edit_text_logged(
+                wait_message,
+                f"Failed to answer question: `{type(exc).__name__}: {exc}`",
+                source_message=message,
+            )
+            return
+
+        logging.info(
+            "Question finished chat_id=%s period=%s elapsed_s=%.1f",
+            message.chat.id,
+            period_raw,
+            time.perf_counter() - started,
+        )
+        text = f"**Answer for {format_period(period_raw)}**\n{answer}"
+        parts = split_telegram_text(text)
+        await edit_text_logged(wait_message, parts[0], source_message=message)
+        for part in parts[1:]:
+            await answer_logged(message, part)
+
     @dp.message(Command("compare"))
     async def compare_command(message: Message) -> None:
         if not is_allowed(settings, message.chat.id):
             return
         if settings.resolved_llm_provider != "ollama":
-            await answer_logged(message, "/compare сейчас работает только с LLM_PROVIDER=ollama.")
+            await answer_logged(message, "/compare currently requires LLM_PROVIDER=ollama.")
             return
         if not settings.compare_models:
             await answer_logged(
                 message,
-                "COMPARE_MODELS пустой. Добавь модели в .env через запятую.",
+                "COMPARE_MODELS is empty. Add comma-separated models to .env.",
             )
             return
 
@@ -299,13 +386,13 @@ async def create_dispatcher(
         try:
             period = parse_period(period_raw)
         except ValueError as exc:
-            await answer_logged(message, f"Не понял период: {exc}")
+            await answer_logged(message, f"Could not parse period: {exc}")
             return
 
         wait_message = await answer_logged(
             message,
-            "Собираю сообщения для сравнения моделей...\n"
-            f"Модели: {', '.join(settings.compare_models)}"
+            "Collecting messages for model comparison...\n"
+            f"Models: {', '.join(settings.compare_models)}"
         )
         since = datetime.now(timezone.utc) - period
         messages = await store.get_messages_since(
@@ -316,7 +403,7 @@ async def create_dispatcher(
         if not messages:
             await edit_text_logged(
                 wait_message,
-                f"За период {format_period(period_raw)} сохраненных сообщений нет.",
+                f"No stored messages for period {format_period(period_raw)}.",
                 source_message=message,
             )
             return
@@ -324,7 +411,7 @@ async def create_dispatcher(
         for model in settings.compare_models:
             await edit_text_logged(
                 wait_message,
-                f"Сравнение моделей: сейчас работает {model}...",
+                f"Model comparison: running {model}...",
                 source_message=message,
             )
             started = time.perf_counter()
@@ -352,7 +439,7 @@ async def create_dispatcher(
                 logging.exception("Compare failed for model %s", model)
                 await answer_logged(
                     message,
-                    f"Модель {model} не смогла сделать саммари: {type(exc).__name__}: {exc}",
+                    f"Model {model} failed to build summary: {type(exc).__name__}: {exc}",
                 )
                 continue
 
@@ -365,9 +452,9 @@ async def create_dispatcher(
                 elapsed,
             )
             text = (
-                f"Сравнение: {model}\n"
-                f"Период: {format_period(period_raw)}\n"
-                f"Время: {elapsed:.1f} сек\n\n"
+                f"Comparison: {model}\n"
+                f"Period: {format_period(period_raw)}\n"
+                f"Elapsed: {elapsed:.1f} sec\n\n"
                 f"{summary}"
             )
             for part in split_telegram_text(text):
@@ -375,7 +462,7 @@ async def create_dispatcher(
 
         await edit_text_logged(
             wait_message,
-            "Сравнение моделей завершено.",
+            "Model comparison finished.",
             source_message=message,
         )
 
@@ -386,15 +473,15 @@ async def create_dispatcher(
         if not settings.transcribe_voice:
             return
         if not transcriber:
-            await answer_logged(message, "Расшифровка голосовых не настроена.")
+            await answer_logged(message, "Voice transcription is not configured.")
             return
 
         duration = audio_duration(message)
         if duration and duration > settings.max_voice_seconds:
             await answer_logged(
                 message,
-                "Голосовое слишком длинное: "
-                f"{duration} сек. Лимит: {settings.max_voice_seconds} сек.",
+                "Voice message is too long: "
+                f"{duration} sec. Limit: {settings.max_voice_seconds} sec.",
             )
             return
 
@@ -405,7 +492,7 @@ async def create_dispatcher(
         voice_sender_name = sender_name(message)[1].replace("*", "").strip() or "Unknown"
         status_message = await reply_logged(
             message,
-            f"🎙 Расшифровываю голосовое от **{voice_sender_name}**...",
+            f"🎙 Transcribing voice message from **{voice_sender_name}**...",
         )
         audio_path: Path | None = None
         started = time.perf_counter()
@@ -417,7 +504,7 @@ async def create_dispatcher(
             logging.exception("Voice transcription failed")
             await edit_text_logged(
                 status_message,
-                f"Не удалось расшифровать голосовое: `{type(exc).__name__}: {exc}`",
+                f"Failed to transcribe voice message: `{type(exc).__name__}: {exc}`",
                 source_message=message,
             )
             return
@@ -428,19 +515,19 @@ async def create_dispatcher(
         if not transcript:
             await edit_text_logged(
                 status_message,
-                "Не удалось распознать речь в голосовом.",
+                "No speech was recognized in the voice message.",
                 source_message=message,
             )
             return
 
-        saved_text = f"🎙 Голосовое сообщение от {voice_sender_name}: {transcript}"
+        saved_text = f"🎙 Voice message from {voice_sender_name}: {transcript}"
         await save_message_text(settings, store, message, saved_text)
         elapsed = time.perf_counter() - started
         preview = transcript[:900] + ("..." if len(transcript) > 900 else "")
         await edit_text_logged(
             status_message,
-            f"**Расшифровка голосового от {voice_sender_name}**\n"
-            f"Сохранено для саммари за {elapsed:.1f} сек.\n\n"
+            f"**Voice transcription from {voice_sender_name}**\n"
+            f"Saved for summaries in {elapsed:.1f} sec.\n\n"
             f"{preview}",
             source_message=message,
         )
@@ -516,11 +603,19 @@ async def main() -> None:
     await store.init()
     llm = build_llm_client(settings)
     summarizer = Summarizer(llm, settings.chunk_chars)
+    chat_assistant = ChatAssistant(llm, settings.chunk_chars)
     transcriber = FasterWhisperTranscriber(settings) if settings.transcribe_voice else None
     gpu_lock = asyncio.Lock()
 
     bot = Bot(token=settings.telegram_bot_token)
-    dp = await create_dispatcher(settings, store, summarizer, transcriber, gpu_lock)
+    dp = await create_dispatcher(
+        settings,
+        store,
+        summarizer,
+        chat_assistant,
+        transcriber,
+        gpu_lock,
+    )
 
     logging.info("Bot started with LLM provider: %s", settings.resolved_llm_provider)
     await dp.start_polling(
