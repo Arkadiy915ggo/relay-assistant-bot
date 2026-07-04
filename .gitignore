@@ -1,6 +1,5 @@
 .env
 .venv/
-.opencode/
 __pycache__/
 *.pyc
 data/

@@ -1,0 +1,21 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "instructions": ["AGENTS.md"],
+  "skills": {
+    "paths": [".opencode/skills"]
+  },
+  "command": {
+    "project-overview": {
+      "description": "Load the project architecture overview for this Telegram bot.",
+      "template": "Use the relay-assistant-overview skill and AGENTS.md. Return a compact but complete map of the project: purpose, runtime flow, main modules, storage schema, external services, environment variables, common commands, and safe files to inspect first. Do not read .env or data/ unless explicitly asked."
+    },
+    "project-debug": {
+      "description": "Diagnose a bug using the project's known architecture.",
+      "template": "Use AGENTS.md and the relay-assistant-overview skill first. Then diagnose the reported issue by tracing the relevant flow through bot.py, storage.py, config.py, llm.py, summarizer.py, assistant.py, image_recognizer.py, video_recognizer.py, transcriber.py, and periods.py as needed. Prefer minimal fixes and verify with compileall or targeted commands. Do not inspect .env or private data/ files unless the user explicitly asks."
+    },
+    "project-smoke": {
+      "description": "Run the lightweight validation checks for this project.",
+      "template": "Run a lightweight project smoke check. Prefer `.venv/bin/python -m compileall src` when .venv exists, otherwise `python -m compileall src`. If dependencies are installed, optionally run import checks for tg_summary_bot modules. Report commands, results, and any limitations."
+    }
+  }
+}
