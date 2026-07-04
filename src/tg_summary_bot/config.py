@@ -127,7 +127,7 @@ def load_settings() -> Settings:
         video_download_dir=Path(os.getenv("VIDEO_DOWNLOAD_DIR", "data/video")),
         video_frame_dir=Path(os.getenv("VIDEO_FRAME_DIR", "data/video_frames")),
         video_frame_count=int(os.getenv("VIDEO_FRAME_COUNT", "8")),
-        video_frame_max_width=int(os.getenv("VIDEO_FRAME_MAX_WIDTH", "1280")),
+        video_frame_max_width=int(os.getenv("VIDEO_FRAME_MAX_WIDTH", "960")),
         video_transcribe_audio=_bool(os.getenv("VIDEO_TRANSCRIBE_AUDIO", "true")),
         max_message_chars=int(os.getenv("MAX_MESSAGE_CHARS", "4000")),
         max_summary_input_chars=int(os.getenv("MAX_SUMMARY_INPUT_CHARS", "120000")),

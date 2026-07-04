@@ -41,7 +41,7 @@ VIDEO_RECOGNITION_USER_PROMPT = """
 """.strip()
 
 
-PROMPT_VERSION = "v9-qwen25-video"
+PROMPT_VERSION = "v10-adaptive-video-compression"
 
 
 class VideoRecognizer:
@@ -65,18 +65,45 @@ class VideoRecognizer:
         )
 
     async def recognize(self, video_path: Path, *, message_id: int, duration: int | None) -> str:
-        frames = await self._extract_frames(video_path, message_id=message_id, duration=duration)
-        if not frames:
-            raise RuntimeError("ffmpeg did not extract any video frames")
+        last_error: Exception | None = None
+        for frame_count, frame_max_width in self._compression_attempts():
+            frames = await self._extract_frames(
+                video_path,
+                message_id=message_id,
+                duration=duration,
+                frame_count=frame_count,
+                frame_max_width=frame_max_width,
+            )
+            if not frames:
+                last_error = RuntimeError("ffmpeg did not extract any video frames")
+                continue
 
-        try:
-            images = [base64.b64encode(frame.read_bytes()).decode("ascii") for frame in frames]
-            return await self._complete_with_images(images)
-        finally:
-            for frame in frames:
-                frame.unlink(missing_ok=True)
+            try:
+                images = [base64.b64encode(frame.read_bytes()).decode("ascii") for frame in frames]
+                return await self._complete_with_images(
+                    images,
+                    frame_max_width=frame_max_width,
+                )
+            except RuntimeError as exc:
+                if not self._is_context_limit_error(exc):
+                    raise
+                last_error = exc
+                logging.warning(
+                    "Ollama video context limit exceeded model=%s frames=%s width=%s; "
+                    "retrying with stronger compression",
+                    self.model,
+                    len(frames),
+                    frame_max_width,
+                )
+            finally:
+                for frame in frames:
+                    frame.unlink(missing_ok=True)
 
-    async def _complete_with_images(self, images: list[str]) -> str:
+        if last_error:
+            raise RuntimeError(f"video frames still exceed context after compression: {last_error}") from last_error
+        raise RuntimeError("ffmpeg did not extract any video frames")
+
+    async def _complete_with_images(self, images: list[str], *, frame_max_width: int) -> str:
         async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
             response = await client.post(
                 f"{self.base_url}/api/generate",
@@ -107,10 +134,11 @@ class VideoRecognizer:
         eval_duration = (data.get("eval_duration") or 0) / 1_000_000_000
         tokens_per_second = eval_count / eval_duration if eval_duration else 0
         logging.info(
-            "Ollama video response model=%s frames=%s total_s=%.1f prompt_tokens=%s "
+            "Ollama video response model=%s frames=%s width=%s total_s=%.1f prompt_tokens=%s "
             "eval_tokens=%s eval_tps=%.2f",
             self.model,
             len(images),
+            frame_max_width,
             total_duration,
             prompt_eval_count,
             eval_count,
@@ -154,10 +182,16 @@ class VideoRecognizer:
         *,
         message_id: int,
         duration: int | None,
+        frame_count: int,
+        frame_max_width: int,
     ) -> list[Path]:
         self.frame_dir.mkdir(parents=True, exist_ok=True)
-        pattern = self.frame_dir / f"{video_path.stem}_{message_id}_%03d.jpg"
-        fps = self.frame_count / max(duration or self.frame_count, 1)
+        glob_pattern = f"{video_path.stem}_{message_id}_{frame_count}_{frame_max_width}_*.jpg"
+        for old_frame in self.frame_dir.glob(glob_pattern):
+            old_frame.unlink(missing_ok=True)
+
+        pattern = self.frame_dir / f"{video_path.stem}_{message_id}_{frame_count}_{frame_max_width}_%03d.jpg"
+        fps = frame_count / max(duration or frame_count, 1)
         fps = min(max(fps, 0.05), 1.0)
         process = await asyncio.create_subprocess_exec(
             "ffmpeg",
@@ -168,11 +202,11 @@ class VideoRecognizer:
             "-i",
             str(video_path),
             "-vf",
-            f"fps={fps:.6f},scale='min({self.frame_max_width},iw)':-2",
+            f"fps={fps:.6f},scale='min({frame_max_width},iw)':-2",
             "-frames:v",
-            str(self.frame_count),
+            str(frame_count),
             "-q:v",
-            "2",
+            "4",
             str(pattern),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
@@ -181,4 +215,29 @@ class VideoRecognizer:
         if process.returncode != 0:
             detail = (stderr or stdout).decode("utf-8", errors="replace").strip()
             raise RuntimeError(f"ffmpeg failed: {detail[:1000]}")
-        return sorted(self.frame_dir.glob(f"{video_path.stem}_{message_id}_*.jpg"))
+        return sorted(self.frame_dir.glob(glob_pattern))
+
+    def _compression_attempts(self) -> list[tuple[int, int]]:
+        candidates = [
+            (self.frame_count, self.frame_max_width),
+            (self.frame_count, min(self.frame_max_width, 960)),
+            (max(self.frame_count * 3 // 4, 1), min(self.frame_max_width, 960)),
+            (max(self.frame_count // 2, 1), min(self.frame_max_width, 768)),
+            (max(self.frame_count // 3, 1), min(self.frame_max_width, 640)),
+            (1, min(self.frame_max_width, 480)),
+            (1, min(self.frame_max_width, 320)),
+        ]
+        attempts: list[tuple[int, int]] = []
+        seen: set[tuple[int, int]] = set()
+        for frame_count, frame_max_width in candidates:
+            attempt = (max(frame_count, 1), max(frame_max_width, 320))
+            if attempt in seen:
+                continue
+            seen.add(attempt)
+            attempts.append(attempt)
+        return attempts
+
+    @staticmethod
+    def _is_context_limit_error(error: Exception) -> bool:
+        text = str(error).lower()
+        return "exceed_context_size" in text or "exceeds the available context size" in text

@@ -283,7 +283,7 @@ MAX_VIDEO_SECONDS=120
 VIDEO_DOWNLOAD_DIR=data/video
 VIDEO_FRAME_DIR=data/video_frames
 VIDEO_FRAME_COUNT=8
-VIDEO_FRAME_MAX_WIDTH=1280
+VIDEO_FRAME_MAX_WIDTH=960
 VIDEO_TRANSCRIBE_AUDIO=true
 OLLAMA_UNLOAD_AFTER_TASK=true
 ```
@@ -318,23 +318,28 @@ Video recognition shares the same GPU queue as summaries, image recognition, and
 
 Audio transcription for videos uses the same local Whisper settings as voice messages: `WHISPER_MODEL`, `WHISPER_DEVICE`, `WHISPER_COMPUTE_TYPE`, and `WHISPER_LANGUAGE`. If `VIDEO_TRANSCRIBE_AUDIO=true`, install voice dependencies with `./run.sh install-voice` or `./run.sh install-voice-cuda`.
 
-If video recognition fails with a context error such as `request (...) exceeds the available context size`, increase only the video context setting, for example:
+If video recognition hits a context error such as `request (...) exceeds the available context size`, the bot automatically retries with fewer and smaller frames. If even the compressed fallback is not enough, reduce the frame settings first:
+
+```env
+VIDEO_FRAME_COUNT=4
+VIDEO_FRAME_MAX_WIDTH=640
+```
+
+Only increase the video context setting if you have enough memory for it:
 
 ```env
 VIDEO_RECOGNITION_NUM_CTX=32768
 ```
 
-Alternatively reduce `VIDEO_FRAME_COUNT` to send fewer sampled frames to the model.
-
 Speed and OCR quality knobs:
 
 ```env
 VIDEO_FRAME_COUNT=8
-VIDEO_FRAME_MAX_WIDTH=1280
+VIDEO_FRAME_MAX_WIDTH=960
 VIDEO_RECOGNITION_NUM_PREDICT=800
 ```
 
-Lower `VIDEO_FRAME_COUNT` to speed up processing. Lower `VIDEO_FRAME_MAX_WIDTH` to reduce image tokens and speed up vision processing, but this may make small text harder to read. Increase it back to `1280` for better OCR.
+Lower `VIDEO_FRAME_COUNT` to speed up processing. Lower `VIDEO_FRAME_MAX_WIDTH` to reduce image tokens and speed up vision processing, but this may make small text harder to read. Increase it back to `1280` for better OCR if your context size allows it.
 
 By default, `/summary` uses `DEFAULT_SUMMARY_PERIOD`, currently `24h`.
 
