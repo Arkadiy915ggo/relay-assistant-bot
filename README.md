@@ -12,7 +12,9 @@ A safe Telegram bot that stores new chat messages and produces short AI summarie
 - supports OpenAI API or a local Ollama model;
 - splits long discussions into chunks and merges the final summary;
 - restricts access with `ALLOWED_CHAT_IDS`;
-- optionally transcribes Telegram voice/audio messages locally with `faster-whisper`.
+- optionally transcribes Telegram voice/audio messages locally with `faster-whisper`;
+- manually recognizes text from images with an Ollama vision model;
+- manually recognizes videos and Telegram video notes through sampled key frames.
 
 ## Telegram Limitations
 
@@ -132,6 +134,10 @@ Restart the bot.
 /summary today
 /question your question
 /question 24h your question
+/image
+/ocr
+/video
+/vocr
 /compare 10m
 ```
 
@@ -205,6 +211,130 @@ WHISPER_MODEL=large-v3-turbo
 WHISPER_MODEL=medium
 WHISPER_MODEL=small
 ```
+
+## Image Recognition
+
+The bot can recognize images manually through an Ollama vision model. It does not run OCR automatically for every incoming image. Incoming photos and image documents are only indexed by Telegram `file_id`, so the bot can later download the selected image when you explicitly ask.
+
+Recommended local model for a good GPU such as RTX 4070 Ti Super:
+
+```bash
+ollama pull qwen2.5vl:7b
+```
+
+Configure `.env`:
+
+```env
+IMAGE_RECOGNITION_MODEL=qwen2.5vl:7b
+IMAGE_RECOGNITION_NUM_CTX=8192
+MAX_IMAGE_SIZE_MB=20
+IMAGE_DOWNLOAD_DIR=data/images
+OLLAMA_UNLOAD_AFTER_TASK=true
+```
+
+Usage:
+
+```text
+/image
+/ocr
+```
+
+Behavior:
+
+- If `/image` is sent as a reply to an image, the bot recognizes only the replied image.
+- If `/image` is sent without a reply, the bot recognizes the latest indexed image in the chat.
+- `/ocr` is an alias for `/image`.
+- The result is saved as a normal stored message, so future `/summary` and `/question` calls can use it.
+
+The image response format is:
+
+```text
+Text from image in the original language
+Russian translation if the text is English
+Short Russian summary of the image
+```
+
+The vision model uses the same Ollama server settings as text models: `OLLAMA_BASE_URL`, `OLLAMA_TIMEOUT_SECONDS`, `OLLAMA_KEEP_ALIVE`, and `OLLAMA_NUM_PREDICT`. Image recognition uses its own context size through `IMAGE_RECOGNITION_NUM_CTX`, so changing it does not affect `/summary`. The bot runs image recognition inside the same GPU queue as summaries and voice transcription. After recognition, it unloads `IMAGE_RECOGNITION_MODEL` when `OLLAMA_UNLOAD_AFTER_TASK=true`.
+
+## Video Recognition
+
+The bot can manually recognize ordinary Telegram videos, video documents, and Telegram video notes/circles. It does not analyze every incoming video automatically. Incoming videos are only indexed by Telegram `file_id`, and recognition runs only when requested.
+
+Install the recommended non-thinking vision model for video frames:
+
+```bash
+ollama pull qwen2.5vl:7b
+```
+
+Make sure `ffmpeg` is available:
+
+```bash
+ffmpeg -version
+```
+
+Configure `.env`:
+
+```env
+VIDEO_RECOGNITION_MODEL=qwen2.5vl:7b
+VIDEO_RECOGNITION_NUM_CTX=16384
+VIDEO_RECOGNITION_NUM_PREDICT=800
+MAX_VIDEO_SIZE_MB=50
+MAX_VIDEO_SECONDS=120
+VIDEO_DOWNLOAD_DIR=data/video
+VIDEO_FRAME_DIR=data/video_frames
+VIDEO_FRAME_COUNT=8
+VIDEO_FRAME_MAX_WIDTH=1280
+VIDEO_TRANSCRIBE_AUDIO=true
+OLLAMA_UNLOAD_AFTER_TASK=true
+```
+
+Usage:
+
+```text
+/video
+/vocr
+```
+
+Behavior:
+
+- If `/video` is sent as a reply to a video or Telegram video note, the bot recognizes only the replied video.
+- If `/video` is sent without a reply, the bot recognizes the latest indexed video in the chat.
+- `/vocr` is an alias for `/video`.
+- The bot downloads the video, extracts key frames with `ffmpeg`, sends those frames to `VIDEO_RECOGNITION_MODEL`, extracts the audio track if present, transcribes speech with Whisper, unloads the model after the task, and deletes temporary files.
+- Repeated `/video` calls for the same message and same video settings use a SQLite cache instead of rerunning `ffmpeg` and Ollama.
+- The result is saved as a normal stored message, so future `/summary` and `/question` calls can use it.
+
+The video response format is:
+
+```text
+Text from video frames in the original language
+Russian translation if the text is English
+Short Russian summary of the video
+Short description of what happens in the video
+Audio transcript if the video contains speech
+```
+
+Video recognition shares the same GPU queue as summaries, image recognition, and voice transcription, so heavy local tasks do not run at the same time.
+
+Audio transcription for videos uses the same local Whisper settings as voice messages: `WHISPER_MODEL`, `WHISPER_DEVICE`, `WHISPER_COMPUTE_TYPE`, and `WHISPER_LANGUAGE`. If `VIDEO_TRANSCRIBE_AUDIO=true`, install voice dependencies with `./run.sh install-voice` or `./run.sh install-voice-cuda`.
+
+If video recognition fails with a context error such as `request (...) exceeds the available context size`, increase only the video context setting, for example:
+
+```env
+VIDEO_RECOGNITION_NUM_CTX=32768
+```
+
+Alternatively reduce `VIDEO_FRAME_COUNT` to send fewer sampled frames to the model.
+
+Speed and OCR quality knobs:
+
+```env
+VIDEO_FRAME_COUNT=8
+VIDEO_FRAME_MAX_WIDTH=1280
+VIDEO_RECOGNITION_NUM_PREDICT=800
+```
+
+Lower `VIDEO_FRAME_COUNT` to speed up processing. Lower `VIDEO_FRAME_MAX_WIDTH` to reduce image tokens and speed up vision processing, but this may make small text harder to read. Increase it back to `1280` for better OCR.
 
 By default, `/summary` uses `DEFAULT_SUMMARY_PERIOD`, currently `24h`.
 

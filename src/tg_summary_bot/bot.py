@@ -4,6 +4,7 @@ import asyncio
 import html
 import json
 import logging
+import mimetypes
 import re
 import time
 from datetime import datetime, timezone
@@ -16,11 +17,13 @@ from aiogram.types import Message
 
 from tg_summary_bot.assistant import ChatAssistant
 from tg_summary_bot.config import Settings, load_settings
+from tg_summary_bot.image_recognizer import ImageRecognizer
 from tg_summary_bot.llm import build_llm_client
 from tg_summary_bot.periods import format_period, parse_period
-from tg_summary_bot.storage import MessageStore
+from tg_summary_bot.storage import MessageStore, StoredImage, StoredVideo
 from tg_summary_bot.summarizer import Summarizer
 from tg_summary_bot.transcriber import FasterWhisperTranscriber
+from tg_summary_bot.video_recognizer import VideoRecognizer
 
 
 RESPONSE_LOGGER_NAME = "tg_summary_bot.responses"
@@ -82,6 +85,152 @@ def audio_duration(message: Message) -> int | None:
     if message.audio:
         return message.audio.duration
     return None
+
+
+def image_payload(message: Message) -> tuple[str, str, int | None, str | None, str | None] | None:
+    if message.photo:
+        photo = max(message.photo, key=lambda item: item.width * item.height)
+        return photo.file_id, "photo", photo.file_size, None, "image/jpeg"
+
+    if message.document and message.document.mime_type:
+        mime_type = message.document.mime_type
+        if mime_type.startswith("image/"):
+            return (
+                message.document.file_id,
+                "document",
+                message.document.file_size,
+                message.document.file_name,
+                mime_type,
+            )
+
+    return None
+
+
+def image_from_message(message: Message) -> StoredImage | None:
+    payload = image_payload(message)
+    if not payload:
+        return None
+    file_id, media_type, file_size, file_name, mime_type = payload
+    return StoredImage(
+        message_id=message.message_id,
+        chat_id=message.chat.id,
+        chat_type=str(message.chat.type),
+        file_id=file_id,
+        media_type=media_type,
+        sender_name=sender_name(message)[1],
+        created_at=message.date.astimezone(timezone.utc).isoformat(),
+        file_size=file_size,
+        file_name=file_name,
+        mime_type=mime_type,
+    )
+
+
+def image_too_large(settings: Settings, image: StoredImage) -> bool:
+    if not image.file_size:
+        return False
+    return image.file_size > settings.max_image_size_mb * 1024 * 1024
+
+
+def video_payload(
+    message: Message,
+) -> tuple[str, str, int | None, int | None, str | None, str | None] | None:
+    if message.video_note:
+        return (
+            message.video_note.file_id,
+            "video_note",
+            message.video_note.duration,
+            message.video_note.file_size,
+            None,
+            "video/mp4",
+        )
+
+    if message.video:
+        return (
+            message.video.file_id,
+            "video",
+            message.video.duration,
+            message.video.file_size,
+            message.video.file_name,
+            message.video.mime_type,
+        )
+
+    if message.document and message.document.mime_type:
+        mime_type = message.document.mime_type
+        if mime_type.startswith("video/"):
+            return (
+                message.document.file_id,
+                "document",
+                None,
+                message.document.file_size,
+                message.document.file_name,
+                mime_type,
+            )
+
+    return None
+
+
+def video_from_message(message: Message) -> StoredVideo | None:
+    payload = video_payload(message)
+    if not payload:
+        return None
+    file_id, media_type, duration, file_size, file_name, mime_type = payload
+    return StoredVideo(
+        message_id=message.message_id,
+        chat_id=message.chat.id,
+        chat_type=str(message.chat.type),
+        file_id=file_id,
+        media_type=media_type,
+        sender_name=sender_name(message)[1],
+        created_at=message.date.astimezone(timezone.utc).isoformat(),
+        duration=duration,
+        file_size=file_size,
+        file_name=file_name,
+        mime_type=mime_type,
+    )
+
+
+def video_too_large(settings: Settings, video: StoredVideo) -> bool:
+    if not video.file_size:
+        return False
+    return video.file_size > settings.max_video_size_mb * 1024 * 1024
+
+
+def video_too_long(settings: Settings, video: StoredVideo) -> bool:
+    if not video.duration:
+        return False
+    return video.duration > settings.max_video_seconds
+
+
+def video_recognition_cache_key(
+    settings: Settings,
+    video_recognizer: VideoRecognizer,
+    transcriber: FasterWhisperTranscriber | None,
+) -> str:
+    if settings.video_transcribe_audio and transcriber:
+        audio = (
+            f"audio=whisper:{transcriber.model_name}:"
+            f"{transcriber.device}:{transcriber.compute_type}:{transcriber.language or 'auto'}"
+        )
+    elif settings.video_transcribe_audio:
+        audio = "audio=missing-transcriber"
+    else:
+        audio = "audio=off"
+    return f"{video_recognizer.cache_key}|{audio}"
+
+
+def combine_video_result(
+    visual_result: str,
+    visual_note: str,
+    audio_transcript: str,
+    audio_note: str,
+) -> str:
+    visual = visual_result.strip() or visual_note
+    transcript = audio_transcript.strip() or audio_note
+    return (
+        f"{visual}\n\n"
+        "**Аудио / речь**\n"
+        f"{transcript}"
+    ).strip()
 
 
 def parse_question_command(text: str, default_period: str) -> tuple[str, str] | None:
@@ -200,6 +349,8 @@ async def create_dispatcher(
     store: MessageStore,
     summarizer: Summarizer,
     chat_assistant: ChatAssistant,
+    image_recognizer: ImageRecognizer,
+    video_recognizer: VideoRecognizer,
     transcriber: FasterWhisperTranscriber | None,
     gpu_lock: asyncio.Lock,
 ) -> Dispatcher:
@@ -218,6 +369,8 @@ async def create_dispatcher(
             "`/summary 7d` - last 7 days\n"
             "`/summary today` - today in UTC\n"
             "`/question 24h <text>` - chat with the assistant using recent context\n"
+            "`/image` - recognize the latest image or replied image\n"
+            "`/video` - recognize the latest video/video note or replied video\n"
             "`/compare 10m` - compare summaries across Ollama models\n"
             "`/stats` - chat_id and stored message count\n\n"
             f"Current chat_id: `{message.chat.id}`"
@@ -228,13 +381,25 @@ async def create_dispatcher(
         if not is_allowed(settings, message.chat.id):
             return
         count = await store.count_messages(message.chat.id)
+        image_count = await store.count_images(message.chat.id)
+        video_count = await store.count_videos(message.chat.id)
         await answer_logged(
             message,
             f"chat_id: `{message.chat.id}`\n"
             f"chat_type: `{message.chat.type}`\n"
             f"saved_messages: `{count}`\n"
+            f"saved_images: `{image_count}`\n"
+            f"saved_videos: `{video_count}`\n"
             f"llm_provider: `{settings.resolved_llm_provider}`\n"
             f"ollama_model: `{settings.ollama_model}`\n"
+            f"question_model: `{settings.question_model or settings.ollama_model}`\n"
+            f"image_recognition_model: `{settings.image_recognition_model}`\n"
+            f"image_recognition_num_ctx: `{settings.image_recognition_num_ctx}`\n"
+            f"video_recognition_model: `{settings.video_recognition_model}`\n"
+            f"video_recognition_num_ctx: `{settings.video_recognition_num_ctx}`\n"
+            f"video_frame_count: `{settings.video_frame_count}`\n"
+            f"video_frame_max_width: `{settings.video_frame_max_width}`\n"
+            f"video_transcribe_audio: `{settings.video_transcribe_audio}`\n"
             f"ollama_timeout_seconds: `{settings.ollama_timeout_seconds}`\n"
             f"ollama_num_ctx: `{settings.ollama_num_ctx}`\n"
             f"ollama_num_predict: `{settings.ollama_num_predict}`\n"
@@ -362,6 +527,211 @@ async def create_dispatcher(
             time.perf_counter() - started,
         )
         text = f"**Answer for {format_period(period_raw)}**\n{answer}"
+        parts = split_telegram_text(text)
+        await edit_text_logged(wait_message, parts[0], source_message=message)
+        for part in parts[1:]:
+            await answer_logged(message, part)
+
+    @dp.message(Command("image", "ocr"))
+    async def image_command(message: Message, bot: Bot) -> None:
+        if not is_allowed(settings, message.chat.id):
+            return
+        if not settings.image_recognition_model:
+            await answer_logged(
+                message,
+                "Image recognition is disabled: IMAGE_RECOGNITION_MODEL is empty.",
+            )
+            return
+
+        image = await resolve_image_for_command(store, message)
+        if not image:
+            await answer_logged(
+                message,
+                "No image found. Reply to an image with `/image`, or send `/image` after an image.",
+            )
+            return
+        if image_too_large(settings, image):
+            await answer_logged(
+                message,
+                "Image is too large: "
+                f"{image.file_size} bytes. Limit: {settings.max_image_size_mb} MB.",
+            )
+            return
+
+        wait_message = await answer_logged(
+            message,
+            f"Recognizing image #{image.message_id} with `{settings.image_recognition_model}`...",
+        )
+        image_path: Path | None = None
+        started = time.perf_counter()
+        try:
+            image_path = await download_image(settings, bot, image)
+            async with gpu_lock:
+                try:
+                    result = await image_recognizer.recognize(image_path)
+                finally:
+                    await image_recognizer.unload()
+        except Exception as exc:  # noqa: BLE001
+            logging.exception("Image recognition failed")
+            await edit_text_logged(
+                wait_message,
+                f"Failed to recognize image: `{type(exc).__name__}: {exc}`",
+                source_message=message,
+            )
+            return
+        finally:
+            if image_path:
+                image_path.unlink(missing_ok=True)
+
+        elapsed = time.perf_counter() - started
+        saved_text = (
+            f"🖼 Image recognition for message #{image.message_id} "
+            f"from {image.sender_name}: {result}"
+        )
+        await save_message_text(settings, store, message, saved_text)
+        text = (
+            f"**Image recognition for message #{image.message_id}**\n"
+            f"Source: {image.sender_name}\n"
+            f"Model: `{settings.image_recognition_model}`\n"
+            f"Elapsed: {elapsed:.1f} sec\n"
+            "Saved for summaries.\n\n"
+            f"{result}"
+        )
+        parts = split_telegram_text(text)
+        await edit_text_logged(wait_message, parts[0], source_message=message)
+        for part in parts[1:]:
+            await answer_logged(message, part)
+
+    @dp.message(Command("video", "vocr"))
+    async def video_command(message: Message, bot: Bot) -> None:
+        if not is_allowed(settings, message.chat.id):
+            return
+        if not settings.video_recognition_model:
+            await answer_logged(
+                message,
+                "Video recognition is disabled: VIDEO_RECOGNITION_MODEL is empty.",
+            )
+            return
+
+        video = await resolve_video_for_command(store, message)
+        if not video:
+            await answer_logged(
+                message,
+                "No video found. Reply to a video with `/video`, or send `/video` after a video.",
+            )
+            return
+        if video_too_large(settings, video):
+            await answer_logged(
+                message,
+                "Video is too large: "
+                f"{video.file_size} bytes. Limit: {settings.max_video_size_mb} MB.",
+            )
+            return
+        if video_too_long(settings, video):
+            await answer_logged(
+                message,
+                "Video is too long: "
+                f"{video.duration} sec. Limit: {settings.max_video_seconds} sec.",
+            )
+            return
+
+        cache_key = video_recognition_cache_key(settings, video_recognizer, transcriber)
+        cached = await store.get_video_recognition(
+            chat_id=video.chat_id,
+            message_id=video.message_id,
+            cache_key=cache_key,
+        )
+        if cached and cached.result.strip():
+            saved_text = (
+                f"🎞 Video recognition for message #{video.message_id} "
+                f"from {video.sender_name}: {cached.result}"
+            )
+            await save_message_text(settings, store, message, saved_text)
+            text = (
+                f"**Video recognition for message #{video.message_id}**\n"
+                f"Source: {video.sender_name}\n"
+                f"Type: `{video.media_type}`\n"
+                f"Model: `{settings.video_recognition_model}`\n"
+                "Cache: `hit`\n"
+                "Saved for summaries.\n\n"
+                f"{cached.result}"
+            )
+            for part in split_telegram_text(text):
+                await answer_logged(message, part)
+            return
+
+        wait_message = await answer_logged(
+            message,
+            f"Recognizing video #{video.message_id} with `{settings.video_recognition_model}`...",
+        )
+        video_path: Path | None = None
+        audio_path: Path | None = None
+        started = time.perf_counter()
+        try:
+            video_path = await download_video(settings, bot, video)
+            audio_path = await extract_video_audio(settings, video_path, video)
+            visual_result = ""
+            visual_note = "Визуальный анализ кадров не дал результата."
+            audio_transcript = ""
+            audio_note = "Аудиодорожка не найдена или речь не распознана."
+            async with gpu_lock:
+                try:
+                    visual_result = await video_recognizer.recognize(
+                        video_path,
+                        message_id=video.message_id,
+                        duration=video.duration,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logging.exception("Video visual recognition failed")
+                    visual_note = f"Визуальный анализ кадров не удался: {type(exc).__name__}: {exc}"
+                finally:
+                    await video_recognizer.unload()
+
+                if settings.video_transcribe_audio:
+                    if audio_path and transcriber:
+                        audio_transcript = await transcriber.transcribe(audio_path)
+                    elif audio_path:
+                        audio_note = "Аудио найдено, но Whisper transcription is not configured."
+                else:
+                    audio_note = "Расшифровка аудио для видео отключена."
+            if not visual_result.strip() and not audio_transcript.strip():
+                raise RuntimeError(f"{visual_note}; {audio_note}")
+            result = combine_video_result(visual_result, visual_note, audio_transcript, audio_note)
+        except Exception as exc:  # noqa: BLE001
+            logging.exception("Video recognition failed")
+            await edit_text_logged(
+                wait_message,
+                f"Failed to recognize video: `{type(exc).__name__}: {exc}`",
+                source_message=message,
+            )
+            return
+        finally:
+            if audio_path:
+                audio_path.unlink(missing_ok=True)
+            if video_path:
+                video_path.unlink(missing_ok=True)
+
+        elapsed = time.perf_counter() - started
+        saved_text = (
+            f"🎞 Video recognition for message #{video.message_id} "
+            f"from {video.sender_name}: {result}"
+        )
+        await store.save_video_recognition(
+            chat_id=video.chat_id,
+            message_id=video.message_id,
+            cache_key=cache_key,
+            result=result,
+        )
+        await save_message_text(settings, store, message, saved_text)
+        text = (
+            f"**Video recognition for message #{video.message_id}**\n"
+            f"Source: {video.sender_name}\n"
+            f"Type: `{video.media_type}`\n"
+            f"Model: `{settings.video_recognition_model}`\n"
+            f"Elapsed: {elapsed:.1f} sec\n"
+            "Saved for summaries.\n\n"
+            f"{result}"
+        )
         parts = split_telegram_text(text)
         await edit_text_logged(wait_message, parts[0], source_message=message)
         for part in parts[1:]:
@@ -532,6 +902,22 @@ async def create_dispatcher(
             source_message=message,
         )
 
+    @dp.channel_post(F.photo | (F.document & F.document.mime_type.startswith("image/")))
+    async def save_channel_image(message: Message) -> None:
+        await save_incoming_image(settings, store, message)
+
+    @dp.message(F.photo | (F.document & F.document.mime_type.startswith("image/")))
+    async def save_regular_image(message: Message) -> None:
+        await save_incoming_image(settings, store, message)
+
+    @dp.channel_post(F.video | F.video_note | (F.document & F.document.mime_type.startswith("video/")))
+    async def save_channel_video(message: Message) -> None:
+        await save_incoming_video(settings, store, message)
+
+    @dp.message(F.video | F.video_note | (F.document & F.document.mime_type.startswith("video/")))
+    async def save_regular_video(message: Message) -> None:
+        await save_incoming_video(settings, store, message)
+
     @dp.channel_post(F.text | F.caption)
     async def save_channel_post(message: Message) -> None:
         await save_incoming_message(settings, store, message)
@@ -545,6 +931,24 @@ async def create_dispatcher(
     return dp
 
 
+async def resolve_image_for_command(store: MessageStore, message: Message) -> StoredImage | None:
+    if message.reply_to_message:
+        replied_image = image_from_message(message.reply_to_message)
+        if replied_image:
+            return replied_image
+        return await store.get_image_by_message_id(message.chat.id, message.reply_to_message.message_id)
+    return await store.get_latest_image(message.chat.id)
+
+
+async def resolve_video_for_command(store: MessageStore, message: Message) -> StoredVideo | None:
+    if message.reply_to_message:
+        replied_video = video_from_message(message.reply_to_message)
+        if replied_video:
+            return replied_video
+        return await store.get_video_by_message_id(message.chat.id, message.reply_to_message.message_id)
+    return await store.get_latest_video(message.chat.id)
+
+
 async def save_incoming_message(settings: Settings, store: MessageStore, message: Message) -> None:
     if not is_allowed(settings, message.chat.id):
         return
@@ -553,6 +957,57 @@ async def save_incoming_message(settings: Settings, store: MessageStore, message
     if not text:
         return
     await save_message_text(settings, store, message, text)
+
+
+async def save_incoming_image(settings: Settings, store: MessageStore, message: Message) -> None:
+    if not is_allowed(settings, message.chat.id):
+        return
+
+    payload = image_payload(message)
+    if not payload:
+        return
+
+    file_id, media_type, file_size, file_name, mime_type = payload
+    sender_id, name = sender_name(message)
+    await store.save_image(
+        chat_id=message.chat.id,
+        message_id=message.message_id,
+        chat_type=str(message.chat.type),
+        file_id=file_id,
+        media_type=media_type,
+        sender_id=sender_id,
+        sender_name=name,
+        created_at=message.date,
+        file_size=file_size,
+        file_name=file_name,
+        mime_type=mime_type,
+    )
+
+
+async def save_incoming_video(settings: Settings, store: MessageStore, message: Message) -> None:
+    if not is_allowed(settings, message.chat.id):
+        return
+
+    payload = video_payload(message)
+    if not payload:
+        return
+
+    file_id, media_type, duration, file_size, file_name, mime_type = payload
+    sender_id, name = sender_name(message)
+    await store.save_video(
+        chat_id=message.chat.id,
+        message_id=message.message_id,
+        chat_type=str(message.chat.type),
+        file_id=file_id,
+        media_type=media_type,
+        sender_id=sender_id,
+        sender_name=name,
+        created_at=message.date,
+        duration=duration,
+        file_size=file_size,
+        file_name=file_name,
+        mime_type=mime_type,
+    )
 
 
 async def save_message_text(
@@ -579,6 +1034,66 @@ async def save_message_text(
     )
 
 
+async def download_image(settings: Settings, bot: Bot, image: StoredImage) -> Path:
+    settings.image_download_dir.mkdir(parents=True, exist_ok=True)
+    suffix = Path(image.file_name).suffix if image.file_name else ""
+    if not suffix and image.mime_type:
+        suffix = mimetypes.guess_extension(image.mime_type) or ""
+    if not suffix:
+        suffix = ".jpg"
+    image_path = settings.image_download_dir / f"{image.chat_id}_{image.message_id}{suffix}"
+    await bot.download(image.file_id, destination=image_path)
+    return image_path
+
+
+async def download_video(settings: Settings, bot: Bot, video: StoredVideo) -> Path:
+    settings.video_download_dir.mkdir(parents=True, exist_ok=True)
+    suffix = Path(video.file_name).suffix if video.file_name else ""
+    if not suffix and video.mime_type:
+        suffix = mimetypes.guess_extension(video.mime_type) or ""
+    if not suffix:
+        suffix = ".mp4"
+    video_path = settings.video_download_dir / f"{video.chat_id}_{video.message_id}{suffix}"
+    await bot.download(video.file_id, destination=video_path)
+    return video_path
+
+
+async def extract_video_audio(settings: Settings, video_path: Path, video: StoredVideo) -> Path | None:
+    settings.video_download_dir.mkdir(parents=True, exist_ok=True)
+    audio_path = settings.video_download_dir / f"{video.chat_id}_{video.message_id}_audio.wav"
+    process = await asyncio.create_subprocess_exec(
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-i",
+        str(video_path),
+        "-map",
+        "0:a:0?",
+        "-vn",
+        "-ac",
+        "1",
+        "-ar",
+        "16000",
+        "-f",
+        "wav",
+        str(audio_path),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, stderr = await process.communicate()
+    if process.returncode != 0:
+        detail = (stderr or stdout).decode("utf-8", errors="replace").strip()
+        logging.warning("Video audio extraction failed for %s: %s", video_path, detail[:500])
+        audio_path.unlink(missing_ok=True)
+        return None
+    if not audio_path.exists() or audio_path.stat().st_size <= 44:
+        audio_path.unlink(missing_ok=True)
+        return None
+    return audio_path
+
+
 async def download_audio_message(
     settings: Settings,
     bot: Bot,
@@ -602,9 +1117,16 @@ async def main() -> None:
     store = MessageStore(settings.database_path)
     await store.init()
     llm = build_llm_client(settings)
+    question_llm = build_llm_client(settings, model=settings.question_model or None)
     summarizer = Summarizer(llm, settings.chunk_chars)
-    chat_assistant = ChatAssistant(llm, settings.chunk_chars)
-    transcriber = FasterWhisperTranscriber(settings) if settings.transcribe_voice else None
+    chat_assistant = ChatAssistant(question_llm, settings.chunk_chars)
+    image_recognizer = ImageRecognizer(settings)
+    video_recognizer = VideoRecognizer(settings)
+    transcriber = (
+        FasterWhisperTranscriber(settings)
+        if settings.transcribe_voice or settings.video_transcribe_audio
+        else None
+    )
     gpu_lock = asyncio.Lock()
 
     bot = Bot(token=settings.telegram_bot_token)
@@ -613,6 +1135,8 @@ async def main() -> None:
         store,
         summarizer,
         chat_assistant,
+        image_recognizer,
+        video_recognizer,
         transcriber,
         gpu_lock,
     )

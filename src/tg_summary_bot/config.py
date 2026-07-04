@@ -41,6 +41,7 @@ class Settings:
     ollama_unload_after_task: bool
     ollama_num_ctx: int
     ollama_num_predict: int
+    question_model: str
     compare_models: list[str]
     database_path: Path
     log_file: Path
@@ -52,6 +53,20 @@ class Settings:
     whisper_language: str
     max_voice_seconds: int
     voice_download_dir: Path
+    image_recognition_model: str
+    image_recognition_num_ctx: int
+    max_image_size_mb: int
+    image_download_dir: Path
+    video_recognition_model: str
+    video_recognition_num_ctx: int
+    video_recognition_num_predict: int
+    max_video_size_mb: int
+    max_video_seconds: int
+    video_download_dir: Path
+    video_frame_dir: Path
+    video_frame_count: int
+    video_frame_max_width: int
+    video_transcribe_audio: bool
     max_message_chars: int
     max_summary_input_chars: int
     chunk_chars: int
@@ -88,6 +103,7 @@ def load_settings() -> Settings:
         ollama_unload_after_task=_bool(os.getenv("OLLAMA_UNLOAD_AFTER_TASK", "true")),
         ollama_num_ctx=int(os.getenv("OLLAMA_NUM_CTX", "4096")),
         ollama_num_predict=int(os.getenv("OLLAMA_NUM_PREDICT", "800")),
+        question_model=os.getenv("QUESTION_MODEL", "").strip(),
         compare_models=_csv_strings(os.getenv("COMPARE_MODELS", "")),
         database_path=Path(os.getenv("DATABASE_PATH", "data/messages.sqlite3")),
         log_file=Path(os.getenv("LOG_FILE", "data/bot.log")),
@@ -99,6 +115,20 @@ def load_settings() -> Settings:
         whisper_language=os.getenv("WHISPER_LANGUAGE", "ru").strip(),
         max_voice_seconds=int(os.getenv("MAX_VOICE_SECONDS", "600")),
         voice_download_dir=Path(os.getenv("VOICE_DOWNLOAD_DIR", "data/voice")),
+        image_recognition_model=os.getenv("IMAGE_RECOGNITION_MODEL", "qwen2.5vl:7b").strip(),
+        image_recognition_num_ctx=int(os.getenv("IMAGE_RECOGNITION_NUM_CTX", "8192")),
+        max_image_size_mb=int(os.getenv("MAX_IMAGE_SIZE_MB", "20")),
+        image_download_dir=Path(os.getenv("IMAGE_DOWNLOAD_DIR", "data/images")),
+        video_recognition_model=os.getenv("VIDEO_RECOGNITION_MODEL", "qwen2.5vl:7b").strip(),
+        video_recognition_num_ctx=int(os.getenv("VIDEO_RECOGNITION_NUM_CTX", "16384")),
+        video_recognition_num_predict=int(os.getenv("VIDEO_RECOGNITION_NUM_PREDICT", "800")),
+        max_video_size_mb=int(os.getenv("MAX_VIDEO_SIZE_MB", "50")),
+        max_video_seconds=int(os.getenv("MAX_VIDEO_SECONDS", "120")),
+        video_download_dir=Path(os.getenv("VIDEO_DOWNLOAD_DIR", "data/video")),
+        video_frame_dir=Path(os.getenv("VIDEO_FRAME_DIR", "data/video_frames")),
+        video_frame_count=int(os.getenv("VIDEO_FRAME_COUNT", "8")),
+        video_frame_max_width=int(os.getenv("VIDEO_FRAME_MAX_WIDTH", "1280")),
+        video_transcribe_audio=_bool(os.getenv("VIDEO_TRANSCRIBE_AUDIO", "true")),
         max_message_chars=int(os.getenv("MAX_MESSAGE_CHARS", "4000")),
         max_summary_input_chars=int(os.getenv("MAX_SUMMARY_INPUT_CHARS", "120000")),
         chunk_chars=int(os.getenv("CHUNK_CHARS", "18000")),
