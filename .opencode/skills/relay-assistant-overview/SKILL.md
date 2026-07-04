@@ -31,14 +31,15 @@ The project is deliberately compact. Most orchestration lives in `src/tg_summary
 - `src/tg_summary_bot/bot.py`: handlers and runtime flow.
 - `src/tg_summary_bot/config.py`: settings and environment parsing.
 - `src/tg_summary_bot/storage.py`: SQLite schema and persistence.
-- `src/tg_summary_bot/memory.py`: long-term memory helper; currently supported by config/storage but not wired into `bot.py` handlers.
+- `src/tg_summary_bot/transcript_formatter.py`: optional post-processor for already-sent Whisper transcripts.
+- `src/tg_summary_bot/memory.py`: long-term memory helper used by `/summary`, `/question`, and `/memory`.
 
 ## Architecture Map
 
 - Entry point: `python -m tg_summary_bot` -> `__main__.py` -> `bot.main()`.
 - Settings: `load_settings()` reads `.env`, validates provider/token, and returns frozen `Settings`.
 - Storage: `MessageStore.init()` creates SQLite tables for messages, images, videos, and video recognition cache.
-- Memory schema: storage also creates `chat_memory_blocks` and `chat_memory_state`; `memory.py` can compress/search old chat history, but the dispatcher does not currently call it.
+- Memory schema: storage also creates `chat_memory_blocks` and `chat_memory_state`; `memory.py` compresses/searches old chat history for long `/summary` and `/question` periods.
 - LLM: `build_llm_client()` returns either `OpenAIClient` or `OllamaClient` behind the `LLMClient` interface.
 - Dispatcher: `create_dispatcher()` registers Telegram commands and passive indexing handlers.
 - GPU serialization: one `asyncio.Lock` prevents Ollama/Whisper jobs from running at the same time.
@@ -70,13 +71,15 @@ Videos, video documents, and video notes are passively indexed by `file_id`. `/v
 
 When `TRANSCRIBE_VOICE=true`, voice/audio messages are downloaded and transcribed with `faster-whisper`. The transcript is saved as a normal stored message for later summaries/questions.
 
+If `TRANSCRIPTION_FORMAT_ENABLED=true`, the raw Whisper transcript is sent first, then `TranscriptFormatter` runs through the configured LLM in the background and edits the already-sent Telegram messages with lightly formatted text.
+
 ### Model Comparison
 
 `/compare [period]` requires Ollama and runs the same message set through each model in `COMPARE_MODELS`.
 
 ### Long-Term Memory
 
-`memory.py` contains `ChatMemory` and `should_use_memory()` for compressing older messages into reusable memory blocks. `config.py` exposes `MEMORY_ENABLED`, `MEMORY_RECENT_PERIOD`, `MEMORY_CHUNK_CHARS`, `MEMORY_MAX_BLOCKS`, and `MEMORY_SEARCH_LIMIT`; `storage.py` has the backing tables and queries. At the time this skill was written, `bot.py` does not import or instantiate `ChatMemory`, so this is infrastructure/partial feature rather than active runtime behavior.
+`memory.py` contains `ChatMemory` and `should_use_memory()` for compressing older messages into reusable memory blocks. `config.py` exposes `MEMORY_ENABLED`, `MEMORY_RECENT_PERIOD`, `MEMORY_CHUNK_CHARS`, `MEMORY_MAX_BLOCKS`, and `MEMORY_SEARCH_LIMIT`; `storage.py` has the backing tables and queries.
 
 ## Verification Commands
 

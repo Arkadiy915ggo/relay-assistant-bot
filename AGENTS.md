@@ -55,7 +55,8 @@ There is currently no dedicated automated test suite in the repository.
 - `src/tg_summary_bot/image_recognizer.py`: manual `/image` and `/ocr` recognition through Ollama vision.
 - `src/tg_summary_bot/video_recognizer.py`: manual `/video` and `/vocr` key-frame recognition through Ollama vision with adaptive compression.
 - `src/tg_summary_bot/transcriber.py`: optional local Whisper transcription for voice/audio and video audio tracks.
-- `src/tg_summary_bot/memory.py`: long-term chat memory compressor/search helper. Current note: `config.py` and `storage.py` contain memory settings/tables, but `bot.py` does not currently wire `ChatMemory` into handlers.
+- `src/tg_summary_bot/transcript_formatter.py`: optional LLM post-processor that formats already-sent Whisper transcripts with minimal edits.
+- `src/tg_summary_bot/memory.py`: long-term chat memory compressor/search helper used by long `/summary` and `/question` periods.
 - `src/tg_summary_bot/periods.py`: period parsing for `30m`, `6h`, `24h`, `7d`, `2w`, `today`, and `сегодня`.
 
 ## Bot Commands
@@ -64,6 +65,8 @@ There is currently no dedicated automated test suite in the repository.
 - `/stats`: show chat id, stored counts, provider/model settings, and media/transcription settings.
 - `/summary [period]`: summarize stored messages for the period; default comes from `DEFAULT_SUMMARY_PERIOD`.
 - `/question [period] <text>`: answer using stored chat context when relevant.
+- `/memory`: show compressed chat memory status.
+- `/transcribe`: transcribe a replied voice/audio message manually.
 - `/image`, `/ocr`: recognize replied image or latest indexed image; save result as a stored message.
 - `/video`, `/vocr`: recognize replied/latest indexed video or Telegram video note; cache result and save it as a stored message.
 - `/compare [period]`: run summaries through `COMPARE_MODELS`; only supported with `LLM_PROVIDER=ollama`.
@@ -84,7 +87,7 @@ SQLite tables are initialized in `MessageStore.init()`:
 - Access control is enforced by `ALLOWED_CHAT_IDS`; an empty set allows all chats.
 - Text and captions are stored passively unless the message is a slash command.
 - Images and videos are indexed passively by Telegram `file_id`; actual recognition happens only on explicit commands.
-- Voice/audio messages are transcribed only when `TRANSCRIBE_VOICE=true` and voice dependencies are installed.
+- Voice/audio messages are transcribed only when `TRANSCRIBE_VOICE=true` and voice dependencies are installed. Optional transcript formatting runs after the raw Whisper response is already sent.
 - Video recognition can include audio transcription when `VIDEO_TRANSCRIBE_AUDIO=true` and a transcriber is configured.
 - Long summaries/questions are chunked before model calls; final summaries merge partials.
 - Telegram responses are split below the Telegram message limit by `split_telegram_text()`.
@@ -97,7 +100,7 @@ Use `.env.example` as the source of truth for documented environment variables. 
 - LLM provider: `LLM_PROVIDER`, `OPENAI_API_KEY`, `OPENAI_MODEL`, `OLLAMA_BASE_URL`, `OLLAMA_MODEL`.
 - Ollama generation: `OLLAMA_TIMEOUT_SECONDS`, `OLLAMA_KEEP_ALIVE`, `OLLAMA_UNLOAD_AFTER_TASK`, `OLLAMA_NUM_CTX`, `OLLAMA_NUM_PREDICT`.
 - Storage/logs: `DATABASE_PATH`, `LOG_FILE`, `RESPONSE_LOG_FILE`.
-- Voice: `TRANSCRIBE_VOICE`, `WHISPER_MODEL`, `WHISPER_DEVICE`, `WHISPER_COMPUTE_TYPE`, `WHISPER_LANGUAGE`, `MAX_VOICE_SECONDS`.
+- Voice: `TRANSCRIBE_VOICE`, `WHISPER_MODEL`, `WHISPER_DEVICE`, `WHISPER_COMPUTE_TYPE`, `WHISPER_LANGUAGE`, `MAX_VOICE_SECONDS`, `TRANSCRIPTION_FORMAT_*`.
 - Image/video: `IMAGE_RECOGNITION_MODEL`, `VIDEO_RECOGNITION_MODEL`, frame limits, size/duration limits, and download directories.
 - Summary limits: `MAX_MESSAGE_CHARS`, `MAX_SUMMARY_INPUT_CHARS`, `CHUNK_CHARS`, `DEFAULT_SUMMARY_PERIOD`.
 - Memory settings in code: `MEMORY_ENABLED`, `MEMORY_RECENT_PERIOD`, `MEMORY_CHUNK_CHARS`, `MEMORY_MAX_BLOCKS`, `MEMORY_SEARCH_LIMIT`.

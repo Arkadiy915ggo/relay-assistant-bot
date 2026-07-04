@@ -113,8 +113,15 @@ class OllamaClient(LLMClient):
         logging.info("Ollama model unloaded model=%s", self.model)
 
 
-def build_llm_client(settings: Settings, *, model: str | None = None) -> LLMClient:
-    provider = settings.resolved_llm_provider
+def build_llm_client(
+    settings: Settings,
+    *,
+    model: str | None = None,
+    provider: str | None = None,
+    num_ctx: int | None = None,
+    num_predict: int | None = None,
+) -> LLMClient:
+    provider = provider or settings.resolved_llm_provider
     if provider == "openai":
         return OpenAIClient(settings.openai_api_key, model or settings.openai_model)
     if provider == "ollama":
@@ -124,7 +131,7 @@ def build_llm_client(settings: Settings, *, model: str | None = None) -> LLMClie
             settings.ollama_timeout_seconds,
             settings.ollama_keep_alive,
             settings.ollama_unload_after_task,
-            settings.ollama_num_ctx,
-            settings.ollama_num_predict,
+            num_ctx or settings.ollama_num_ctx,
+            num_predict or settings.ollama_num_predict,
         )
     raise RuntimeError(f"Unsupported LLM provider: {provider}")

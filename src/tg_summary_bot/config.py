@@ -53,6 +53,12 @@ class Settings:
     whisper_language: str
     max_voice_seconds: int
     voice_download_dir: Path
+    transcription_format_enabled: bool
+    transcription_format_provider: str
+    transcription_format_model: str
+    transcription_format_num_ctx: int
+    transcription_format_num_predict: int
+    max_transcription_format_chars: int
     image_recognition_model: str
     image_recognition_num_ctx: int
     max_image_size_mb: int
@@ -95,6 +101,9 @@ def load_settings() -> Settings:
     provider = os.getenv("LLM_PROVIDER", "auto").strip().lower()
     if provider not in {"auto", "openai", "ollama"}:
         raise RuntimeError("LLM_PROVIDER must be one of: auto, openai, ollama")
+    transcription_format_provider = os.getenv("TRANSCRIPTION_FORMAT_PROVIDER", "ollama").strip().lower()
+    if transcription_format_provider not in {"openai", "ollama"}:
+        raise RuntimeError("TRANSCRIPTION_FORMAT_PROVIDER must be one of: openai, ollama")
 
     return Settings(
         telegram_bot_token=token,
@@ -121,6 +130,15 @@ def load_settings() -> Settings:
         whisper_language=os.getenv("WHISPER_LANGUAGE", "ru").strip(),
         max_voice_seconds=int(os.getenv("MAX_VOICE_SECONDS", "600")),
         voice_download_dir=Path(os.getenv("VOICE_DOWNLOAD_DIR", "data/voice")),
+        transcription_format_enabled=_bool(os.getenv("TRANSCRIPTION_FORMAT_ENABLED", "true")),
+        transcription_format_provider=transcription_format_provider,
+        transcription_format_model=os.getenv(
+            "TRANSCRIPTION_FORMAT_MODEL",
+            os.getenv("VIDEO_RECOGNITION_MODEL", "qwen2.5vl:7b"),
+        ).strip(),
+        transcription_format_num_ctx=int(os.getenv("TRANSCRIPTION_FORMAT_NUM_CTX", "16384")),
+        transcription_format_num_predict=int(os.getenv("TRANSCRIPTION_FORMAT_NUM_PREDICT", "4096")),
+        max_transcription_format_chars=int(os.getenv("MAX_TRANSCRIPTION_FORMAT_CHARS", "12000")),
         image_recognition_model=os.getenv("IMAGE_RECOGNITION_MODEL", "qwen2.5vl:7b").strip(),
         image_recognition_num_ctx=int(os.getenv("IMAGE_RECOGNITION_NUM_CTX", "8192")),
         max_image_size_mb=int(os.getenv("MAX_IMAGE_SIZE_MB", "20")),

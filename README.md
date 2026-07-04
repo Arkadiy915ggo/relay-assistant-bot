@@ -136,6 +136,7 @@ Restart the bot.
 /question your question
 /question 24h your question
 /memory
+/transcribe
 /image
 /ocr
 /video
@@ -175,7 +176,7 @@ Use this log to inspect real bot answers and improve prompt quality.
 
 ## Voice Messages
 
-The bot can locally transcribe Telegram voice/audio messages through `faster-whisper` and store the transcript as a normal message for future `/summary` calls.
+The bot can locally transcribe Telegram voice/audio messages through `faster-whisper` and store the transcript as a normal message for future `/summary` calls. It can also send the fast raw Whisper result first, then format the already-sent message with an LLM in the background.
 
 Install CPU voice dependencies:
 
@@ -198,10 +199,18 @@ WHISPER_DEVICE=cuda
 WHISPER_COMPUTE_TYPE=float16
 WHISPER_LANGUAGE=ru
 MAX_VOICE_SECONDS=600
+TRANSCRIPTION_FORMAT_ENABLED=true
+TRANSCRIPTION_FORMAT_PROVIDER=ollama
+TRANSCRIPTION_FORMAT_MODEL=qwen2.5vl:7b
+TRANSCRIPTION_FORMAT_NUM_CTX=16384
+TRANSCRIPTION_FORMAT_NUM_PREDICT=4096
+MAX_TRANSCRIPTION_FORMAT_CHARS=12000
 OLLAMA_UNLOAD_AFTER_TASK=true
 ```
 
-LLM tasks and transcription share a single GPU queue: the bot does not run Ollama and Whisper at the same time. After `/summary` or `/compare`, the Ollama model is explicitly unloaded so Whisper can use the GPU.
+LLM tasks, transcription, and transcript formatting share a single GPU queue: the bot does not run Ollama and Whisper at the same time. The raw Whisper transcript is sent immediately; formatting is scheduled after that response and edits the sent messages when it finishes. After local LLM work, the Ollama model is explicitly unloaded when `OLLAMA_UNLOAD_AFTER_TASK=true`.
+
+Set `TRANSCRIPTION_FORMAT_ENABLED=false` to keep raw Whisper output only. Set `TRANSCRIPTION_FORMAT_MODEL=` to disable formatting by leaving no model configured. Very long transcripts above `MAX_TRANSCRIPTION_FORMAT_CHARS` are left unformatted rather than partially rewritten.
 
 `run.sh` automatically adds CUDA libraries from `.venv` to `LD_LIBRARY_PATH` when they are installed through `install-voice-cuda`.
 

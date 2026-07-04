@@ -24,6 +24,7 @@ from tg_summary_bot.periods import format_period, parse_period
 from tg_summary_bot.storage import MessageStore, StoredImage, StoredVideo
 from tg_summary_bot.summarizer import Summarizer
 from tg_summary_bot.transcriber import FasterWhisperTranscriber
+from tg_summary_bot.transcript_formatter import TranscriptFormatter
 from tg_summary_bot.video_recognizer import VideoRecognizer
 
 
@@ -360,6 +361,7 @@ async def create_dispatcher(
     image_recognizer: ImageRecognizer,
     video_recognizer: VideoRecognizer,
     transcriber: FasterWhisperTranscriber | None,
+    transcript_formatter: TranscriptFormatter | None,
     gpu_lock: asyncio.Lock,
 ) -> Dispatcher:
     dp = Dispatcher()
@@ -417,6 +419,12 @@ async def create_dispatcher(
             f"transcribe_voice: `{settings.transcribe_voice}`\n"
             f"whisper_model: `{settings.whisper_model}`\n"
             f"whisper_device: `{settings.whisper_device}`\n"
+            f"transcription_format_enabled: `{settings.transcription_format_enabled}`\n"
+            f"transcription_format_provider: `{settings.transcription_format_provider}`\n"
+            f"transcription_format_model: `{settings.transcription_format_model}`\n"
+            f"transcription_format_num_ctx: `{settings.transcription_format_num_ctx}`\n"
+            f"transcription_format_num_predict: `{settings.transcription_format_num_predict}`\n"
+            f"max_transcription_format_chars: `{settings.max_transcription_format_chars}`\n"
             f"max_transcription_chars: `{settings.max_transcription_chars}`"
         )
 
@@ -934,6 +942,79 @@ async def create_dispatcher(
             source_message=message,
         )
 
+    async def format_transcript_response(
+        *,
+        source_message: Message,
+        request_message: Message,
+        response_messages: list[Message],
+        voice_sender_name: str,
+        transcript: str,
+        transcription_elapsed: float,
+    ) -> None:
+        if not transcript_formatter:
+            return
+        if len(transcript) > settings.max_transcription_format_chars:
+            logging.info(
+                "Transcript formatting skipped chat_id=%s message_id=%s chars=%s limit=%s",
+                source_message.chat.id,
+                source_message.message_id,
+                len(transcript),
+                settings.max_transcription_format_chars,
+            )
+            return
+
+        started = time.perf_counter()
+        try:
+            async with gpu_lock:
+                try:
+                    formatted = await transcript_formatter.format(transcript)
+                finally:
+                    await transcript_formatter.unload()
+        except Exception:  # noqa: BLE001
+            logging.exception(
+                "Transcript formatting failed chat_id=%s message_id=%s",
+                source_message.chat.id,
+                source_message.message_id,
+            )
+            return
+
+        formatted = formatted.strip()
+        if not formatted:
+            return
+
+        await save_message_text(
+            settings,
+            store,
+            source_message,
+            f"🎙 Voice message from {voice_sender_name}: {formatted}",
+            limit_chars=settings.max_transcription_chars,
+            replace_existing=True,
+        )
+        format_elapsed = time.perf_counter() - started
+        text = (
+            f"**Voice transcription from {voice_sender_name}**\n"
+            f"Saved for summaries in {transcription_elapsed:.1f} sec.\n"
+            f"Formatted by `{transcript_formatter.model_name}` in {format_elapsed:.1f} sec.\n\n"
+            f"{formatted}"
+        )
+        parts = split_telegram_text(text)
+        for index, part in enumerate(parts):
+            if index < len(response_messages):
+                await edit_text_logged(
+                    response_messages[index],
+                    part,
+                    source_message=request_message,
+                )
+            else:
+                response_messages.append(await answer_logged(request_message, part))
+
+        for old_message in response_messages[len(parts) :]:
+            await edit_text_logged(
+                old_message,
+                "Formatted transcript was merged into the previous message.",
+                source_message=request_message,
+            )
+
     async def transcribe_audio_source(
         source_message: Message,
         bot: Bot,
@@ -1016,9 +1097,22 @@ async def create_dispatcher(
             f"{transcript}"
         )
         parts = split_telegram_text(text)
+        response_messages = [status_message]
         await edit_text_logged(status_message, parts[0], source_message=request_message)
         for part in parts[1:]:
-            await answer_logged(request_message, part)
+            response_messages.append(await answer_logged(request_message, part))
+
+        if transcript_formatter:
+            asyncio.create_task(
+                format_transcript_response(
+                    source_message=source_message,
+                    request_message=request_message,
+                    response_messages=response_messages,
+                    voice_sender_name=voice_sender_name,
+                    transcript=transcript,
+                    transcription_elapsed=elapsed,
+                )
+            )
 
     @dp.message(Command("transcribe"))
     async def transcribe_command(message: Message, bot: Bot) -> None:
@@ -1267,6 +1361,28 @@ async def main() -> None:
     summarizer = Summarizer(llm, settings.chunk_chars)
     chat_assistant = ChatAssistant(question_llm, settings.chunk_chars)
     chat_memory = ChatMemory(store, llm, settings) if settings.memory_enabled else None
+    transcript_formatter_llm = (
+        build_llm_client(
+            settings,
+            provider=settings.transcription_format_provider,
+            model=settings.transcription_format_model,
+            num_ctx=settings.transcription_format_num_ctx,
+            num_predict=settings.transcription_format_num_predict,
+        )
+        if settings.transcribe_voice
+        and settings.transcription_format_enabled
+        and settings.transcription_format_model
+        else None
+    )
+    transcript_formatter = (
+        TranscriptFormatter(
+            transcript_formatter_llm,
+            model_name=settings.transcription_format_model,
+            max_chars=settings.max_transcription_format_chars,
+        )
+        if transcript_formatter_llm
+        else None
+    )
     image_recognizer = ImageRecognizer(settings)
     video_recognizer = VideoRecognizer(settings)
     transcriber = (
@@ -1286,6 +1402,7 @@ async def main() -> None:
         image_recognizer,
         video_recognizer,
         transcriber,
+        transcript_formatter,
         gpu_lock,
     )
 
