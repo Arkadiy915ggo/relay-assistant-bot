@@ -19,6 +19,7 @@ from tg_summary_bot.assistant import ChatAssistant
 from tg_summary_bot.config import Settings, load_settings
 from tg_summary_bot.image_recognizer import ImageRecognizer
 from tg_summary_bot.llm import build_llm_client
+from tg_summary_bot.memory import ChatMemory, should_use_memory
 from tg_summary_bot.periods import format_period, parse_period
 from tg_summary_bot.storage import MessageStore, StoredImage, StoredVideo
 from tg_summary_bot.summarizer import Summarizer
@@ -60,12 +61,18 @@ def split_telegram_text(text: str, limit: int = 3900) -> list[str]:
         return [text]
     chunks: list[str] = []
     current = ""
-    for line in text.splitlines():
-        addition = line + "\n"
-        if current and len(current) + len(addition) > limit:
+    for line in text.splitlines(keepends=True):
+        while line:
+            remaining = limit - len(current)
+            if remaining <= 0:
+                chunks.append(current.rstrip())
+                current = ""
+                remaining = limit
+            current += line[:remaining]
+            line = line[remaining:]
+        if len(current) >= limit:
             chunks.append(current.rstrip())
             current = ""
-        current += addition
     if current:
         chunks.append(current.rstrip())
     return chunks or [text[:limit]]
@@ -349,6 +356,7 @@ async def create_dispatcher(
     store: MessageStore,
     summarizer: Summarizer,
     chat_assistant: ChatAssistant,
+    chat_memory: ChatMemory | None,
     image_recognizer: ImageRecognizer,
     video_recognizer: VideoRecognizer,
     transcriber: FasterWhisperTranscriber | None,
@@ -369,6 +377,8 @@ async def create_dispatcher(
             "`/summary 7d` - last 7 days\n"
             "`/summary today` - today in UTC\n"
             "`/question 24h <text>` - chat with the assistant using recent context\n"
+            "`/memory` - compressed chat memory status\n"
+            "`/transcribe` - transcribe replied voice/audio\n"
             "`/image` - recognize the latest image or replied image\n"
             "`/video` - recognize the latest video/video note or replied video\n"
             "`/compare 10m` - compare summaries across Ollama models\n"
@@ -403,9 +413,37 @@ async def create_dispatcher(
             f"ollama_timeout_seconds: `{settings.ollama_timeout_seconds}`\n"
             f"ollama_num_ctx: `{settings.ollama_num_ctx}`\n"
             f"ollama_num_predict: `{settings.ollama_num_predict}`\n"
+            f"memory_enabled: `{settings.memory_enabled}`\n"
             f"transcribe_voice: `{settings.transcribe_voice}`\n"
             f"whisper_model: `{settings.whisper_model}`\n"
-            f"whisper_device: `{settings.whisper_device}`"
+            f"whisper_device: `{settings.whisper_device}`\n"
+            f"max_transcription_chars: `{settings.max_transcription_chars}`"
+        )
+
+    @dp.message(Command("memory"))
+    async def memory_command(message: Message) -> None:
+        if not is_allowed(settings, message.chat.id):
+            return
+        if not chat_memory:
+            await answer_logged(message, "Chat memory is disabled: `MEMORY_ENABLED=false`.")
+            return
+
+        args = (message.text or "").split(maxsplit=1)
+        if len(args) > 1:
+            await answer_logged(message, "Usage: `/memory`")
+            return
+
+        status = await chat_memory.status(message.chat.id)
+        await answer_logged(
+            message,
+            f"memory_blocks: `{status['memory_blocks']}`\n"
+            f"processed_until: `{status['processed_until']}`\n"
+            f"latest_raw_messages: `{status['latest_raw_messages']}`\n"
+            f"pending_old_messages: `{status['pending_old_messages']}`\n"
+            f"recent_period: `{status['recent_period']}`\n"
+            f"chunk_chars: `{status['chunk_chars']}`\n"
+            f"max_blocks: `{status['max_blocks']}`\n"
+            f"search_limit: `{status['search_limit']}`",
         )
 
     @dp.message(Command("summary"))
@@ -422,27 +460,50 @@ async def create_dispatcher(
             return
 
         wait_message = await answer_logged(message, "Collecting messages and building summary...")
-        since = datetime.now(timezone.utc) - period
+        now = datetime.now(timezone.utc)
+        since = now - period
+        use_memory = should_use_memory(period, chat_memory)
+        raw_since = chat_memory.recent_since(now) if use_memory and chat_memory else since
+        if raw_since < since:
+            raw_since = since
         messages = await store.get_messages_since(
             chat_id=message.chat.id,
-            since=since,
+            since=raw_since,
             limit_chars=settings.max_summary_input_chars,
         )
         logging.info(
-            "Summary started chat_id=%s period=%s model=%s messages=%s",
+            "Summary started chat_id=%s period=%s model=%s raw_messages=%s memory=%s",
             message.chat.id,
             period_raw,
             settings.ollama_model
             if settings.resolved_llm_provider == "ollama"
             else settings.openai_model,
             len(messages),
+            use_memory,
         )
         started = time.perf_counter()
         try:
             async with gpu_lock:
                 try:
-                    summary = await summarizer.summarize(messages, format_period(period_raw))
+                    context_messages = messages
+                    if use_memory and chat_memory:
+                        created_blocks = await chat_memory.ensure_current(message.chat.id, now=now)
+                        blocks = await chat_memory.blocks_for_summary(
+                            chat_id=message.chat.id,
+                            since=since,
+                            until=raw_since,
+                        )
+                        context_messages = chat_memory.blocks_as_messages(blocks) + messages
+                        logging.info(
+                            "Summary memory context chat_id=%s blocks=%s created_blocks=%s",
+                            message.chat.id,
+                            len(blocks),
+                            created_blocks,
+                        )
+                    summary = await summarizer.summarize(context_messages, format_period(period_raw))
                 finally:
+                    if use_memory and chat_memory:
+                        await chat_memory.unload()
                     await summarizer.unload()
         except Exception as exc:  # noqa: BLE001
             logging.exception("Summary failed")
@@ -488,28 +549,53 @@ async def create_dispatcher(
             return
 
         wait_message = await answer_logged(message, "Thinking...")
-        since = datetime.now(timezone.utc) - period
+        now = datetime.now(timezone.utc)
+        since = now - period
+        use_memory = should_use_memory(period, chat_memory)
+        raw_since = chat_memory.recent_since(now) if use_memory and chat_memory else since
+        if raw_since < since:
+            raw_since = since
         messages = await store.get_messages_since(
             chat_id=message.chat.id,
-            since=since,
+            since=raw_since,
             limit_chars=settings.max_summary_input_chars,
         )
         logging.info(
-            "Question started chat_id=%s period=%s messages=%s",
+            "Question started chat_id=%s period=%s raw_messages=%s memory=%s",
             message.chat.id,
             period_raw,
             len(messages),
+            use_memory,
         )
         started = time.perf_counter()
         try:
             async with gpu_lock:
                 try:
+                    context_messages = messages
+                    if use_memory and chat_memory:
+                        created_blocks = await chat_memory.ensure_current(message.chat.id, now=now)
+                        blocks = await chat_memory.search(
+                            chat_id=message.chat.id,
+                            since=since,
+                            until=raw_since,
+                            query=question,
+                        )
+                        await chat_memory.unload()
+                        context_messages = chat_memory.blocks_as_messages(blocks) + messages
+                        logging.info(
+                            "Question memory context chat_id=%s blocks=%s created_blocks=%s",
+                            message.chat.id,
+                            len(blocks),
+                            created_blocks,
+                        )
                     answer = await chat_assistant.ask(
-                        messages,
+                        context_messages,
                         format_period(period_raw),
                         question,
                     )
                 finally:
+                    if use_memory and chat_memory:
+                        await chat_memory.unload()
                     await chat_assistant.unload()
         except Exception as exc:  # noqa: BLE001
             logging.exception("Question failed")
@@ -646,7 +732,13 @@ async def create_dispatcher(
                 f"🎞 Video recognition for message #{video.message_id} "
                 f"from {video.sender_name}: {cached.result}"
             )
-            await save_message_text(settings, store, message, saved_text)
+            await save_message_text(
+                settings,
+                store,
+                message,
+                saved_text,
+                limit_chars=settings.max_transcription_chars,
+            )
             text = (
                 f"**Video recognition for message #{video.message_id}**\n"
                 f"Source: {video.sender_name}\n"
@@ -722,7 +814,13 @@ async def create_dispatcher(
             cache_key=cache_key,
             result=result,
         )
-        await save_message_text(settings, store, message, saved_text)
+        await save_message_text(
+            settings,
+            store,
+            message,
+            saved_text,
+            limit_chars=settings.max_transcription_chars,
+        )
         text = (
             f"**Video recognition for message #{video.message_id}**\n"
             f"Source: {video.sender_name}\n"
@@ -836,38 +934,50 @@ async def create_dispatcher(
             source_message=message,
         )
 
-    @dp.message(F.voice | F.audio)
-    async def transcribe_audio_message(message: Message, bot: Bot) -> None:
-        if not is_allowed(settings, message.chat.id):
+    async def transcribe_audio_source(
+        source_message: Message,
+        bot: Bot,
+        *,
+        request_message: Message | None = None,
+        replace_existing: bool = False,
+        notify_disabled: bool = False,
+    ) -> None:
+        request_message = request_message or source_message
+        if not is_allowed(settings, request_message.chat.id):
             return
         if not settings.transcribe_voice:
+            if notify_disabled:
+                await answer_logged(
+                    request_message,
+                    "Voice transcription is disabled: `TRANSCRIBE_VOICE=false`.",
+                )
             return
         if not transcriber:
-            await answer_logged(message, "Voice transcription is not configured.")
+            await answer_logged(request_message, "Voice transcription is not configured.")
             return
 
-        duration = audio_duration(message)
+        duration = audio_duration(source_message)
         if duration and duration > settings.max_voice_seconds:
             await answer_logged(
-                message,
+                request_message,
                 "Voice message is too long: "
                 f"{duration} sec. Limit: {settings.max_voice_seconds} sec.",
             )
             return
 
-        file_id = audio_file_id(message)
+        file_id = audio_file_id(source_message)
         if not file_id:
             return
 
-        voice_sender_name = sender_name(message)[1].replace("*", "").strip() or "Unknown"
+        voice_sender_name = sender_name(source_message)[1].replace("*", "").strip() or "Unknown"
         status_message = await reply_logged(
-            message,
+            request_message,
             f"🎙 Transcribing voice message from **{voice_sender_name}**...",
         )
         audio_path: Path | None = None
         started = time.perf_counter()
         try:
-            audio_path = await download_audio_message(settings, bot, message, file_id)
+            audio_path = await download_audio_message(settings, bot, source_message, file_id)
             async with gpu_lock:
                 transcript = await transcriber.transcribe(audio_path)
         except Exception as exc:  # noqa: BLE001
@@ -875,7 +985,7 @@ async def create_dispatcher(
             await edit_text_logged(
                 status_message,
                 f"Failed to transcribe voice message: `{type(exc).__name__}: {exc}`",
-                source_message=message,
+                source_message=request_message,
             )
             return
         finally:
@@ -886,21 +996,52 @@ async def create_dispatcher(
             await edit_text_logged(
                 status_message,
                 "No speech was recognized in the voice message.",
-                source_message=message,
+                source_message=request_message,
             )
             return
 
         saved_text = f"🎙 Voice message from {voice_sender_name}: {transcript}"
-        await save_message_text(settings, store, message, saved_text)
+        await save_message_text(
+            settings,
+            store,
+            source_message,
+            saved_text,
+            limit_chars=settings.max_transcription_chars,
+            replace_existing=replace_existing,
+        )
         elapsed = time.perf_counter() - started
-        preview = transcript[:900] + ("..." if len(transcript) > 900 else "")
-        await edit_text_logged(
-            status_message,
+        text = (
             f"**Voice transcription from {voice_sender_name}**\n"
             f"Saved for summaries in {elapsed:.1f} sec.\n\n"
-            f"{preview}",
-            source_message=message,
+            f"{transcript}"
         )
+        parts = split_telegram_text(text)
+        await edit_text_logged(status_message, parts[0], source_message=request_message)
+        for part in parts[1:]:
+            await answer_logged(request_message, part)
+
+    @dp.message(Command("transcribe"))
+    async def transcribe_command(message: Message, bot: Bot) -> None:
+        if not is_allowed(settings, message.chat.id):
+            return
+        if not message.reply_to_message:
+            await answer_logged(message, "Reply to a voice/audio message with `/transcribe`.")
+            return
+        if not audio_file_id(message.reply_to_message):
+            await answer_logged(message, "The replied message is not voice/audio.")
+            return
+
+        await transcribe_audio_source(
+            message.reply_to_message,
+            bot,
+            request_message=message,
+            replace_existing=True,
+            notify_disabled=True,
+        )
+
+    @dp.message(F.voice | F.audio)
+    async def transcribe_audio_message(message: Message, bot: Bot) -> None:
+        await transcribe_audio_source(message, bot)
 
     @dp.channel_post(F.photo | (F.document & F.document.mime_type.startswith("image/")))
     async def save_channel_image(message: Message) -> None:
@@ -1015,8 +1156,12 @@ async def save_message_text(
     store: MessageStore,
     message: Message,
     text: str,
+    *,
+    limit_chars: int | None = None,
+    replace_existing: bool = False,
 ) -> None:
-    text = " ".join(text.split())[: settings.max_message_chars]
+    limit = settings.max_message_chars if limit_chars is None else limit_chars
+    text = " ".join(text.split())[:limit]
     sender_id, name = sender_name(message)
     await store.save_message(
         chat_id=message.chat.id,
@@ -1031,6 +1176,7 @@ async def save_message_text(
             if message.reply_to_message
             else None
         ),
+        replace=replace_existing,
     )
 
 
@@ -1120,6 +1266,7 @@ async def main() -> None:
     question_llm = build_llm_client(settings, model=settings.question_model or None)
     summarizer = Summarizer(llm, settings.chunk_chars)
     chat_assistant = ChatAssistant(question_llm, settings.chunk_chars)
+    chat_memory = ChatMemory(store, llm, settings) if settings.memory_enabled else None
     image_recognizer = ImageRecognizer(settings)
     video_recognizer = VideoRecognizer(settings)
     transcriber = (
@@ -1135,6 +1282,7 @@ async def main() -> None:
         store,
         summarizer,
         chat_assistant,
+        chat_memory,
         image_recognizer,
         video_recognizer,
         transcriber,

@@ -14,7 +14,8 @@ A safe Telegram bot that stores new chat messages and produces short AI summarie
 - restricts access with `ALLOWED_CHAT_IDS`;
 - optionally transcribes Telegram voice/audio messages locally with `faster-whisper`;
 - manually recognizes text from images with an Ollama vision model;
-- manually recognizes videos and Telegram video notes through sampled key frames.
+- manually recognizes videos and Telegram video notes through sampled key frames;
+- compresses old chat history into SQLite memory blocks for long `/question` and `/summary` periods.
 
 ## Telegram Limitations
 
@@ -134,11 +135,32 @@ Restart the bot.
 /summary today
 /question your question
 /question 24h your question
+/memory
 /image
 /ocr
 /video
 /vocr
 /compare 10m
+```
+
+## Chat Memory
+
+For periods longer than `MEMORY_RECENT_PERIOD`, the bot can compress older raw messages into short SQLite memory blocks. `/question` uses fresh raw messages plus relevant memory blocks; `/summary` uses fresh raw messages plus memory blocks for the requested period.
+
+Configure:
+
+```env
+MEMORY_ENABLED=true
+MEMORY_RECENT_PERIOD=24h
+MEMORY_CHUNK_CHARS=18000
+MEMORY_MAX_BLOCKS=200
+MEMORY_SEARCH_LIMIT=8
+```
+
+Check status:
+
+```text
+/memory
 ```
 
 ## Response Logs

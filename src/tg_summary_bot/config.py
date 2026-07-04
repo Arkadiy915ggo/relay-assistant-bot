@@ -68,9 +68,15 @@ class Settings:
     video_frame_max_width: int
     video_transcribe_audio: bool
     max_message_chars: int
+    max_transcription_chars: int
     max_summary_input_chars: int
     chunk_chars: int
     default_summary_period: str
+    memory_enabled: bool
+    memory_recent_period: str
+    memory_chunk_chars: int
+    memory_max_blocks: int
+    memory_search_limit: int
 
     @property
     def resolved_llm_provider(self) -> str:
@@ -130,7 +136,13 @@ def load_settings() -> Settings:
         video_frame_max_width=int(os.getenv("VIDEO_FRAME_MAX_WIDTH", "960")),
         video_transcribe_audio=_bool(os.getenv("VIDEO_TRANSCRIBE_AUDIO", "true")),
         max_message_chars=int(os.getenv("MAX_MESSAGE_CHARS", "4000")),
+        max_transcription_chars=int(os.getenv("MAX_TRANSCRIPTION_CHARS", "50000")),
         max_summary_input_chars=int(os.getenv("MAX_SUMMARY_INPUT_CHARS", "120000")),
         chunk_chars=int(os.getenv("CHUNK_CHARS", "18000")),
         default_summary_period=os.getenv("DEFAULT_SUMMARY_PERIOD", "24h").strip(),
+        memory_enabled=_bool(os.getenv("MEMORY_ENABLED", "true")),
+        memory_recent_period=os.getenv("MEMORY_RECENT_PERIOD", "24h").strip(),
+        memory_chunk_chars=int(os.getenv("MEMORY_CHUNK_CHARS", "18000")),
+        memory_max_blocks=int(os.getenv("MEMORY_MAX_BLOCKS", "200")),
+        memory_search_limit=int(os.getenv("MEMORY_SEARCH_LIMIT", "8")),
     )
