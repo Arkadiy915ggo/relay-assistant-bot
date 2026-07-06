@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from tg_summary_bot.llm import LLMClient
+from tg_summary_bot.observability import opik_track, update_opik_span_metadata
 from tg_summary_bot.storage import StoredMessage
 
 
@@ -49,12 +50,21 @@ class Summarizer:
         self.llm = llm
         self.chunk_chars = chunk_chars
 
+    @opik_track(name="summary.summarize")
     async def summarize(self, messages: list[StoredMessage], period_label: str) -> str:
         if not messages:
             return f"За период `{period_label}` сохраненных сообщений нет."
 
         rendered = _render_messages(messages)
         chunks = _split_text(rendered, self.chunk_chars)
+        update_opik_span_metadata(
+            {
+                "period_label": period_label,
+                "message_count": len(messages),
+                "chunk_count": len(chunks),
+                "input_chars": len(rendered),
+            }
+        )
 
         if len(chunks) == 1:
             return await self._summarize_chunk(chunks[0], period_label, final=True)
@@ -75,6 +85,7 @@ class Summarizer:
     async def unload(self) -> None:
         await self.llm.unload()
 
+    @opik_track(name="summary.chunk")
     async def _summarize_chunk(
         self,
         chunk: str,
@@ -84,6 +95,15 @@ class Summarizer:
         chunk_index: int = 1,
         chunk_count: int = 1,
     ) -> str:
+        update_opik_span_metadata(
+            {
+                "period_label": period_label,
+                "final": final,
+                "chunk_index": chunk_index,
+                "chunk_count": chunk_count,
+                "input_chars": len(chunk),
+            }
+        )
         if final:
             user = f"""
 Сделай итоговое саммари Telegram-обсуждения за период: {period_label}.
@@ -121,8 +141,16 @@ class Summarizer:
 """.strip()
         return await self.llm.complete(system=SYSTEM_PROMPT, user=user)
 
+    @opik_track(name="summary.merge")
     async def _merge_summaries(self, partials: list[str], period_label: str) -> str:
         joined = "\n\n---\n\n".join(partials)
+        update_opik_span_metadata(
+            {
+                "period_label": period_label,
+                "partial_count": len(partials),
+                "input_chars": len(joined),
+            }
+        )
         user = f"""
 Собери финальное краткое саммари Telegram-обсуждения за период: {period_label}.
 Ниже промежуточные выжимки частей длинного обсуждения.

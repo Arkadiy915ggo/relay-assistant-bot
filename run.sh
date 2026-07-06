@@ -9,6 +9,8 @@ usage() {
   cat <<'EOF'
 Usage:
   ./run.sh install   Create .venv and install dependencies
+  ./run.sh install-opik
+                     Create .venv and install Opik tracing dependencies
   ./run.sh install-voice
                      Create .venv and install CPU voice transcription dependencies
   ./run.sh install-voice-cuda
@@ -55,6 +57,11 @@ case "$COMMAND" in
     python3 -m venv .venv
     .venv/bin/python -m pip install --upgrade pip
     .venv/bin/python -m pip install -e .
+    ;;
+  install-opik)
+    python3 -m venv .venv
+    .venv/bin/python -m pip install --upgrade pip
+    .venv/bin/python -m pip install -e '.[opik]'
     ;;
   install-voice)
     python3 -m venv .venv

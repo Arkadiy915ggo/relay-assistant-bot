@@ -15,7 +15,8 @@ A safe Telegram bot that stores new chat messages and produces short AI summarie
 - optionally transcribes Telegram voice/audio messages locally with `faster-whisper`;
 - manually recognizes text from images with an Ollama vision model;
 - manually recognizes videos and Telegram video notes through sampled key frames;
-- compresses old chat history into SQLite memory blocks for long `/question` and `/summary` periods.
+- compresses old chat history into SQLite memory blocks for long `/question` and `/summary` periods;
+- optionally logs LLM traces to Opik for answer quality analysis.
 
 ## Telegram Limitations
 
@@ -76,6 +77,12 @@ For local voice transcription with Whisper:
 
 ```bash
 ./run.sh install-voice
+```
+
+For Opik tracing:
+
+```bash
+./run.sh install-opik
 ```
 
 ## BotFather Setup
@@ -173,6 +180,27 @@ RESPONSE_LOG_FILE=data/responses.log
 ```
 
 Use this log to inspect real bot answers and improve prompt quality.
+
+## Opik Tracing
+
+Opik can collect LLM traces for `/summary`, `/question`, `/compare`, and transcript formatting. It is disabled by default because prompts can contain private chat history.
+
+Install and configure:
+
+```bash
+./run.sh install-opik
+opik configure
+```
+
+Enable in `.env`:
+
+```env
+OPIK_ENABLED=true
+OPIK_PROJECT_NAME=telegram-summary-bot
+OPIK_CAPTURE_CONTENT=true
+```
+
+Set `OPIK_CAPTURE_CONTENT=false` to log only metadata without prompts and outputs. For private chats, prefer a local or self-hosted Opik backend.
 
 ## Voice Messages
 

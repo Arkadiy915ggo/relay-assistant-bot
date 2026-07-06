@@ -83,6 +83,9 @@ class Settings:
     memory_chunk_chars: int
     memory_max_blocks: int
     memory_search_limit: int
+    opik_enabled: bool
+    opik_project_name: str
+    opik_capture_content: bool
 
     @property
     def resolved_llm_provider(self) -> str:
@@ -163,4 +166,7 @@ def load_settings() -> Settings:
         memory_chunk_chars=int(os.getenv("MEMORY_CHUNK_CHARS", "18000")),
         memory_max_blocks=int(os.getenv("MEMORY_MAX_BLOCKS", "200")),
         memory_search_limit=int(os.getenv("MEMORY_SEARCH_LIMIT", "8")),
+        opik_enabled=_bool(os.getenv("OPIK_ENABLED", "false")),
+        opik_project_name=os.getenv("OPIK_PROJECT_NAME", "telegram-summary-bot").strip(),
+        opik_capture_content=_bool(os.getenv("OPIK_CAPTURE_CONTENT", "true"), default=True),
     )

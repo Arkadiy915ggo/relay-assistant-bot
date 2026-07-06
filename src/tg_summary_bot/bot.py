@@ -390,8 +390,6 @@ async def create_dispatcher(
 
     @dp.message(Command("stats"))
     async def stats_command(message: Message) -> None:
-        if not is_allowed(settings, message.chat.id):
-            return
         count = await store.count_messages(message.chat.id)
         image_count = await store.count_images(message.chat.id)
         video_count = await store.count_videos(message.chat.id)
@@ -415,6 +413,9 @@ async def create_dispatcher(
             f"ollama_timeout_seconds: `{settings.ollama_timeout_seconds}`\n"
             f"ollama_num_ctx: `{settings.ollama_num_ctx}`\n"
             f"ollama_num_predict: `{settings.ollama_num_predict}`\n"
+            f"opik_enabled: `{settings.opik_enabled}`\n"
+            f"opik_project_name: `{settings.opik_project_name}`\n"
+            f"opik_capture_content: `{settings.opik_capture_content}`\n"
             f"memory_enabled: `{settings.memory_enabled}`\n"
             f"transcribe_voice: `{settings.transcribe_voice}`\n"
             f"whisper_model: `{settings.whisper_model}`\n"
@@ -425,7 +426,8 @@ async def create_dispatcher(
             f"transcription_format_num_ctx: `{settings.transcription_format_num_ctx}`\n"
             f"transcription_format_num_predict: `{settings.transcription_format_num_predict}`\n"
             f"max_transcription_format_chars: `{settings.max_transcription_format_chars}`\n"
-            f"max_transcription_chars: `{settings.max_transcription_chars}`"
+            f"max_transcription_chars: `{settings.max_transcription_chars}`\n"
+            f"access_allowed: `{is_allowed(settings, message.chat.id)}`"
         )
 
     @dp.message(Command("memory"))

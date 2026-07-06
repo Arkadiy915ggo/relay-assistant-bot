@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from tg_summary_bot.llm import LLMClient
+from tg_summary_bot.observability import opik_track, update_opik_span_metadata
 
 
 TRANSCRIPT_FORMAT_SYSTEM_PROMPT = """
@@ -22,6 +23,7 @@ class TranscriptFormatter:
         self.model_name = model_name
         self.max_chars = max_chars
 
+    @opik_track(name="transcript.format")
     async def format(self, transcript: str) -> str:
         text = transcript.strip()
         if not text:
@@ -31,6 +33,13 @@ class TranscriptFormatter:
                 f"Transcript is too long to format: {len(text)} chars. "
                 f"Limit: {self.max_chars} chars."
             )
+        update_opik_span_metadata(
+            {
+                "model": self.model_name,
+                "transcript_chars": len(text),
+                "max_chars": self.max_chars,
+            }
+        )
 
         user = f"""
 Отформатируй расшифровку. Не сокращай и не пересказывай текст.

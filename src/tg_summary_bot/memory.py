@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 
 from tg_summary_bot.config import Settings
 from tg_summary_bot.llm import LLMClient
+from tg_summary_bot.observability import opik_track, update_opik_span_metadata
 from tg_summary_bot.periods import parse_period
 from tg_summary_bot.storage import ChatMemoryBlock, MessageStore, StoredMessage
 
@@ -202,8 +203,15 @@ class ChatMemory:
             )
         return messages
 
+    @opik_track(name="memory.compress")
     async def _compress(self, messages: list[StoredMessage]) -> tuple[str, str, str]:
         rendered = _render_messages(messages)
+        update_opik_span_metadata(
+            {
+                "message_count": len(messages),
+                "input_chars": len(rendered),
+            }
+        )
         user = f"""
 Сожми старую часть Telegram-чата в один memory-блок.
 

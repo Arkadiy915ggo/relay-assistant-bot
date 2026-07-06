@@ -4,6 +4,14 @@
   "skills": {
     "paths": [".opencode/skills"]
   },
+  "mcp": {
+    "opik-mcp": {
+      "type": "remote",
+      "url": "https://www.comet.com/opik/api/v1/mcp",
+      "enabled": true,
+      "timeout": 120000
+    }
+  },
   "command": {
     "project-overview": {
       "description": "Load the project architecture overview for this Telegram bot.",

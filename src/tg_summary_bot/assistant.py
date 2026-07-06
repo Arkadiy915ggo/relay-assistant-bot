@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from tg_summary_bot.llm import LLMClient
+from tg_summary_bot.observability import opik_track, update_opik_span_metadata
 from tg_summary_bot.storage import StoredMessage
 
 
@@ -47,12 +48,22 @@ class ChatAssistant:
         self.llm = llm
         self.chunk_chars = chunk_chars
 
+    @opik_track(name="question.ask")
     async def ask(self, messages: list[StoredMessage], period_label: str, question: str) -> str:
         if not messages:
             return await self._answer_from_context("", period_label, question)
 
         rendered = _render_messages(messages)
         chunks = _split_text(rendered, self.chunk_chars)
+        update_opik_span_metadata(
+            {
+                "period_label": period_label,
+                "message_count": len(messages),
+                "chunk_count": len(chunks),
+                "context_chars": len(rendered),
+                "question_chars": len(question),
+            }
+        )
 
         if len(chunks) == 1:
             return await self._answer_from_context(chunks[0], period_label, question)
@@ -77,6 +88,7 @@ class ChatAssistant:
     async def unload(self) -> None:
         await self.llm.unload()
 
+    @opik_track(name="question.extract_context")
     async def _extract_relevant_context(
         self,
         chunk: str,
@@ -86,6 +98,15 @@ class ChatAssistant:
         chunk_index: int,
         chunk_count: int,
     ) -> str:
+        update_opik_span_metadata(
+            {
+                "period_label": period_label,
+                "chunk_index": chunk_index,
+                "chunk_count": chunk_count,
+                "chunk_chars": len(chunk),
+                "question_chars": len(question),
+            }
+        )
         user = f"""
 Пользователь хочет пообщаться с ассистентом и задал вопрос:
 {question}
@@ -100,7 +121,15 @@ class ChatAssistant:
 """.strip()
         return await self.llm.complete(system=CHAT_SYSTEM_PROMPT, user=user)
 
+    @opik_track(name="question.answer")
     async def _answer_from_context(self, context: str, period_label: str, question: str) -> str:
+        update_opik_span_metadata(
+            {
+                "period_label": period_label,
+                "context_chars": len(context),
+                "question_chars": len(question),
+            }
+        )
         context_block = context or "История чата за выбранный период пуста."
         user = f"""
 Пользователь задал вопрос в Telegram-чате.
