@@ -9,22 +9,56 @@ from tg_summary_bot.config import Settings
 from tg_summary_bot.llm import LLMClient
 from tg_summary_bot.observability import opik_track, update_opik_span_metadata
 from tg_summary_bot.periods import parse_period
-from tg_summary_bot.storage import ChatMemoryBlock, MessageStore, StoredMessage
+from tg_summary_bot.storage import (
+    ChatMemoryBlock,
+    ChatParticipantFact,
+    MessageStore,
+    StoredMessage,
+)
 
 
 MEMORY_SYSTEM_PROMPT = """
 Ты аккуратно сжимаешь историю Telegram-чата в долговременную память.
 Пиши по-русски, кратко и фактически.
-Не выдумывай решения, ответственных, даты и договоренности.
-Сохраняй имена участников, явные обещания, важные темы, решения и открытые вопросы.
+Не выдумывай решения, ответственных, даты, роли, предпочтения и договоренности.
+Сохраняй только то, что явно следует из сообщений.
+Каждый факт о человеке должен иметь source_message_ids из входных сообщений.
+Не сохраняй шутки, оскорбления, догадки и временные эмоции как факты о человеке.
 """.strip()
+
+
+FACT_TYPES = {
+    "role",
+    "responsibility",
+    "project",
+    "preference",
+    "constraint",
+    "task",
+    "temporary_state",
+    "skill",
+    "relationship",
+    "other",
+}
+TEMPORARY_FACT_TYPES = {"task", "temporary_state"}
+ROLLUP_GROUP_SIZE = 8
+
+
+def participant_key(sender_id: int | None, sender_name: str) -> str:
+    if sender_id is not None:
+        return f"id:{sender_id}"
+    normalized = re.sub(r"[^\wа-яА-ЯёЁ]+", "_", sender_name.strip().lower()).strip("_")
+    return f"name:{normalized or 'unknown'}"
 
 
 def _render_messages(messages: list[StoredMessage]) -> str:
     lines: list[str] = []
     for msg in messages:
         reply = f" reply_to={msg.reply_to_message_id}" if msg.reply_to_message_id else ""
-        lines.append(f"[{msg.created_at} #{msg.message_id}{reply}] {msg.sender_name}: {msg.text}")
+        key = participant_key(msg.sender_id, msg.sender_name)
+        lines.append(
+            f"[{msg.created_at} #{msg.message_id}{reply} sender_key={key}] "
+            f"{msg.sender_name}: {msg.text}"
+        )
     return "\n".join(lines)
 
 
@@ -42,14 +76,134 @@ def _json_object(text: str) -> dict[str, object] | None:
     return data if isinstance(data, dict) else None
 
 
+def _safe_json(data: dict[str, object]) -> str:
+    return json.dumps(data, ensure_ascii=False, sort_keys=True)
+
+
 def _string_list(value: object) -> str:
     if isinstance(value, list):
         return ", ".join(str(item).strip() for item in value if str(item).strip())
     return str(value or "").strip()
 
 
+def _object_list(value: object) -> list[dict[str, object]]:
+    if not isinstance(value, list):
+        return []
+    return [item for item in value if isinstance(item, dict)]
+
+
+def _text_items(value: object, *, limit: int = 8) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    items: list[str] = []
+    for item in value:
+        if isinstance(item, dict):
+            text = str(item.get("text") or item.get("fact") or item.get("task") or "").strip()
+        else:
+            text = str(item or "").strip()
+        if text:
+            items.append(text)
+    return items[:limit]
+
+
 def _tokens(text: str) -> list[str]:
-    return [token.lower() for token in re.findall(r"[\wа-яА-ЯёЁ]{3,}", text)]
+    result: list[str] = []
+    for token in re.findall(r"[\wа-яА-ЯёЁ]{3,}", text.lower()):
+        if token not in result:
+            result.append(token)
+    return result[:24]
+
+
+def _int_list(value: object) -> list[int]:
+    if not isinstance(value, list):
+        return []
+    result: list[int] = []
+    for item in value:
+        try:
+            number = int(item)
+        except (TypeError, ValueError):
+            continue
+        result.append(number)
+    return result
+
+
+def _parse_datetime(value: str) -> datetime:
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return datetime.now(timezone.utc)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _expires_at(fact_type: str, last_seen_at: str, raw: dict[str, object]) -> str | None:
+    raw_days = raw.get("expires_after_days")
+    try:
+        days = int(raw_days) if raw_days is not None else None
+    except (TypeError, ValueError):
+        days = None
+
+    if days is None and fact_type == "temporary_state":
+        days = 14
+    if days is None and fact_type == "task":
+        days = 60
+    if days is None or days <= 0:
+        return None
+    return (_parse_datetime(last_seen_at) + timedelta(days=days)).isoformat()
+
+
+def _participant_name_for_key(messages: list[StoredMessage], key: str) -> str:
+    for message in messages:
+        if participant_key(message.sender_id, message.sender_name) == key:
+            return message.sender_name
+    return key
+
+
+def _block_structured_data(block: ChatMemoryBlock) -> dict[str, object]:
+    data = _json_object(block.structured_json)
+    return data or {}
+
+
+def _block_text(block: ChatMemoryBlock) -> str:
+    data = _block_structured_data(block)
+    sections = [
+        f"Сжатая память чата ({block.level}) за {block.period_start}..{block.period_end}.",
+        f"Темы: {block.topics or 'не выделены'}",
+        f"Ключевые слова: {block.keywords or 'не выделены'}",
+        f"Сообщений в блоке: {block.message_count}",
+        "",
+        str(data.get("summary") or block.summary),
+    ]
+    for title, key in [
+        ("Решения", "decisions"),
+        ("Задачи", "tasks"),
+        ("Открытые вопросы", "open_questions"),
+        ("Важные события", "important_events"),
+    ]:
+        items = _text_items(data.get(key))
+        if items:
+            sections.append(f"\n{title}:")
+            sections.extend(f"- {item}" for item in items)
+    return "\n".join(sections).strip()
+
+
+def _profile_lines(facts: list[ChatParticipantFact], *, limit: int = 18) -> list[str]:
+    grouped: dict[str, list[ChatParticipantFact]] = {}
+    names: dict[str, str] = {}
+    for fact in facts:
+        if fact.confidence == "low":
+            continue
+        grouped.setdefault(fact.participant_key, []).append(fact)
+        names[fact.participant_key] = fact.participant_name
+
+    lines: list[str] = []
+    for key, user_facts in grouped.items():
+        lines.append(f"- {names.get(key, key)}:")
+        for fact in user_facts[:limit]:
+            suffix = f" ({fact.fact_type}, {fact.confidence})"
+            lines.append(f"  - {fact.fact_text}{suffix}")
+    return lines
 
 
 class ChatMemory:
@@ -80,28 +234,32 @@ class ChatMemory:
                 limit_chars=self.chunk_chars,
             )
             if not messages:
+                await self._maintain_hierarchy(chat_id)
                 return created_blocks
 
-            summary, topics, keywords = await self._compress(messages)
+            data = await self._compress_messages(messages)
             period_start = messages[0].created_at
             period_end = messages[-1].created_at
             await self.store.save_memory_block(
                 chat_id=chat_id,
                 period_start=period_start,
                 period_end=period_end,
-                summary=summary,
-                topics=topics,
-                keywords=keywords,
+                summary=str(data.get("summary") or "")[:2500],
+                topics=_string_list(data.get("topics"))[:1000],
+                keywords=_string_list(data.get("keywords"))[:1000],
                 message_count=len(messages),
+                structured_json=_safe_json(data),
+                level="chunk",
                 processed_until=period_end,
-                max_blocks=self.max_blocks,
             )
+            saved_facts = await self._save_participant_facts(chat_id, data, messages)
             processed = period_end
             created_blocks += 1
             logging.info(
-                "Chat memory block created chat_id=%s messages=%s period=%s..%s",
+                "Chat memory block created chat_id=%s messages=%s facts=%s period=%s..%s",
                 chat_id,
                 len(messages),
+                saved_facts,
                 period_start,
                 period_end,
             )
@@ -127,40 +285,142 @@ class ChatMemory:
         until: datetime,
         query: str,
     ) -> list[ChatMemoryBlock]:
-        candidates = await self.store.get_recent_memory_blocks_for_period(
+        candidates = await self.store.search_memory_blocks(
             chat_id=chat_id,
             since=since,
             until=until,
-            limit=self.max_blocks,
+            query=query,
+            limit=max(self.search_limit * 4, 20),
         )
-        terms = _tokens(query)
-        if not terms:
-            return candidates[: self.search_limit]
+        if not candidates:
+            candidates = await self.store.get_recent_memory_blocks_for_period(
+                chat_id=chat_id,
+                since=since,
+                until=until,
+                limit=max(self.search_limit * 3, 12),
+            )
+        if len(candidates) <= self.search_limit:
+            return candidates
 
-        scored: list[tuple[int, ChatMemoryBlock]] = []
-        for block in candidates:
-            keywords = block.keywords.lower()
-            topics = block.topics.lower()
-            summary = block.summary.lower()
-            score = 0
-            for term in terms:
-                score += keywords.count(term) * 3
-                score += topics.count(term) * 2
-                score += summary.count(term)
-            if score:
-                scored.append((score, block))
+        keyword_ranked = self._keyword_rank(candidates, query)
+        reranked = await self._rerank_blocks(keyword_ranked[: max(self.search_limit * 3, 12)], query)
+        return reranked[: self.search_limit]
 
-        if not scored:
-            return candidates[: self.search_limit]
+    async def participant_context(
+        self,
+        *,
+        chat_id: int,
+        query: str,
+        participant_keys: list[str] | None = None,
+        participant_names: list[str] | None = None,
+        limit: int = 18,
+    ) -> str:
+        facts: list[ChatParticipantFact] = []
+        seen: set[int] = set()
 
-        scored.sort(key=lambda item: (item[0], item[1].period_end), reverse=True)
-        return [block for _, block in scored[: self.search_limit]]
+        explicit_keys = list(dict.fromkeys(participant_keys or []))
+        if explicit_keys:
+            for fact in await self.store.get_participant_facts(
+                chat_id=chat_id,
+                participant_keys=explicit_keys,
+                limit=limit,
+            ):
+                if fact.fact_id not in seen:
+                    facts.append(fact)
+                    seen.add(fact.fact_id)
+
+        for name in participant_names or []:
+            for fact in await self.store.get_participant_facts(
+                chat_id=chat_id,
+                participant_name=name,
+                limit=limit,
+            ):
+                if fact.fact_id not in seen:
+                    facts.append(fact)
+                    seen.add(fact.fact_id)
+
+        search_facts = await self.store.search_participant_facts(
+            chat_id=chat_id,
+            query=query,
+            participant_keys=explicit_keys or None,
+            limit=limit,
+        )
+        for fact in search_facts:
+            if fact.fact_id not in seen:
+                facts.append(fact)
+                seen.add(fact.fact_id)
+
+        lines = _profile_lines(facts, limit=limit)
+        if not lines:
+            return ""
+        return "Паспорта релевантных участников:\n" + "\n".join(lines)
+
+    async def profile_text(
+        self,
+        *,
+        chat_id: int,
+        participant_keys: list[str] | None = None,
+        participant_name: str | None = None,
+        include_inactive: bool = False,
+        limit: int = 50,
+    ) -> str:
+        facts = await self.store.get_participant_facts(
+            chat_id=chat_id,
+            participant_keys=participant_keys,
+            participant_name=participant_name,
+            include_inactive=include_inactive,
+            limit=limit,
+        )
+        if not facts:
+            return "Паспорт участника пока пуст."
+        lines = _profile_lines(facts, limit=limit)
+        return "Паспорт участника:\n" + "\n".join(lines)
+
+    async def forget_profile(self, *, chat_id: int, participant_keys: list[str]) -> int:
+        return await self.store.mark_participant_facts_status(
+            chat_id=chat_id,
+            participant_keys=participant_keys,
+            status="forgotten",
+        )
+
+    async def reset_blocks(self, chat_id: int) -> None:
+        await self.store.reset_chat_memory(chat_id)
+
+    async def add_profile_correction(
+        self,
+        *,
+        chat_id: int,
+        participant_key: str,
+        participant_name: str,
+        fact_text: str,
+        source_message_id: int,
+        created_at: datetime,
+    ) -> None:
+        if created_at.tzinfo is None:
+            created_at = created_at.replace(tzinfo=timezone.utc)
+        created_at_iso = created_at.astimezone(timezone.utc).isoformat()
+        await self.store.save_participant_fact(
+            chat_id=chat_id,
+            participant_key=participant_key,
+            participant_name=participant_name,
+            fact_type="other",
+            fact_text=fact_text,
+            source_message_ids=[source_message_id],
+            confidence="high",
+            first_seen_at=created_at_iso,
+            last_seen_at=created_at_iso,
+            expires_at=None,
+        )
 
     async def status(self, chat_id: int) -> dict[str, object]:
         cutoff = self.recent_since()
         processed_until = await self.store.get_memory_processed_until(chat_id)
         return {
             "memory_blocks": await self.store.count_memory_blocks(chat_id),
+            "chunk_blocks": await self.store.count_memory_blocks(chat_id, level="chunk"),
+            "rollup_blocks": await self.store.count_memory_blocks(chat_id, level="rollup"),
+            "archive_blocks": await self.store.count_memory_blocks(chat_id, level="archive"),
+            "participant_facts": await self.store.count_participant_facts(chat_id),
             "processed_until": processed_until or "none",
             "latest_raw_messages": await self.store.count_messages_since(
                 chat_id=chat_id,
@@ -173,7 +433,7 @@ class ChatMemory:
             ),
             "recent_period": str(self.recent_period),
             "chunk_chars": self.chunk_chars,
-            "max_blocks": self.max_blocks,
+            "max_blocks_per_level": self.max_blocks,
             "search_limit": self.search_limit,
         }
 
@@ -183,33 +443,40 @@ class ChatMemory:
     def blocks_as_messages(self, blocks: list[ChatMemoryBlock]) -> list[StoredMessage]:
         messages: list[StoredMessage] = []
         for block in blocks:
-            text = (
-                f"Сжатая память чата за {block.period_start}..{block.period_end}.\n"
-                f"Темы: {block.topics or 'не выделены'}\n"
-                f"Ключевые слова: {block.keywords or 'не выделены'}\n"
-                f"Сообщений в блоке: {block.message_count}\n\n"
-                f"{block.summary}"
-            )
             messages.append(
                 StoredMessage(
                     message_id=-block.block_id,
                     chat_id=block.chat_id,
                     chat_type="memory",
+                    sender_id=None,
                     sender_name="ChatMemory",
-                    text=text,
+                    text=_block_text(block),
                     created_at=block.period_end,
                     reply_to_message_id=None,
                 )
             )
         return messages
 
+    def participant_context_as_message(self, chat_id: int, text: str) -> StoredMessage:
+        return StoredMessage(
+            message_id=-900_000_000,
+            chat_id=chat_id,
+            chat_type="memory",
+            sender_id=None,
+            sender_name="ParticipantProfiles",
+            text=text,
+            created_at=datetime.now(timezone.utc).isoformat(),
+            reply_to_message_id=None,
+        )
+
     @opik_track(name="memory.compress")
-    async def _compress(self, messages: list[StoredMessage]) -> tuple[str, str, str]:
+    async def _compress_messages(self, messages: list[StoredMessage]) -> dict[str, object]:
         rendered = _render_messages(messages)
         update_opik_span_metadata(
             {
                 "message_count": len(messages),
                 "input_chars": len(rendered),
+                "level": "chunk",
             }
         )
         user = f"""
@@ -218,17 +485,40 @@ class ChatMemory:
 Верни строго JSON без markdown в таком формате:
 {{
   "summary": "короткая фактическая выжимка до 1500-2500 символов",
+  "decisions": [{{"text": "решение", "source_message_ids": [123]}}],
+  "tasks": [{{"text": "задача/обещание", "owner": "имя", "source_message_ids": [123]}}],
+  "open_questions": [{{"text": "открытый вопрос", "source_message_ids": [123]}}],
+  "important_events": [{{"text": "важное событие", "source_message_ids": [123]}}],
+  "participant_facts": [
+    {{
+      "participant_key": "точный sender_key участника",
+      "participant_name": "имя участника",
+      "fact_type": "role|responsibility|project|preference|constraint|task|temporary_state|skill|relationship|other",
+      "fact": "атомарный факт о человеке",
+      "source_message_ids": [123],
+      "confidence": "high|medium|low",
+      "expires_after_days": 30
+    }}
+  ],
   "topics": ["тема 1", "тема 2"],
   "keywords": ["ключевое слово", "имя участника", "проект"]
 }}
 
-Что сохранить:
+Правила для participant_facts:
+- сохраняй только атомарные факты, явно подтвержденные сообщениями;
+- не сохраняй факт без source_message_ids;
+- participant_key должен точно совпадать с sender_key из сообщения;
+- если факт про участника не подтвержден явно, не добавляй его;
+- low confidence лучше не добавлять, кроме очень полезных, но сомнительных фактов;
+- временные состояния и задачи должны иметь expires_after_days;
+- шутки, сарказм, оскорбления и догадки не являются фактами о человеке.
+
+Что сохранить в memory-блоке:
 - важные темы и контекст;
 - решения и договоренности;
 - задачи, ответственных и сроки, только если они явно есть;
 - открытые вопросы и разногласия;
-- важные факты о людях, проектах, планах;
-- заметные шутки или цитаты, только если они могут быть полезны позже.
+- важные факты о людях, проектах, планах.
 
 Сообщения:
 {rendered}
@@ -236,14 +526,206 @@ class ChatMemory:
         response = await self.llm.complete(system=MEMORY_SYSTEM_PROMPT, user=user)
         data = _json_object(response)
         if not data:
-            return response[:2500], "", ""
+            return {
+                "summary": response[:2500],
+                "decisions": [],
+                "tasks": [],
+                "open_questions": [],
+                "important_events": [],
+                "participant_facts": [],
+                "topics": [],
+                "keywords": [],
+            }
+        data["summary"] = str(data.get("summary") or response[:2500]).strip()[:2500]
+        return data
 
-        summary = str(data.get("summary") or "").strip()[:2500]
-        topics = _string_list(data.get("topics"))[:1000]
-        keywords = _string_list(data.get("keywords"))[:1000]
-        if not summary:
-            summary = response[:2500]
-        return summary, topics, keywords
+    @opik_track(name="memory.rollup")
+    async def _compress_blocks(
+        self,
+        blocks: list[ChatMemoryBlock],
+        *,
+        target_level: str,
+    ) -> dict[str, object]:
+        rendered = "\n\n---\n\n".join(_block_text(block) for block in blocks)
+        update_opik_span_metadata(
+            {
+                "block_count": len(blocks),
+                "input_chars": len(rendered),
+                "level": target_level,
+            }
+        )
+        user = f"""
+Сожми несколько уже существующих memory-блоков в один блок уровня {target_level}.
+Не добавляй новых фактов, которых нет в блоках. Если сведения противоречат друг другу,
+сохрани это как открытое противоречие, а не выбирай произвольно одну версию.
+
+Верни строго JSON без markdown в формате:
+{{
+  "summary": "краткая выжимка до 2500 символов",
+  "decisions": [],
+  "tasks": [],
+  "open_questions": [],
+  "important_events": [],
+  "participant_facts": [],
+  "topics": [],
+  "keywords": []
+}}
+
+Блоки:
+{rendered}
+""".strip()
+        response = await self.llm.complete(system=MEMORY_SYSTEM_PROMPT, user=user)
+        data = _json_object(response)
+        if not data:
+            return {"summary": response[:2500], "topics": [], "keywords": []}
+        data["summary"] = str(data.get("summary") or response[:2500]).strip()[:2500]
+        return data
+
+    async def _save_participant_facts(
+        self,
+        chat_id: int,
+        data: dict[str, object],
+        messages: list[StoredMessage],
+    ) -> int:
+        message_by_id = {message.message_id: message for message in messages if message.message_id > 0}
+        saved = 0
+        for raw in _object_list(data.get("participant_facts")):
+            fact_text = str(raw.get("fact") or raw.get("fact_text") or raw.get("text") or "").strip()
+            if not fact_text:
+                continue
+            source_ids = [item for item in _int_list(raw.get("source_message_ids")) if item in message_by_id]
+            if not source_ids:
+                continue
+
+            fact_type = str(raw.get("fact_type") or "other").strip().lower()
+            if fact_type not in FACT_TYPES:
+                fact_type = "other"
+
+            confidence = str(raw.get("confidence") or "medium").strip().lower()
+            if confidence not in {"high", "medium", "low"} or confidence == "low":
+                continue
+
+            key = str(raw.get("participant_key") or "").strip()
+            source_senders = {
+                participant_key(message_by_id[source_id].sender_id, message_by_id[source_id].sender_name)
+                for source_id in source_ids
+            }
+            if not key and len(source_senders) == 1:
+                key = next(iter(source_senders))
+            if key not in source_senders and key not in {
+                participant_key(message.sender_id, message.sender_name) for message in messages
+            }:
+                continue
+
+            name = str(raw.get("participant_name") or "").strip()
+            if not name:
+                name = _participant_name_for_key(messages, key)
+
+            source_dates = [_parse_datetime(message_by_id[source_id].created_at) for source_id in source_ids]
+            first_seen = min(source_dates).isoformat()
+            last_seen = max(source_dates).isoformat()
+            await self.store.save_participant_fact(
+                chat_id=chat_id,
+                participant_key=key,
+                participant_name=name,
+                fact_type=fact_type,
+                fact_text=fact_text[:800],
+                source_message_ids=source_ids,
+                confidence=confidence,
+                first_seen_at=first_seen,
+                last_seen_at=last_seen,
+                expires_at=_expires_at(fact_type, last_seen, raw),
+            )
+            saved += 1
+        return saved
+
+    async def _maintain_hierarchy(self, chat_id: int) -> None:
+        await self._rollup_level(chat_id, source_level="chunk", target_level="rollup")
+        await self._rollup_level(chat_id, source_level="rollup", target_level="archive")
+        await self._rollup_level(chat_id, source_level="archive", target_level="archive")
+
+    async def _rollup_level(self, chat_id: int, *, source_level: str, target_level: str) -> None:
+        while await self.store.count_memory_blocks(chat_id, level=source_level) > self.max_blocks:
+            blocks = await self.store.get_oldest_memory_blocks(
+                chat_id=chat_id,
+                level=source_level,
+                limit=ROLLUP_GROUP_SIZE,
+            )
+            if len(blocks) < 2:
+                return
+            data = await self._compress_blocks(blocks, target_level=target_level)
+            await self.store.save_memory_block(
+                chat_id=chat_id,
+                period_start=blocks[0].period_start,
+                period_end=blocks[-1].period_end,
+                summary=str(data.get("summary") or "")[:2500],
+                topics=_string_list(data.get("topics"))[:1000],
+                keywords=_string_list(data.get("keywords"))[:1000],
+                message_count=sum(block.message_count for block in blocks),
+                structured_json=_safe_json(data),
+                level=target_level,
+                processed_until=None,
+            )
+            await self.store.delete_memory_blocks([block.block_id for block in blocks])
+            logging.info(
+                "Chat memory rollup created chat_id=%s source=%s target=%s blocks=%s",
+                chat_id,
+                source_level,
+                target_level,
+                len(blocks),
+            )
+
+    def _keyword_rank(self, blocks: list[ChatMemoryBlock], query: str) -> list[ChatMemoryBlock]:
+        terms = _tokens(query)
+        if not terms:
+            return blocks
+        scored: list[tuple[int, ChatMemoryBlock]] = []
+        for block in blocks:
+            haystack = " ".join(
+                [block.summary, block.topics, block.keywords, block.structured_json]
+            ).lower()
+            score = 0
+            for term in terms:
+                score += block.keywords.lower().count(term) * 4
+                score += block.topics.lower().count(term) * 2
+                score += haystack.count(term)
+            scored.append((score, block))
+        scored.sort(key=lambda item: (item[0], item[1].period_end), reverse=True)
+        return [block for _, block in scored]
+
+    @opik_track(name="memory.rerank")
+    async def _rerank_blocks(self, blocks: list[ChatMemoryBlock], query: str) -> list[ChatMemoryBlock]:
+        if len(blocks) <= self.search_limit:
+            return blocks
+        rendered = "\n\n".join(
+            f"block_id={block.block_id}\n{_block_text(block)[:1200]}" for block in blocks
+        )
+        update_opik_span_metadata(
+            {
+                "candidate_count": len(blocks),
+                "query_chars": len(query),
+            }
+        )
+        user = f"""
+Выбери memory-блоки, которые реально помогут ответить на вопрос.
+Верни строго JSON без markdown: {{"block_ids": [1, 2, 3]}}
+Не выбирай блок только из-за совпадения случайного слова.
+Максимум блоков: {self.search_limit}.
+
+Вопрос:
+{query}
+
+Кандидаты:
+{rendered}
+""".strip()
+        response = await self.llm.complete(system=MEMORY_SYSTEM_PROMPT, user=user)
+        data = _json_object(response)
+        ids = _int_list(data.get("block_ids") if data else None)
+        if not ids:
+            return blocks
+        by_id = {block.block_id: block for block in blocks}
+        selected = [by_id[block_id] for block_id in ids if block_id in by_id]
+        return selected + [block for block in blocks if block.block_id not in ids]
 
 
 def should_use_memory(period: timedelta, memory: ChatMemory | None) -> bool:

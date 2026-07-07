@@ -19,7 +19,7 @@ from tg_summary_bot.assistant import ChatAssistant
 from tg_summary_bot.config import Settings, load_settings
 from tg_summary_bot.image_recognizer import ImageRecognizer
 from tg_summary_bot.llm import build_llm_client
-from tg_summary_bot.memory import ChatMemory, should_use_memory
+from tg_summary_bot.memory import ChatMemory, participant_key, should_use_memory
 from tg_summary_bot.periods import format_period, parse_period
 from tg_summary_bot.storage import MessageStore, StoredImage, StoredVideo
 from tg_summary_bot.summarizer import Summarizer
@@ -55,6 +55,26 @@ def sender_name(message: Message) -> tuple[int | None, str]:
     if message.sender_chat:
         return message.sender_chat.id, message.sender_chat.title or str(message.sender_chat.id)
     return None, "Unknown"
+
+
+def participant_ref(message: Message) -> tuple[str, str]:
+    sender_id, name = sender_name(message)
+    return participant_key(sender_id, name), name
+
+
+def participant_refs_for_context(message: Message) -> tuple[list[str], list[str]]:
+    refs = [participant_ref(message)]
+    if message.reply_to_message:
+        refs.append(participant_ref(message.reply_to_message))
+
+    keys: list[str] = []
+    names: list[str] = []
+    for key, name in refs:
+        if key not in keys:
+            keys.append(key)
+        if name and name not in names:
+            names.append(name)
+    return keys, names
 
 
 def split_telegram_text(text: str, limit: int = 3900) -> list[str]:
@@ -435,7 +455,8 @@ async def create_dispatcher(
             "`/summary 7d` - last 7 days\n"
             "`/summary today` - today in UTC\n"
             "`/question 24h <text>` - chat with the assistant using recent context\n"
-            "`/memory` - compressed chat memory status\n"
+            "`/memory` - compressed chat memory status; `/memory rebuild` resets blocks\n"
+            "`/profile` - show or edit participant memory profile\n"
             "`/transcribe` - transcribe replied voice/audio\n"
             "`/image` - recognize the latest image or replied image\n"
             "`/video` - recognize the latest video/video note or replied video\n"
@@ -499,21 +520,107 @@ async def create_dispatcher(
 
         args = (message.text or "").split(maxsplit=1)
         if len(args) > 1:
-            await answer_logged(message, "Usage: `/memory`")
+            action = args[1].strip().lower()
+            if action == "rebuild":
+                await chat_memory.reset_blocks(message.chat.id)
+                await answer_logged(
+                    message,
+                    "Memory blocks were reset. Participant profile facts were kept. "
+                    "The next long `/summary` or `/question` will rebuild structured memory.",
+                )
+                return
+            await answer_logged(message, "Usage: `/memory` or `/memory rebuild`")
             return
 
         status = await chat_memory.status(message.chat.id)
         await answer_logged(
             message,
             f"memory_blocks: `{status['memory_blocks']}`\n"
+            f"chunk_blocks: `{status['chunk_blocks']}`\n"
+            f"rollup_blocks: `{status['rollup_blocks']}`\n"
+            f"archive_blocks: `{status['archive_blocks']}`\n"
+            f"participant_facts: `{status['participant_facts']}`\n"
             f"processed_until: `{status['processed_until']}`\n"
             f"latest_raw_messages: `{status['latest_raw_messages']}`\n"
             f"pending_old_messages: `{status['pending_old_messages']}`\n"
             f"recent_period: `{status['recent_period']}`\n"
             f"chunk_chars: `{status['chunk_chars']}`\n"
-            f"max_blocks: `{status['max_blocks']}`\n"
+            f"max_blocks_per_level: `{status['max_blocks_per_level']}`\n"
             f"search_limit: `{status['search_limit']}`",
         )
+
+    @dp.message(Command("profile"))
+    async def profile_command(message: Message) -> None:
+        if not is_allowed(settings, message.chat.id):
+            return
+        if not chat_memory:
+            await answer_logged(message, "Chat memory is disabled: `MEMORY_ENABLED=false`.")
+            return
+
+        parts = (message.text or "").split(maxsplit=2)
+        action = parts[1].lower() if len(parts) > 1 else "show"
+
+        if action == "forget":
+            if message.reply_to_message:
+                keys = [participant_ref(message.reply_to_message)[0]]
+            elif len(parts) > 2:
+                facts = await store.get_participant_facts(
+                    chat_id=message.chat.id,
+                    participant_name=parts[2],
+                    limit=100,
+                )
+                keys = list(dict.fromkeys(fact.participant_key for fact in facts))
+            else:
+                await answer_logged(
+                    message,
+                    "Usage: reply with `/profile forget`, or `/profile forget <name>`.",
+                )
+                return
+            count = await chat_memory.forget_profile(chat_id=message.chat.id, participant_keys=keys)
+            await answer_logged(message, f"Forgot active profile facts: `{count}`.")
+            return
+
+        if action == "correct":
+            if not message.reply_to_message or len(parts) < 3 or not parts[2].strip():
+                await answer_logged(
+                    message,
+                    "Usage: reply to a participant with `/profile correct <true fact>`.",
+                )
+                return
+            key, name = participant_ref(message.reply_to_message)
+            await chat_memory.add_profile_correction(
+                chat_id=message.chat.id,
+                participant_key=key,
+                participant_name=name,
+                fact_text=parts[2].strip(),
+                source_message_id=message.message_id,
+                created_at=message.date,
+            )
+            await answer_logged(message, f"Saved profile correction for `{name}`.")
+            return
+
+        if action not in {"show", "forget", "correct"}:
+            participant_name = " ".join(parts[1:]).strip()
+            text = await chat_memory.profile_text(
+                chat_id=message.chat.id,
+                participant_name=participant_name,
+            )
+            await answer_logged(message, text)
+            return
+
+        if message.reply_to_message:
+            key, _ = participant_ref(message.reply_to_message)
+            text = await chat_memory.profile_text(
+                chat_id=message.chat.id,
+                participant_keys=[key],
+            )
+        else:
+            key, _ = participant_ref(message)
+            text = await chat_memory.profile_text(
+                chat_id=message.chat.id,
+                participant_keys=[key],
+            )
+        await answer_logged(message, text)
 
     @dp.message(Command("summary"))
     async def summary_command(message: Message) -> None:
@@ -638,6 +745,7 @@ async def create_dispatcher(
         try:
             async with gpu_lock:
                 try:
+                    profile_context = ""
                     context_messages = messages
                     if use_memory and chat_memory:
                         created_blocks = await chat_memory.ensure_current(message.chat.id, now=now)
@@ -655,6 +763,21 @@ async def create_dispatcher(
                             len(blocks),
                             created_blocks,
                         )
+                    if chat_memory:
+                        participant_keys, participant_names = participant_refs_for_context(message)
+                        profile_context = await chat_memory.participant_context(
+                            chat_id=message.chat.id,
+                            query=question,
+                            participant_keys=participant_keys,
+                            participant_names=participant_names,
+                        )
+                    if profile_context and chat_memory:
+                        context_messages = [
+                            chat_memory.participant_context_as_message(
+                                message.chat.id,
+                                profile_context,
+                            )
+                        ] + context_messages
                     answer = await chat_assistant.ask(
                         context_messages,
                         format_period(period_raw),

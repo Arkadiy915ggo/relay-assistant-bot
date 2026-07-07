@@ -56,7 +56,7 @@ There is currently no dedicated automated test suite in the repository.
 - `src/tg_summary_bot/video_recognizer.py`: manual `/video` and `/vocr` key-frame recognition through Ollama vision with adaptive compression.
 - `src/tg_summary_bot/transcriber.py`: optional local Whisper transcription for voice/audio and video audio tracks.
 - `src/tg_summary_bot/transcript_formatter.py`: optional LLM post-processor that formats already-sent Whisper transcripts with minimal edits.
-- `src/tg_summary_bot/memory.py`: long-term chat memory compressor/search helper used by long `/summary` and `/question` periods.
+- `src/tg_summary_bot/memory.py`: structured long-term chat memory, hybrid memory search, rollups, and participant profile facts used by `/summary`, `/question`, and mention answers.
 - `src/tg_summary_bot/periods.py`: period parsing for `30m`, `6h`, `24h`, `7d`, `2w`, `today`, and `сегодня`.
 
 ## Bot Commands
@@ -65,7 +65,8 @@ There is currently no dedicated automated test suite in the repository.
 - `/stats`: show chat id, stored counts, provider/model settings, and media/transcription settings.
 - `/summary [period]`: summarize stored messages for the period; default comes from `DEFAULT_SUMMARY_PERIOD`.
 - `/question [period] <text>`: answer using stored chat context when relevant.
-- `/memory`: show compressed chat memory status.
+- `/memory`: show compressed chat memory status; `/memory rebuild` resets memory blocks/state so they can be rebuilt from stored raw messages.
+- `/profile`: show, forget, or correct source-backed participant profile facts.
 - `/transcribe`: transcribe a replied voice/audio message manually.
 - `/image`, `/ocr`: recognize replied image or latest indexed image; save result as a stored message.
 - `/video`, `/vocr`: recognize replied/latest indexed video or Telegram video note; cache result and save it as a stored message.
@@ -79,17 +80,19 @@ SQLite tables are initialized in `MessageStore.init()`:
 - `images`: primary key `(chat_id, message_id)`, stores Telegram `file_id` and metadata for later manual recognition.
 - `videos`: primary key `(chat_id, message_id)`, stores Telegram `file_id`, duration, size, and metadata for later manual recognition.
 - `video_recognitions`: primary key `(chat_id, message_id, cache_key)`, caches expensive video recognition results by prompt/model/frame/audio settings.
-- `chat_memory_blocks`: optional long-term memory blocks with period bounds, summary, topics, keywords, and message count.
+- `chat_memory_blocks`: optional long-term structured memory blocks with period bounds, summary, topics, keywords, message count, structured JSON, and hierarchy level.
 - `chat_memory_state`: tracks the latest processed message timestamp per chat for memory compression.
+- `chat_participant_facts`: source-backed participant profile facts with type, confidence, status, source message ids, and optional expiration.
 
 ## Important Behavior
 
 - Access control is enforced by `ALLOWED_CHAT_IDS`; an empty set allows all chats.
 - Text and captions are stored passively unless the message is a slash command.
-- Images and videos are indexed passively by Telegram `file_id`; actual recognition happens only on explicit commands.
+- Images and videos are indexed passively by Telegram `file_id`; Telegram video notes are recognized automatically, while normal video files require explicit commands.
 - Voice/audio messages are transcribed only when `TRANSCRIBE_VOICE=true` and voice dependencies are installed. Optional transcript formatting runs after the raw Whisper response is already sent.
 - Video recognition can include audio transcription when `VIDEO_TRANSCRIBE_AUDIO=true` and a transcriber is configured.
 - Long summaries/questions are chunked before model calls; final summaries merge partials.
+- Mentioning the bot in a message triggers the same contextual answer flow as `/question` using the default period.
 - Telegram responses are split below the Telegram message limit by `split_telegram_text()`.
 
 ## Configuration

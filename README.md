@@ -14,8 +14,10 @@ A safe Telegram bot that stores new chat messages and produces short AI summarie
 - restricts access with `ALLOWED_CHAT_IDS`;
 - optionally transcribes Telegram voice/audio messages locally with `faster-whisper`;
 - manually recognizes text from images with an Ollama vision model;
-- manually recognizes videos and Telegram video notes through sampled key frames;
-- compresses old chat history into SQLite memory blocks for long `/question` and `/summary` periods;
+- manually recognizes videos through sampled key frames and auto-recognizes Telegram video notes;
+- answers contextual questions when the bot is mentioned in a message;
+- compresses old chat history into structured SQLite memory blocks for long `/question` and `/summary` periods;
+- keeps source-backed participant profile facts that can be used in answers;
 - optionally logs LLM traces to Opik for answer quality analysis.
 
 ## Telegram Limitations
@@ -143,6 +145,10 @@ Restart the bot.
 /question your question
 /question 24h your question
 /memory
+/memory rebuild
+/profile
+/profile forget
+/profile correct true fact
 /transcribe
 /image
 /ocr
@@ -153,7 +159,11 @@ Restart the bot.
 
 ## Chat Memory
 
-For periods longer than `MEMORY_RECENT_PERIOD`, the bot can compress older raw messages into short SQLite memory blocks. `/question` uses fresh raw messages plus relevant memory blocks; `/summary` uses fresh raw messages plus memory blocks for the requested period.
+For periods longer than `MEMORY_RECENT_PERIOD`, the bot can compress older raw messages into structured SQLite memory blocks. `/question` uses fresh raw messages plus relevant memory blocks; `/summary` uses fresh raw messages plus memory blocks for the requested period.
+
+Memory blocks now keep structured fields for summaries, decisions, tasks, open questions, important events, keywords, and source-backed participant facts. Old blocks are rolled up into higher-level blocks instead of being discarded immediately when the block count grows.
+
+Participant profiles are built from explicit facts with source message ids, confidence, status, and optional expiration for temporary facts. Question answers and mention-triggered answers can include only relevant participant profile facts, including the author of the question and the author of a replied message.
 
 Configure:
 
@@ -169,6 +179,22 @@ Check status:
 
 ```text
 /memory
+```
+
+If you already have old unstructured memory blocks, reset them and let the bot rebuild them from stored raw messages on the next long `/summary` or `/question`:
+
+```text
+/memory rebuild
+```
+
+Inspect or edit participant profiles:
+
+```text
+/profile                 # show your profile, or reply to show another participant
+/profile <name>          # search profile facts by participant name
+/profile forget          # reply to a participant to forget active facts
+/profile forget <name>   # forget active facts found by name
+/profile correct <fact>  # reply to a participant to save a high-confidence correction
 ```
 
 ## Response Logs
