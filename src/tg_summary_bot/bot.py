@@ -259,6 +259,54 @@ def parse_question_command(text: str, default_period: str) -> tuple[str, str] | 
     return default_period, raw
 
 
+def entity_type_name(entity: object) -> str:
+    return str(getattr(entity, "type", "")).lower().split(".")[-1]
+
+
+def has_mention_entity(message: Message) -> bool:
+    entities = message.entities if message.text else message.caption_entities
+    return any(
+        entity_type_name(entity) in {"mention", "text_mention"}
+        for entity in entities or []
+    )
+
+
+def bot_mention_question(
+    message: Message,
+    *,
+    bot_id: int | None,
+    bot_username: str | None,
+) -> str | None:
+    text = message.text or message.caption or ""
+    if not text:
+        return None
+
+    entities = message.entities if message.text else message.caption_entities
+    mentioned = False
+    for entity in entities or []:
+        entity_type = entity_type_name(entity)
+        if entity_type == "mention" and bot_username:
+            mention = entity.extract_from(text).lstrip("@").lower()
+            if mention == bot_username.lower():
+                mentioned = True
+        elif entity_type == "text_mention" and bot_id:
+            user = getattr(entity, "user", None)
+            if user and user.id == bot_id:
+                mentioned = True
+
+    if not mentioned:
+        return None
+
+    question = text
+    if bot_username:
+        question = re.sub(
+            rf"(?i)(?<!\w)@{re.escape(bot_username)}\b",
+            "",
+            question,
+        )
+    return " ".join(question.split())
+
+
 def setup_logging(settings: Settings) -> None:
     settings.log_file.parent.mkdir(parents=True, exist_ok=True)
     settings.response_log_file.parent.mkdir(parents=True, exist_ok=True)
@@ -365,6 +413,14 @@ async def create_dispatcher(
     gpu_lock: asyncio.Lock,
 ) -> Dispatcher:
     dp = Dispatcher()
+    bot_identity: tuple[int | None, str | None] | None = None
+
+    async def get_bot_identity(bot: Bot) -> tuple[int | None, str | None]:
+        nonlocal bot_identity
+        if bot_identity is None:
+            me = await bot.get_me()
+            bot_identity = (me.id, me.username)
+        return bot_identity
 
     @dp.message(Command("start", "help"))
     async def help_command(message: Message) -> None:
@@ -385,6 +441,9 @@ async def create_dispatcher(
             "`/video` - recognize the latest video/video note or replied video\n"
             "`/compare 10m` - compare summaries across Ollama models\n"
             "`/stats` - chat_id and stored message count\n\n"
+            "Voice messages are transcribed automatically when enabled. "
+            "Video notes are recognized automatically. "
+            "Mention the bot in a message to ask a contextual question.\n\n"
             f"Current chat_id: `{message.chat.id}`"
         )
 
@@ -537,28 +596,26 @@ async def create_dispatcher(
         for part in parts[1:]:
             await answer_logged(message, part)
 
-    @dp.message(Command("question"))
-    async def question_command(message: Message) -> None:
+    async def answer_chat_question(
+        message: Message,
+        *,
+        period_raw: str,
+        question: str,
+        reply_to_source: bool = False,
+    ) -> None:
         if not is_allowed(settings, message.chat.id):
             return
 
-        parsed = parse_question_command(message.text or "", settings.default_summary_period)
-        if not parsed:
-            await answer_logged(
-                message,
-                "Usage: `/question [period] your question`\n"
-                "Example: `/question 24h who promised to fix the issue?`",
-            )
-            return
-
-        period_raw, question = parsed
         try:
             period = parse_period(period_raw)
         except ValueError as exc:
             await answer_logged(message, f"Could not parse period: {exc}")
             return
 
-        wait_message = await answer_logged(message, "Thinking...")
+        if reply_to_source:
+            wait_message = await reply_logged(message, "Thinking...")
+        else:
+            wait_message = await answer_logged(message, "Thinking...")
         now = datetime.now(timezone.utc)
         since = now - period
         use_memory = should_use_memory(period, chat_memory)
@@ -627,6 +684,23 @@ async def create_dispatcher(
         await edit_text_logged(wait_message, parts[0], source_message=message)
         for part in parts[1:]:
             await answer_logged(message, part)
+
+    @dp.message(Command("question"))
+    async def question_command(message: Message) -> None:
+        if not is_allowed(settings, message.chat.id):
+            return
+
+        parsed = parse_question_command(message.text or "", settings.default_summary_period)
+        if not parsed:
+            await answer_logged(
+                message,
+                "Usage: `/question [period] your question`\n"
+                "Example: `/question 24h who promised to fix the issue?`",
+            )
+            return
+
+        period_raw, question = parsed
+        await answer_chat_question(message, period_raw=period_raw, question=question)
 
     @dp.message(Command("image", "ocr"))
     async def image_command(message: Message, bot: Bot) -> None:
@@ -698,34 +772,35 @@ async def create_dispatcher(
         for part in parts[1:]:
             await answer_logged(message, part)
 
-    @dp.message(Command("video", "vocr"))
-    async def video_command(message: Message, bot: Bot) -> None:
-        if not is_allowed(settings, message.chat.id):
+    async def recognize_video_source(
+        *,
+        video: StoredVideo,
+        request_message: Message,
+        save_target_message: Message,
+        bot: Bot,
+        notify_disabled: bool = False,
+        status_as_reply: bool = False,
+    ) -> None:
+        if not is_allowed(settings, request_message.chat.id):
             return
         if not settings.video_recognition_model:
-            await answer_logged(
-                message,
-                "Video recognition is disabled: VIDEO_RECOGNITION_MODEL is empty.",
-            )
+            if notify_disabled:
+                await answer_logged(
+                    request_message,
+                    "Video recognition is disabled: VIDEO_RECOGNITION_MODEL is empty.",
+                )
             return
 
-        video = await resolve_video_for_command(store, message)
-        if not video:
-            await answer_logged(
-                message,
-                "No video found. Reply to a video with `/video`, or send `/video` after a video.",
-            )
-            return
         if video_too_large(settings, video):
             await answer_logged(
-                message,
+                request_message,
                 "Video is too large: "
                 f"{video.file_size} bytes. Limit: {settings.max_video_size_mb} MB.",
             )
             return
         if video_too_long(settings, video):
             await answer_logged(
-                message,
+                request_message,
                 "Video is too long: "
                 f"{video.duration} sec. Limit: {settings.max_video_seconds} sec.",
             )
@@ -745,7 +820,7 @@ async def create_dispatcher(
             await save_message_text(
                 settings,
                 store,
-                message,
+                save_target_message,
                 saved_text,
                 limit_chars=settings.max_transcription_chars,
             )
@@ -758,14 +833,21 @@ async def create_dispatcher(
                 "Saved for summaries.\n\n"
                 f"{cached.result}"
             )
-            for part in split_telegram_text(text):
-                await answer_logged(message, part)
+            for index, part in enumerate(split_telegram_text(text)):
+                if index == 0 and status_as_reply:
+                    await reply_logged(request_message, part)
+                else:
+                    await answer_logged(request_message, part)
             return
 
-        wait_message = await answer_logged(
-            message,
-            f"Recognizing video #{video.message_id} with `{settings.video_recognition_model}`...",
+        status_text = (
+            f"Recognizing video #{video.message_id} "
+            f"with `{settings.video_recognition_model}`..."
         )
+        if status_as_reply:
+            wait_message = await reply_logged(request_message, status_text)
+        else:
+            wait_message = await answer_logged(request_message, status_text)
         video_path: Path | None = None
         audio_path: Path | None = None
         started = time.perf_counter()
@@ -804,7 +886,7 @@ async def create_dispatcher(
             await edit_text_logged(
                 wait_message,
                 f"Failed to recognize video: `{type(exc).__name__}: {exc}`",
-                source_message=message,
+                source_message=request_message,
             )
             return
         finally:
@@ -827,7 +909,7 @@ async def create_dispatcher(
         await save_message_text(
             settings,
             store,
-            message,
+            save_target_message,
             saved_text,
             limit_chars=settings.max_transcription_chars,
         )
@@ -841,9 +923,30 @@ async def create_dispatcher(
             f"{result}"
         )
         parts = split_telegram_text(text)
-        await edit_text_logged(wait_message, parts[0], source_message=message)
+        await edit_text_logged(wait_message, parts[0], source_message=request_message)
         for part in parts[1:]:
-            await answer_logged(message, part)
+            await answer_logged(request_message, part)
+
+    @dp.message(Command("video", "vocr"))
+    async def video_command(message: Message, bot: Bot) -> None:
+        if not is_allowed(settings, message.chat.id):
+            return
+
+        video = await resolve_video_for_command(store, message)
+        if not video:
+            await answer_logged(
+                message,
+                "No video found. Reply to a video with `/video`, or send `/video` after a video.",
+            )
+            return
+
+        await recognize_video_source(
+            video=video,
+            request_message=message,
+            save_target_message=message,
+            bot=bot,
+            notify_disabled=True,
+        )
 
     @dp.message(Command("compare"))
     async def compare_command(message: Message) -> None:
@@ -1152,18 +1255,51 @@ async def create_dispatcher(
         await save_incoming_video(settings, store, message)
 
     @dp.message(F.video | F.video_note | (F.document & F.document.mime_type.startswith("video/")))
-    async def save_regular_video(message: Message) -> None:
+    async def save_regular_video(message: Message, bot: Bot) -> None:
         await save_incoming_video(settings, store, message)
+        if not message.video_note:
+            return
+
+        video = video_from_message(message)
+        if not video:
+            return
+        await recognize_video_source(
+            video=video,
+            request_message=message,
+            save_target_message=message,
+            bot=bot,
+            status_as_reply=True,
+        )
 
     @dp.channel_post(F.text | F.caption)
     async def save_channel_post(message: Message) -> None:
         await save_incoming_message(settings, store, message)
 
     @dp.message(F.text | F.caption)
-    async def save_regular_message(message: Message) -> None:
+    async def save_regular_message(message: Message, bot: Bot) -> None:
         if message.text and message.text.startswith("/"):
             return
         await save_incoming_message(settings, store, message)
+        if not has_mention_entity(message):
+            return
+
+        bot_id, bot_username = await get_bot_identity(bot)
+        question = bot_mention_question(
+            message,
+            bot_id=bot_id,
+            bot_username=bot_username,
+        )
+        if question is None:
+            return
+        if not question:
+            await reply_logged(message, "Напишите вопрос рядом с упоминанием бота.")
+            return
+        await answer_chat_question(
+            message,
+            period_raw=settings.default_summary_period,
+            question=question,
+            reply_to_source=True,
+        )
 
     return dp
 
