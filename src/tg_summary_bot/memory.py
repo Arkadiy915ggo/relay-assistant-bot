@@ -43,6 +43,10 @@ TEMPORARY_FACT_TYPES = {"task", "temporary_state"}
 ROLLUP_GROUP_SIZE = 8
 
 
+class MemoryCompressionError(RuntimeError):
+    pass
+
+
 def participant_key(sender_id: int | None, sender_name: str) -> str:
     if sender_id is not None:
         return f"id:{sender_id}"
@@ -104,6 +108,30 @@ def _text_items(value: object, *, limit: int = 8) -> list[str]:
         if text:
             items.append(text)
     return items[:limit]
+
+
+def _has_structured_items(data: dict[str, object]) -> bool:
+    return any(
+        _object_list(data.get(key))
+        for key in [
+            "decisions",
+            "tasks",
+            "open_questions",
+            "important_events",
+            "participant_facts",
+        ]
+    ) or bool(_text_items(data.get("topics")) or _text_items(data.get("keywords")))
+
+
+def _validate_memory_data(data: dict[str, object], *, message_count: int) -> None:
+    summary = str(data.get("summary") or "").strip()
+    min_summary_chars = 80 if message_count >= 10 else 20
+    if len(summary) >= min_summary_chars or _has_structured_items(data):
+        return
+    raise MemoryCompressionError(
+        "Memory compression returned an implausibly short/empty JSON result. "
+        "Increase OLLAMA_NUM_CTX, lower MEMORY_CHUNK_CHARS, or restart Ollama before rebuilding memory."
+    )
 
 
 def _tokens(text: str) -> list[str]:
@@ -211,7 +239,13 @@ class ChatMemory:
         self.store = store
         self.llm = llm
         self.recent_period = parse_period(settings.memory_recent_period)
-        self.chunk_chars = settings.memory_chunk_chars
+        self.chunk_chars = min(settings.memory_chunk_chars, settings.chunk_chars)
+        if self.chunk_chars < settings.memory_chunk_chars:
+            logging.info(
+                "Memory chunk chars capped by CHUNK_CHARS memory_chunk_chars=%s effective=%s",
+                settings.memory_chunk_chars,
+                self.chunk_chars,
+            )
         self.max_blocks = settings.memory_max_blocks
         self.search_limit = settings.memory_search_limit
 
@@ -523,21 +557,42 @@ class ChatMemory:
 Сообщения:
 {rendered}
 """.strip()
-        response = await self.llm.complete(system=MEMORY_SYSTEM_PROMPT, user=user)
-        data = _json_object(response)
-        if not data:
-            return {
-                "summary": response[:2500],
-                "decisions": [],
-                "tasks": [],
-                "open_questions": [],
-                "important_events": [],
-                "participant_facts": [],
-                "topics": [],
-                "keywords": [],
-            }
-        data["summary"] = str(data.get("summary") or response[:2500]).strip()[:2500]
-        return data
+        compact_user = f"""
+Верни строго один JSON-объект без markdown. Если данных для раздела нет, верни пустой список.
+Поля: summary, decisions, tasks, open_questions, important_events, participant_facts, topics, keywords.
+participant_facts добавляй только с точным participant_key и source_message_ids из сообщений.
+
+Сообщения:
+{rendered}
+""".strip()
+        last_error = ""
+        for attempt, prompt in enumerate([user, compact_user], start=1):
+            response = await self.llm.complete(
+                system=MEMORY_SYSTEM_PROMPT,
+                user=prompt,
+                response_format="json",
+            )
+            data = _json_object(response)
+            if not data:
+                last_error = "Memory compression did not return JSON."
+                logging.warning(
+                    "Memory compression returned non-JSON response attempt=%s response_chars=%s",
+                    attempt,
+                    len(response),
+                )
+                continue
+            data["summary"] = str(data.get("summary") or response[:2500]).strip()[:2500]
+            try:
+                _validate_memory_data(data, message_count=len(messages))
+            except MemoryCompressionError as exc:
+                last_error = str(exc)
+                logging.warning("Memory compression rejected JSON response attempt=%s: %s", attempt, exc)
+                continue
+            return data
+        raise MemoryCompressionError(
+            f"{last_error} "
+            "Increase OLLAMA_NUM_CTX, lower MEMORY_CHUNK_CHARS, or restart Ollama before rebuilding memory."
+        )
 
     @opik_track(name="memory.rollup")
     async def _compress_blocks(
@@ -574,7 +629,11 @@ class ChatMemory:
 Блоки:
 {rendered}
 """.strip()
-        response = await self.llm.complete(system=MEMORY_SYSTEM_PROMPT, user=user)
+        response = await self.llm.complete(
+            system=MEMORY_SYSTEM_PROMPT,
+            user=user,
+            response_format="json",
+        )
         data = _json_object(response)
         if not data:
             return {"summary": response[:2500], "topics": [], "keywords": []}
@@ -718,7 +777,11 @@ class ChatMemory:
 Кандидаты:
 {rendered}
 """.strip()
-        response = await self.llm.complete(system=MEMORY_SYSTEM_PROMPT, user=user)
+        response = await self.llm.complete(
+            system=MEMORY_SYSTEM_PROMPT,
+            user=user,
+            response_format="json",
+        )
         data = _json_object(response)
         ids = _int_list(data.get("block_ids") if data else None)
         if not ids:

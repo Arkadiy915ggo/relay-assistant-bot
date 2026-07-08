@@ -93,6 +93,14 @@ class ChatParticipantFact:
     updated_at: str
 
 
+@dataclass(frozen=True)
+class ChatParticipant:
+    sender_id: int | None
+    sender_name: str
+    last_seen_at: str
+    message_count: int
+
+
 class MessageStore:
     def __init__(self, database_path: Path) -> None:
         self.database_path = database_path
@@ -292,10 +300,11 @@ class MessageStore:
 
     async def _init_fts_tables(self, db: aiosqlite.Connection) -> None:
         try:
+            await self._drop_contentless_fts_table(db, "chat_memory_blocks_fts")
             await db.execute(
                 """
                 CREATE VIRTUAL TABLE IF NOT EXISTS chat_memory_blocks_fts
-                USING fts5(search_text, content='', tokenize='unicode61')
+                USING fts5(search_text, tokenize='unicode61')
                 """
             )
             await db.execute(
@@ -312,10 +321,11 @@ class MessageStore:
             self._memory_fts_available = False
 
         try:
+            await self._drop_contentless_fts_table(db, "chat_participant_facts_fts")
             await db.execute(
                 """
                 CREATE VIRTUAL TABLE IF NOT EXISTS chat_participant_facts_fts
-                USING fts5(search_text, content='', tokenize='unicode61')
+                USING fts5(search_text, tokenize='unicode61')
                 """
             )
             await db.execute(
@@ -330,6 +340,19 @@ class MessageStore:
             self._participant_facts_fts_available = True
         except aiosqlite.OperationalError:
             self._participant_facts_fts_available = False
+
+    async def _drop_contentless_fts_table(self, db: aiosqlite.Connection, table: str) -> None:
+        cursor = await db.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+            (table,),
+        )
+        row = await cursor.fetchone()
+        await cursor.close()
+        if not row:
+            return
+        schema = str(row[0] or "").replace(" ", "").lower()
+        if "content=''" in schema or 'content=""' in schema:
+            await db.execute(f"DROP TABLE IF EXISTS {table}")
 
     async def save_message(
         self,
@@ -750,6 +773,43 @@ class MessageStore:
             await cursor.close()
         return int(row[0]) if row else 0
 
+    async def get_chat_participants(
+        self,
+        *,
+        chat_id: int,
+        limit: int = 200,
+    ) -> list[ChatParticipant]:
+        async with aiosqlite.connect(self.database_path) as db:
+            await self._prepare_connection(db)
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                """
+                SELECT sender_id, sender_name, MAX(created_at) AS last_seen_at,
+                       COUNT(*) AS message_count
+                FROM messages
+                WHERE chat_id = ?
+                GROUP BY sender_id, sender_name
+                ORDER BY last_seen_at DESC
+                LIMIT ?
+                """,
+                (chat_id, limit),
+            )
+            rows = await cursor.fetchall()
+            await cursor.close()
+
+        participants: list[ChatParticipant] = []
+        for row in rows:
+            sender_id = row["sender_id"]
+            participants.append(
+                ChatParticipant(
+                    sender_id=int(sender_id) if sender_id is not None else None,
+                    sender_name=str(row["sender_name"]),
+                    last_seen_at=str(row["last_seen_at"]),
+                    message_count=int(row["message_count"] or 0),
+                )
+            )
+        return participants
+
     async def get_memory_processed_until(self, chat_id: int) -> str | None:
         async with aiosqlite.connect(self.database_path) as db:
             await self._prepare_connection(db)
@@ -1139,6 +1199,7 @@ class MessageStore:
                         str(existing["confidence"]),
                         confidence,
                     )
+                    indexed_confidence = merged_confidence
                     first_seen = str(existing["first_seen_at"] or first_seen_at)
                     await db.execute(
                         """
@@ -1161,6 +1222,7 @@ class MessageStore:
                         ),
                     )
                 else:
+                    indexed_confidence = confidence
                     cursor = await db.execute(
                         """
                         INSERT INTO chat_participant_facts (
@@ -1204,7 +1266,7 @@ class MessageStore:
                                 participant_name=participant_name,
                                 fact_type=fact_type,
                                 fact_text=fact_text,
-                                confidence=confidence,
+                                confidence=indexed_confidence,
                                 status=status,
                             ),
                         ),
