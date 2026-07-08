@@ -19,7 +19,8 @@ from tg_summary_bot.assistant import ChatAssistant
 from tg_summary_bot.config import Settings, load_settings
 from tg_summary_bot.image_recognizer import ImageRecognizer
 from tg_summary_bot.llm import build_llm_client
-from tg_summary_bot.memory import ChatMemory, participant_key, should_use_memory
+from tg_summary_bot.memory import ChatMemory, MemoryCompressionError, participant_key, should_use_memory
+from tg_summary_bot.observability import opik_track, update_opik_span_metadata
 from tg_summary_bot.periods import format_period, parse_period
 from tg_summary_bot.storage import MessageStore, StoredImage, StoredVideo
 from tg_summary_bot.summarizer import Summarizer
@@ -60,6 +61,69 @@ def sender_name(message: Message) -> tuple[int | None, str]:
 def participant_ref(message: Message) -> tuple[str, str]:
     sender_id, name = sender_name(message)
     return participant_key(sender_id, name), name
+
+
+def normalize_profile_target(value: str) -> str:
+    return re.sub(r"[^0-9a-zа-яё]+", "", value.strip().lstrip("@").lower())
+
+
+def split_profile_correction_target(text: str) -> tuple[str | None, str]:
+    text = text.strip()
+    target, separator, fact = text.partition(" ")
+    if target.startswith("@"):
+        return target.strip("@,:; "), fact.strip() if separator else ""
+    return None, text
+
+
+def ranked_profile_target_matches(
+    query: str,
+    candidates: list[tuple[str, str]],
+) -> list[tuple[str, str]]:
+    normalized_query = normalize_profile_target(query)
+    if not normalized_query:
+        return []
+
+    seen: set[str] = set()
+    scored: list[tuple[int, int, str, str]] = []
+    for key, name in candidates:
+        if key in seen:
+            continue
+        seen.add(key)
+        normalized_name = normalize_profile_target(name)
+        normalized_key = normalize_profile_target(key.removeprefix("name:"))
+        score = 0
+        if normalized_query in {normalized_name, normalized_key}:
+            score = 4
+        elif normalized_name.startswith(normalized_query) or normalized_key.startswith(
+            normalized_query
+        ):
+            score = 3
+        elif normalized_query in normalized_name or normalized_query in normalized_key:
+            score = 2
+        if score:
+            scored.append((score, -len(name), key, name))
+
+    scored.sort(reverse=True)
+    return [(key, name) for _, _, key, name in scored]
+
+
+async def resolve_profile_target(
+    store: MessageStore,
+    *,
+    chat_id: int,
+    query: str,
+) -> list[tuple[str, str]]:
+    candidates: list[tuple[str, str]] = []
+    for fact in await store.get_participant_facts(chat_id=chat_id, limit=200):
+        candidates.append((fact.participant_key, fact.participant_name))
+    for participant in await store.get_chat_participants(chat_id=chat_id, limit=200):
+        candidates.append(
+            (
+                participant_key(participant.sender_id, participant.sender_name),
+                participant.sender_name,
+            )
+        )
+    return ranked_profile_target_matches(query, candidates)
 
 
 def participant_refs_for_context(message: Message) -> tuple[list[str], list[str]]:
@@ -456,7 +520,9 @@ async def create_dispatcher(
             "`/summary today` - today in UTC\n"
             "`/question 24h <text>` - chat with the assistant using recent context\n"
             "`/memory` - compressed chat memory status; `/memory rebuild` resets blocks\n"
-            "`/profile` - show or edit participant memory profile\n"
+            "`/profile [name]` - show your, replied, or named participant profile\n"
+            "`/profile correct [@name] <fact>` - save a profile fact for yourself, "
+            "named, or replied participant\n"
             "`/transcribe` - transcribe replied voice/audio\n"
             "`/image` - recognize the latest image or replied image\n"
             "`/video` - recognize the latest video/video note or replied video\n"
@@ -576,27 +642,96 @@ async def create_dispatcher(
                     "Usage: reply with `/profile forget`, or `/profile forget <name>`.",
                 )
                 return
-            count = await chat_memory.forget_profile(chat_id=message.chat.id, participant_keys=keys)
+            count = await chat_memory.forget_profile(
+                chat_id=message.chat.id,
+                participant_keys=keys,
+            )
             await answer_logged(message, f"Forgot active profile facts: `{count}`.")
             return
 
         if action == "correct":
-            if not message.reply_to_message or len(parts) < 3 or not parts[2].strip():
+            if len(parts) < 3 or not parts[2].strip():
                 await answer_logged(
                     message,
-                    "Usage: reply to a participant with `/profile correct <true fact>`.",
+                    "Usage: `/profile correct <true fact>` for yourself, "
+                    "`/profile correct @name <true fact>` for a named participant, "
+                    "or reply to a participant with `/profile correct <true fact>`.",
                 )
                 return
-            key, name = participant_ref(message.reply_to_message)
+            fact_text = parts[2].strip()
+            if message.reply_to_message:
+                key, name = participant_ref(message.reply_to_message)
+            else:
+                target_query, parsed_fact = split_profile_correction_target(fact_text)
+                if target_query is None:
+                    key, name = participant_ref(message)
+                else:
+                    if not target_query or not parsed_fact:
+                        await answer_logged(
+                            message,
+                            "Usage: `/profile correct @name <true fact>`.",
+                        )
+                        return
+                    matches = await resolve_profile_target(
+                        store,
+                        chat_id=message.chat.id,
+                        query=target_query,
+                    )
+                    if not matches:
+                        await answer_logged(
+                            message,
+                            f"Не нашёл участника `{target_query}`. "
+                            "Ответьте на его сообщение `/profile correct <true fact>` "
+                            "или используйте часть отображаемого имени.",
+                        )
+                        return
+                    normalized_target = normalize_profile_target(target_query)
+                    exact_matches = [
+                        match
+                        for match in matches
+                        if normalized_target
+                        in {
+                            normalize_profile_target(match[0].removeprefix("name:")),
+                            normalize_profile_target(match[1]),
+                        }
+                    ]
+                    if len(matches) > 1 and len(exact_matches) != 1:
+                        candidates = "\n".join(
+                            f"- {candidate_name}" for _, candidate_name in matches[:5]
+                        )
+                        await answer_logged(
+                            message,
+                            f"Нашёл несколько участников для `{target_query}`. "
+                            "Уточните имя или ответьте на сообщение участника.\n"
+                            f"{candidates}",
+                        )
+                        return
+                    key, name = (exact_matches or matches)[0]
+                    fact_text = parsed_fact
             await chat_memory.add_profile_correction(
                 chat_id=message.chat.id,
                 participant_key=key,
                 participant_name=name,
-                fact_text=parts[2].strip(),
+                fact_text=fact_text,
                 source_message_id=message.message_id,
                 created_at=message.date,
             )
-            await answer_logged(message, f"Saved profile correction for `{name}`.")
+            text = await chat_memory.profile_text(
+                chat_id=message.chat.id,
+                participant_keys=[key],
+            )
+            await answer_logged(
+                message,
+                f"Saved profile correction for `{name}`.\n\n{text}",
+            )
+            return
+
+        if action == "show" and len(parts) > 2 and parts[2].strip():
+            text = await chat_memory.profile_text(
+                chat_id=message.chat.id,
+                participant_name=parts[2].strip(),
+            )
+            await answer_logged(message, text)
             return
 
         if action not in {"show", "forget", "correct"}:
@@ -620,6 +755,12 @@ async def create_dispatcher(
                 chat_id=message.chat.id,
                 participant_keys=[key],
             )
+            if text == "Паспорт участника пока пуст.":
+                text += (
+                    "\n\n`/profile` без reply показывает ваш профиль. "
+                    "Чтобы посмотреть другого участника, ответьте на его сообщение `/profile` "
+                    "или используйте `/profile <name>`."
+                )
         await answer_logged(message, text)
 
     @dp.message(Command("summary"))
@@ -663,19 +804,34 @@ async def create_dispatcher(
                 try:
                     context_messages = messages
                     if use_memory and chat_memory:
-                        created_blocks = await chat_memory.ensure_current(message.chat.id, now=now)
-                        blocks = await chat_memory.blocks_for_summary(
-                            chat_id=message.chat.id,
-                            since=since,
-                            until=raw_since,
-                        )
-                        context_messages = chat_memory.blocks_as_messages(blocks) + messages
-                        logging.info(
-                            "Summary memory context chat_id=%s blocks=%s created_blocks=%s",
-                            message.chat.id,
-                            len(blocks),
-                            created_blocks,
-                        )
+                        try:
+                            created_blocks = await chat_memory.ensure_current(message.chat.id, now=now)
+                            blocks = await chat_memory.blocks_for_summary(
+                                chat_id=message.chat.id,
+                                since=since,
+                                until=raw_since,
+                            )
+                            context_messages = chat_memory.blocks_as_messages(blocks) + messages
+                            logging.info(
+                                "Summary memory context chat_id=%s blocks=%s created_blocks=%s",
+                                message.chat.id,
+                                len(blocks),
+                                created_blocks,
+                            )
+                        except MemoryCompressionError as exc:
+                            logging.warning(
+                                "Summary memory rebuild failed; falling back to raw messages chat_id=%s period=%s: %s",
+                                message.chat.id,
+                                period_raw,
+                                exc,
+                            )
+                            if raw_since != since:
+                                messages = await store.get_messages_since(
+                                    chat_id=message.chat.id,
+                                    since=since,
+                                    limit_chars=settings.max_summary_input_chars,
+                                )
+                            context_messages = messages
                     summary = await summarizer.summarize(context_messages, format_period(period_raw))
                 finally:
                     if use_memory and chat_memory:
@@ -748,21 +904,36 @@ async def create_dispatcher(
                     profile_context = ""
                     context_messages = messages
                     if use_memory and chat_memory:
-                        created_blocks = await chat_memory.ensure_current(message.chat.id, now=now)
-                        blocks = await chat_memory.search(
-                            chat_id=message.chat.id,
-                            since=since,
-                            until=raw_since,
-                            query=question,
-                        )
-                        await chat_memory.unload()
-                        context_messages = chat_memory.blocks_as_messages(blocks) + messages
-                        logging.info(
-                            "Question memory context chat_id=%s blocks=%s created_blocks=%s",
-                            message.chat.id,
-                            len(blocks),
-                            created_blocks,
-                        )
+                        try:
+                            created_blocks = await chat_memory.ensure_current(message.chat.id, now=now)
+                            blocks = await chat_memory.search(
+                                chat_id=message.chat.id,
+                                since=since,
+                                until=raw_since,
+                                query=question,
+                            )
+                            await chat_memory.unload()
+                            context_messages = chat_memory.blocks_as_messages(blocks) + messages
+                            logging.info(
+                                "Question memory context chat_id=%s blocks=%s created_blocks=%s",
+                                message.chat.id,
+                                len(blocks),
+                                created_blocks,
+                            )
+                        except MemoryCompressionError as exc:
+                            logging.warning(
+                                "Question memory rebuild failed; falling back to raw messages chat_id=%s period=%s: %s",
+                                message.chat.id,
+                                period_raw,
+                                exc,
+                            )
+                            if raw_since != since:
+                                messages = await store.get_messages_since(
+                                    chat_id=message.chat.id,
+                                    since=since,
+                                    limit_chars=settings.max_summary_input_chars,
+                                )
+                            context_messages = messages
                     if chat_memory:
                         participant_keys, participant_names = participant_refs_for_context(message)
                         profile_context = await chat_memory.participant_context(
@@ -895,6 +1066,7 @@ async def create_dispatcher(
         for part in parts[1:]:
             await answer_logged(message, part)
 
+    @opik_track(name="video.process")
     async def recognize_video_source(
         *,
         video: StoredVideo,
@@ -906,6 +1078,17 @@ async def create_dispatcher(
     ) -> None:
         if not is_allowed(settings, request_message.chat.id):
             return
+        update_opik_span_metadata(
+            {
+                "chat_id": request_message.chat.id,
+                "message_id": video.message_id,
+                "media_type": video.media_type,
+                "duration_s": video.duration,
+                "file_size": video.file_size,
+                "model": settings.video_recognition_model,
+                "video_transcribe_audio": settings.video_transcribe_audio,
+            }
+        )
         if not settings.video_recognition_model:
             if notify_disabled:
                 await answer_logged(
@@ -936,6 +1119,7 @@ async def create_dispatcher(
             cache_key=cache_key,
         )
         if cached and cached.result.strip():
+            update_opik_span_metadata({"cache_hit": True})
             saved_text = (
                 f"🎞 Video recognition for message #{video.message_id} "
                 f"from {video.sender_name}: {cached.result}"
@@ -962,6 +1146,8 @@ async def create_dispatcher(
                 else:
                     await answer_logged(request_message, part)
             return
+
+        update_opik_span_metadata({"cache_hit": False})
 
         status_text = (
             f"Recognizing video #{video.message_id} "
@@ -1243,6 +1429,7 @@ async def create_dispatcher(
                 source_message=request_message,
             )
 
+    @opik_track(name="audio.process")
     async def transcribe_audio_source(
         source_message: Message,
         bot: Bot,
@@ -1254,6 +1441,17 @@ async def create_dispatcher(
         request_message = request_message or source_message
         if not is_allowed(settings, request_message.chat.id):
             return
+        update_opik_span_metadata(
+            {
+                "chat_id": request_message.chat.id,
+                "message_id": source_message.message_id,
+                "duration_s": audio_duration(source_message),
+                "model": settings.whisper_model,
+                "device": settings.whisper_device,
+                "compute_type": settings.whisper_compute_type,
+                "language": settings.whisper_language or "auto",
+            }
+        )
         if not settings.transcribe_voice:
             if notify_disabled:
                 await answer_logged(
