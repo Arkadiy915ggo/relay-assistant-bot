@@ -7,6 +7,7 @@ from pathlib import Path
 import httpx
 
 from tg_summary_bot.config import Settings
+from tg_summary_bot.observability import opik_track, update_opik_llm_usage, update_opik_span_metadata
 
 
 IMAGE_RECOGNITION_SYSTEM_PROMPT = """
@@ -43,8 +44,32 @@ class ImageRecognizer:
         self.num_ctx = settings.image_recognition_num_ctx
         self.num_predict = settings.ollama_num_predict
 
+    @opik_track(name="image.recognize")
     async def recognize(self, image_path: Path) -> str:
+        image_size = image_path.stat().st_size if image_path.exists() else 0
+        update_opik_span_metadata(
+            {
+                "model": self.model,
+                "image_size_bytes": image_size,
+                "num_ctx": self.num_ctx,
+                "num_predict": self.num_predict,
+            }
+        )
         image_b64 = base64.b64encode(image_path.read_bytes()).decode("ascii")
+        return await self._complete_with_image(image_b64=image_b64, image_size=image_size)
+
+    @opik_track(name="image.vision", type="llm")
+    async def _complete_with_image(self, *, image_b64: str, image_size: int) -> str:
+        update_opik_span_metadata(
+            {
+                "provider": "ollama",
+                "model": self.model,
+                "image_count": 1,
+                "image_size_bytes": image_size,
+                "num_ctx": self.num_ctx,
+                "num_predict": self.num_predict,
+            }
+        )
         async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
             response = await client.post(
                 f"{self.base_url}/api/chat",
@@ -80,6 +105,26 @@ class ImageRecognizer:
         eval_count = data.get("eval_count") or 0
         eval_duration = (data.get("eval_duration") or 0) / 1_000_000_000
         tokens_per_second = eval_count / eval_duration if eval_duration else 0
+        content = str(data.get("message", {}).get("content", "")).strip()
+        update_opik_llm_usage(
+            provider="ollama",
+            model=self.model,
+            usage={
+                "prompt_tokens": int(prompt_eval_count),
+                "completion_tokens": int(eval_count),
+                "total_tokens": int(prompt_eval_count) + int(eval_count),
+            },
+            metadata={
+                "image_count": 1,
+                "image_size_bytes": image_size,
+                "num_ctx": self.num_ctx,
+                "num_predict": self.num_predict,
+                "total_duration_s": round(total_duration, 3),
+                "eval_duration_s": round(eval_duration, 3),
+                "eval_tokens_per_second": round(tokens_per_second, 3),
+                "output_chars": len(content),
+            },
+        )
         logging.info(
             "Ollama vision response model=%s total_s=%.1f prompt_tokens=%s "
             "eval_tokens=%s eval_tps=%.2f",
@@ -89,7 +134,7 @@ class ImageRecognizer:
             eval_count,
             tokens_per_second,
         )
-        return str(data.get("message", {}).get("content", "")).strip()
+        return content
 
     async def unload(self) -> None:
         if not self.unload_after_task:

@@ -3,17 +3,24 @@ from __future__ import annotations
 import logging
 from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable
+from typing import Any
 
 import httpx
 from openai import AsyncOpenAI
 
 from tg_summary_bot.config import Settings
-from tg_summary_bot.observability import configure_opik_tracing
+from tg_summary_bot.observability import configure_opik_tracing, update_opik_llm_usage
 
 
 class LLMClient(ABC):
     @abstractmethod
-    async def complete(self, *, system: str, user: str) -> str:
+    async def complete(
+        self,
+        *,
+        system: str,
+        user: str,
+        response_format: str | None = None,
+    ) -> str:
         raise NotImplementedError
 
     async def unload(self) -> None:
@@ -26,6 +33,8 @@ class OpenAIClient(LLMClient):
             raise RuntimeError("OPENAI_API_KEY is required for LLM_PROVIDER=openai")
         self.client = AsyncOpenAI(api_key=api_key)
         self.model = model
+        self.last_usage: dict[str, int] = {}
+        self.last_metadata: dict[str, Any] = {}
         if opik_project_name:
             self.client = self._track_openai_client(self.client, opik_project_name)
 
@@ -40,17 +49,43 @@ class OpenAIClient(LLMClient):
             ) from exc
         return track_openai(client, project_name=project_name, provider="openai")
 
-    async def complete(self, *, system: str, user: str) -> str:
-        response = await self.client.chat.completions.create(
-            model=self.model,
-            temperature=0.2,
-            messages=[
+    async def complete(
+        self,
+        *,
+        system: str,
+        user: str,
+        response_format: str | None = None,
+    ) -> str:
+        self.last_usage = {}
+        self.last_metadata = {
+            "system_chars": len(system),
+            "user_chars": len(user),
+            "temperature": 0.2,
+            "response_format": response_format or "text",
+        }
+        request: dict[str, object] = {
+            "model": self.model,
+            "temperature": 0.2,
+            "messages": [
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},
             ],
+        }
+        if response_format == "json":
+            request["response_format"] = {"type": "json_object"}
+        response = await self.client.chat.completions.create(
+            **request,
         )
+        if response.usage:
+            self.last_usage = {
+                "prompt_tokens": int(response.usage.prompt_tokens or 0),
+                "completion_tokens": int(response.usage.completion_tokens or 0),
+                "total_tokens": int(response.usage.total_tokens or 0),
+            }
         content = response.choices[0].message.content
-        return content.strip() if content else "Failed to get a response from the model."
+        result = content.strip() if content else "Failed to get a response from the model."
+        self.last_metadata["output_chars"] = len(result)
+        return result
 
 
 class OllamaClient(LLMClient):
@@ -71,25 +106,45 @@ class OllamaClient(LLMClient):
         self.unload_after_task = unload_after_task
         self.num_ctx = num_ctx
         self.num_predict = num_predict
+        self.last_usage: dict[str, int] = {}
+        self.last_metadata: dict[str, Any] = {}
 
-    async def complete(self, *, system: str, user: str) -> str:
+    async def complete(
+        self,
+        *,
+        system: str,
+        user: str,
+        response_format: str | None = None,
+    ) -> str:
+        self.last_usage = {}
+        self.last_metadata = {
+            "system_chars": len(system),
+            "user_chars": len(user),
+            "num_ctx": self.num_ctx,
+            "num_predict": self.num_predict,
+            "temperature": 0.2,
+            "response_format": response_format or "text",
+        }
+        payload: dict[str, object] = {
+            "model": self.model,
+            "stream": False,
+            "keep_alive": self.keep_alive,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            "options": {
+                "temperature": 0.2,
+                "num_ctx": self.num_ctx,
+                "num_predict": self.num_predict,
+            },
+        }
+        if response_format == "json":
+            payload["format"] = "json"
         async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
             response = await client.post(
                 f"{self.base_url}/api/chat",
-                json={
-                    "model": self.model,
-                    "stream": False,
-                    "keep_alive": self.keep_alive,
-                    "messages": [
-                        {"role": "system", "content": system},
-                        {"role": "user", "content": user},
-                    ],
-                    "options": {
-                        "temperature": 0.2,
-                        "num_ctx": self.num_ctx,
-                        "num_predict": self.num_predict,
-                    },
-                },
+                json=payload,
             )
             try:
                 response.raise_for_status()
@@ -102,6 +157,18 @@ class OllamaClient(LLMClient):
         eval_count = data.get("eval_count") or 0
         eval_duration = (data.get("eval_duration") or 0) / 1_000_000_000
         tokens_per_second = eval_count / eval_duration if eval_duration else 0
+        self.last_usage = {
+            "prompt_tokens": int(prompt_eval_count),
+            "completion_tokens": int(eval_count),
+            "total_tokens": int(prompt_eval_count) + int(eval_count),
+        }
+        self.last_metadata.update(
+            {
+                "total_duration_s": round(total_duration, 3),
+                "eval_duration_s": round(eval_duration, 3),
+                "eval_tokens_per_second": round(tokens_per_second, 3),
+            }
+        )
         logging.info(
             "Ollama response model=%s total_s=%.1f prompt_tokens=%s eval_tokens=%s eval_tps=%.2f",
             self.model,
@@ -110,7 +177,9 @@ class OllamaClient(LLMClient):
             eval_count,
             tokens_per_second,
         )
-        return str(data.get("message", {}).get("content", "")).strip()
+        result = str(data.get("message", {}).get("content", "")).strip()
+        self.last_metadata["output_chars"] = len(result)
+        return result
 
     async def unload(self) -> None:
         if not self.unload_after_task:
@@ -144,7 +213,7 @@ class OpikLLMClient(LLMClient):
         self.capture_content = capture_content
         self._tracked_complete = self._build_tracked_complete()
 
-    def _build_tracked_complete(self) -> Callable[[str, str], Awaitable[str]]:
+    def _build_tracked_complete(self) -> Callable[[str, str, str | None], Awaitable[str]]:
         try:
             import opik
         except ImportError as exc:
@@ -153,21 +222,42 @@ class OpikLLMClient(LLMClient):
                 "Install it with: ./run.sh install-opik"
             ) from exc
 
+        span_name = f"llm.{self.provider}.{self.model}" if self.model else f"llm.{self.provider}"
+
         @opik.track(
-            name="llm.complete",
+            name=span_name,
             type="llm",
             project_name=self.project_name or None,
             metadata={"provider": self.provider, "model": self.model},
             capture_input=self.capture_content,
             capture_output=self.capture_content,
+            create_duplicate_root_span=False,
         )
-        async def tracked_complete(system: str, user: str) -> str:
-            return await self.wrapped.complete(system=system, user=user)
+        async def tracked_complete(system: str, user: str, response_format: str | None) -> str:
+            result = await self.wrapped.complete(
+                system=system,
+                user=user,
+                response_format=response_format,
+            )
+            metadata = dict(getattr(self.wrapped, "last_metadata", {}) or {})
+            update_opik_llm_usage(
+                provider=self.provider,
+                model=self.model,
+                usage=getattr(self.wrapped, "last_usage", {}) or {},
+                metadata=metadata,
+            )
+            return result
 
         return tracked_complete
 
-    async def complete(self, *, system: str, user: str) -> str:
-        return await self._tracked_complete(system, user)
+    async def complete(
+        self,
+        *,
+        system: str,
+        user: str,
+        response_format: str | None = None,
+    ) -> str:
+        return await self._tracked_complete(system, user, response_format)
 
     async def unload(self) -> None:
         await self.wrapped.unload()
