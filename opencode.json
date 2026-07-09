@@ -6,8 +6,8 @@
   },
   "mcp": {
     "opik-mcp": {
-      "type": "remote",
-      "url": "https://www.comet.com/opik/api/v1/mcp",
+      "type": "local",
+      "command": ["/usr/bin/python3", "/home/arkadiy915/Repos/Personal/relay-assistant-bot/.opencode/opik_mcp.py"],
       "enabled": true,
       "timeout": 120000
     }
