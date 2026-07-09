@@ -154,6 +154,8 @@ def update_opik_llm_usage(
         "eval_duration_s",
         "eval_tokens_per_second",
         "output_chars",
+        "ctx_saturated",
+        "output_too_short",
     ):
         if metadata and key in metadata:
             trace_metadata[f"llm_last_{key}"] = metadata[key]

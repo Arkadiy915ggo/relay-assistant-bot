@@ -515,6 +515,27 @@ async def create_dispatcher(
 ) -> Dispatcher:
     dp = Dispatcher()
     bot_identity: tuple[int | None, str | None] | None = None
+    profile_refresh_tasks: set[asyncio.Task[None]] = set()
+
+    async def refresh_recent_profile_facts(chat_id: int, *, now: datetime) -> None:
+        if not chat_memory:
+            return
+        try:
+            async with gpu_lock:
+                try:
+                    saved = await chat_memory.ensure_recent_profiles_current(chat_id, now=now)
+                finally:
+                    await chat_memory.unload()
+            if saved:
+                logging.info("Recent profile facts refreshed chat_id=%s saved=%s", chat_id, saved)
+        except Exception:  # noqa: BLE001
+            logging.exception("Recent profile fact refresh failed chat_id=%s", chat_id)
+
+    def schedule_profile_refresh(chat_id: int, *, now: datetime) -> None:
+        if chat_memory:
+            task = asyncio.create_task(refresh_recent_profile_facts(chat_id, now=now))
+            profile_refresh_tasks.add(task)
+            task.add_done_callback(profile_refresh_tasks.discard)
 
     async def get_bot_identity(bot: Bot) -> tuple[int | None, str | None]:
         nonlocal bot_identity
@@ -626,10 +647,12 @@ async def create_dispatcher(
             f"archive_blocks: `{status['archive_blocks']}`\n"
             f"participant_facts: `{status['participant_facts']}`\n"
             f"processed_until: `{status['processed_until']}`\n"
+            f"profile_processed_until: `{status['profile_processed_until']}`\n"
             f"latest_raw_messages: `{status['latest_raw_messages']}`\n"
             f"pending_old_messages: `{status['pending_old_messages']}`\n"
             f"recent_period: `{status['recent_period']}`\n"
             f"chunk_chars: `{status['chunk_chars']}`\n"
+            f"profile_chunk_chars: `{status['profile_chunk_chars']}`\n"
             f"max_blocks_per_level: `{status['max_blocks_per_level']}`\n"
             f"search_limit: `{status['search_limit']}`",
         )
@@ -877,6 +900,7 @@ async def create_dispatcher(
         await edit_text_logged(wait_message, parts[0], source_message=message)
         for part in parts[1:]:
             await answer_logged(message, part)
+        schedule_profile_refresh(message.chat.id, now=now)
 
     async def answer_chat_question(
         message: Message,
@@ -997,6 +1021,7 @@ async def create_dispatcher(
         await edit_text_logged(wait_message, parts[0], source_message=message)
         for part in parts[1:]:
             await answer_logged(message, part)
+        schedule_profile_refresh(message.chat.id, now=now)
 
     @dp.message(Command("question"))
     async def question_command(message: Message) -> None:

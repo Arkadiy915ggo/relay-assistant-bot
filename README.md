@@ -166,6 +166,8 @@ Memory blocks now keep structured fields for summaries, decisions, tasks, open q
 
 Participant profiles are built from explicit facts with source message ids, confidence, status, and optional expiration for temporary facts. Question answers and mention-triggered answers can include only relevant participant profile facts, including the author of the question and the author of a replied message.
 
+Profile facts are updated in two ways: older messages are processed during long-memory compression, and recent raw messages are scanned after `/summary` and `/question` even for short periods. Recent profile scanning uses a separate, smaller chunk size derived from `OLLAMA_NUM_CTX` and capped by `CHUNK_CHARS`/`MEMORY_CHUNK_CHARS`, so a small context window automatically reduces profile extraction chunk size.
+
 Configure:
 
 ```env
@@ -175,6 +177,8 @@ MEMORY_CHUNK_CHARS=18000
 MEMORY_MAX_BLOCKS=200
 MEMORY_SEARCH_LIMIT=8
 ```
+
+With `OLLAMA_NUM_CTX=32768`, the default profile extraction chunk is already capped at a safe size. If you run Ollama with a much smaller context, keep `CHUNK_CHARS` and `MEMORY_CHUNK_CHARS` conservative or increase `OLLAMA_NUM_CTX`.
 
 Check status:
 
@@ -510,7 +514,9 @@ If you see `ReadTimeout`, the model is usually loading or generating too slowly.
 - `MAX_MESSAGE_CHARS` truncates very long messages before storage.
 - `MAX_SUMMARY_INPUT_CHARS` limits how much text is sent to the model for one summary request.
 - `CHUNK_CHARS` controls chunk size for long discussions.
-- `OLLAMA_NUM_CTX` controls the Ollama context size. If it is too small, long chunks can produce `400 Bad Request`.
+- `MEMORY_CHUNK_CHARS` controls old-message memory compression chunks, capped by `CHUNK_CHARS`.
+- Recent participant profile extraction chooses a smaller dynamic chunk from `OLLAMA_NUM_CTX`, `CHUNK_CHARS`, and `MEMORY_CHUNK_CHARS`.
+- `OLLAMA_NUM_CTX` controls the Ollama context size. If it is too small, long chunks can produce `400 Bad Request` or very short model outputs.
 - `OLLAMA_NUM_PREDICT` limits response length. This helps avoid timeouts with slow 70B models.
 - `LOG_FILE` sets the bot log file, defaulting to `data/bot.log`.
 - SQLite uses WAL mode, which is enough for small and medium chats.

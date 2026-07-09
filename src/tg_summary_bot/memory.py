@@ -41,6 +41,9 @@ FACT_TYPES = {
 }
 TEMPORARY_FACT_TYPES = {"task", "temporary_state"}
 ROLLUP_GROUP_SIZE = 8
+PROFILE_CHARS_PER_CONTEXT_TOKEN = 3
+PROFILE_CHUNK_MIN_CHARS = 3500
+PROFILE_CHUNK_MAX_CHARS = 9000
 
 
 class MemoryCompressionError(RuntimeError):
@@ -131,6 +134,27 @@ def _validate_memory_data(data: dict[str, object], *, message_count: int) -> Non
     raise MemoryCompressionError(
         "Memory compression returned an implausibly short/empty JSON result. "
         "Increase OLLAMA_NUM_CTX, lower MEMORY_CHUNK_CHARS, or restart Ollama before rebuilding memory."
+    )
+
+
+def _empty_fact_stats() -> dict[str, int]:
+    return {
+        "saved": 0,
+        "returned": 0,
+        "rejected_no_text": 0,
+        "rejected_too_short": 0,
+        "rejected_no_source": 0,
+        "rejected_low_confidence": 0,
+        "rejected_invalid_key": 0,
+        "invalid_json": 0,
+    }
+
+
+def _profile_chunk_chars(settings: Settings, memory_chunk_chars: int) -> int:
+    ctx_based_chars = settings.ollama_num_ctx * PROFILE_CHARS_PER_CONTEXT_TOKEN // 4
+    return max(
+        PROFILE_CHUNK_MIN_CHARS,
+        min(memory_chunk_chars, PROFILE_CHUNK_MAX_CHARS, ctx_based_chars),
     )
 
 
@@ -248,6 +272,7 @@ class ChatMemory:
             )
         self.max_blocks = settings.memory_max_blocks
         self.search_limit = settings.memory_search_limit
+        self.profile_chunk_chars = _profile_chunk_chars(settings, self.chunk_chars)
 
     def recent_since(self, now: datetime | None = None) -> datetime:
         now = now or datetime.now(timezone.utc)
@@ -286,16 +311,64 @@ class ChatMemory:
                 level="chunk",
                 processed_until=period_end,
             )
-            saved_facts = await self._save_participant_facts(chat_id, data, messages)
+            fact_stats = await self._save_participant_facts(chat_id, data, messages)
             processed = period_end
             created_blocks += 1
             logging.info(
                 "Chat memory block created chat_id=%s messages=%s facts=%s period=%s..%s",
                 chat_id,
                 len(messages),
-                saved_facts,
+                fact_stats["saved"],
                 period_start,
                 period_end,
+            )
+
+    async def ensure_recent_profiles_current(
+        self,
+        chat_id: int,
+        *,
+        now: datetime | None = None,
+    ) -> int:
+        now = now or datetime.now(timezone.utc)
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=timezone.utc)
+        now = now.astimezone(timezone.utc)
+
+        recent_start = self.recent_since(now).isoformat()
+        processed = await self.store.get_profile_processed_until(chat_id)
+        after = max(processed, recent_start) if processed else recent_start
+        saved_total = 0
+
+        while True:
+            messages = await self.store.get_profile_message_chunk(
+                chat_id=chat_id,
+                after=after,
+                before=now,
+                limit_chars=self.profile_chunk_chars,
+            )
+            if not messages:
+                return saved_total
+
+            stats = await self._extract_participant_facts(chat_id, messages)
+            if stats["invalid_json"]:
+                logging.warning(
+                    "Profile fact extraction returned invalid JSON chat_id=%s messages=%s period=%s..%s",
+                    chat_id,
+                    len(messages),
+                    messages[0].created_at,
+                    messages[-1].created_at,
+                )
+                return saved_total
+            saved_total += stats["saved"]
+            after = messages[-1].created_at
+            await self.store.save_profile_processed_until(chat_id, after)
+            logging.info(
+                "Chat profile facts extracted chat_id=%s messages=%s saved=%s period=%s..%s",
+                chat_id,
+                len(messages),
+                stats["saved"],
+                messages[0].created_at,
+                messages[-1].created_at,
             )
 
     async def blocks_for_summary(
@@ -449,6 +522,7 @@ class ChatMemory:
     async def status(self, chat_id: int) -> dict[str, object]:
         cutoff = self.recent_since()
         processed_until = await self.store.get_memory_processed_until(chat_id)
+        profile_processed_until = await self.store.get_profile_processed_until(chat_id)
         return {
             "memory_blocks": await self.store.count_memory_blocks(chat_id),
             "chunk_blocks": await self.store.count_memory_blocks(chat_id, level="chunk"),
@@ -456,6 +530,7 @@ class ChatMemory:
             "archive_blocks": await self.store.count_memory_blocks(chat_id, level="archive"),
             "participant_facts": await self.store.count_participant_facts(chat_id),
             "processed_until": processed_until or "none",
+            "profile_processed_until": profile_processed_until or "none",
             "latest_raw_messages": await self.store.count_messages_since(
                 chat_id=chat_id,
                 since=cutoff,
@@ -467,6 +542,7 @@ class ChatMemory:
             ),
             "recent_period": str(self.recent_period),
             "chunk_chars": self.chunk_chars,
+            "profile_chunk_chars": self.profile_chunk_chars,
             "max_blocks_per_level": self.max_blocks,
             "search_limit": self.search_limit,
         }
@@ -574,6 +650,13 @@ participant_facts добавляй только с точным participant_key 
             )
             data = _json_object(response)
             if not data:
+                update_opik_span_metadata(
+                    {
+                        "json_valid": False,
+                        "failed_attempt": attempt,
+                        "invalid_output_chars": len(response),
+                    }
+                )
                 last_error = "Memory compression did not return JSON."
                 logging.warning(
                     "Memory compression returned non-JSON response attempt=%s response_chars=%s",
@@ -586,8 +669,24 @@ participant_facts добавляй только с точным participant_key 
                 _validate_memory_data(data, message_count=len(messages))
             except MemoryCompressionError as exc:
                 last_error = str(exc)
+                update_opik_span_metadata(
+                    {
+                        "json_valid": True,
+                        "rejected_attempt": attempt,
+                        "participant_facts_returned": len(
+                            _object_list(data.get("participant_facts"))
+                        ),
+                    }
+                )
                 logging.warning("Memory compression rejected JSON response attempt=%s: %s", attempt, exc)
                 continue
+            update_opik_span_metadata(
+                {
+                    "json_valid": True,
+                    "attempts": attempt,
+                    "participant_facts_returned": len(_object_list(data.get("participant_facts"))),
+                }
+            )
             return data
         raise MemoryCompressionError(
             f"{last_error} "
@@ -640,20 +739,107 @@ participant_facts добавляй только с точным participant_key 
         data["summary"] = str(data.get("summary") or response[:2500]).strip()[:2500]
         return data
 
+    @opik_track(name="profile.extract")
+    async def _extract_participant_facts(
+        self,
+        chat_id: int,
+        messages: list[StoredMessage],
+    ) -> dict[str, int]:
+        rendered = _render_messages(messages)
+        update_opik_span_metadata(
+            {
+                "message_count": len(messages),
+                "input_chars": len(rendered),
+                "profile_chunk_chars": self.profile_chunk_chars,
+            }
+        )
+        user = f"""
+Извлеки только полезные факты о конкретных участниках Telegram-чата.
+
+Верни строго JSON без markdown в формате:
+{{
+  "participant_facts": [
+    {{
+      "participant_key": "точный sender_key участника",
+      "participant_name": "имя участника",
+      "fact_type": "role|responsibility|project|preference|constraint|task|temporary_state|skill|relationship|other",
+      "fact": "информативный атомарный факт в 1-2 предложениях",
+      "source_message_ids": [123],
+      "confidence": "high|medium",
+      "expires_after_days": 30
+    }}
+  ]
+}}
+
+Правила:
+- сохраняй только факты, явно подтвержденные сообщениями;
+- fact должен быть понятным без исходного сообщения, не короче короткой фразы;
+- participant_key должен точно совпадать с sender_key из сообщения;
+- source_message_ids обязательны и должны ссылаться на сообщения ниже;
+- не добавляй low confidence;
+- шутки, оскорбления, сарказм и временные эмоции не являются фактами о человеке;
+- временные состояния и задачи сохраняй только если они полезны позже, с expires_after_days;
+- если фактов нет, верни пустой массив.
+
+Сообщения:
+{rendered}
+""".strip()
+        response = await self.llm.complete(
+            system=MEMORY_SYSTEM_PROMPT,
+            user=user,
+            response_format="json",
+        )
+        data = _json_object(response)
+        if not data:
+            update_opik_span_metadata(
+                {
+                    "json_valid": False,
+                    "invalid_output_chars": len(response),
+                    "participant_facts_returned": 0,
+                    "participant_facts_saved": 0,
+                }
+            )
+            stats = _empty_fact_stats()
+            stats["invalid_json"] = 1
+            return stats
+
+        stats = await self._save_participant_facts(chat_id, data, messages)
+        update_opik_span_metadata(
+            {
+                "json_valid": True,
+                "participant_facts_returned": stats["returned"],
+                "participant_facts_saved": stats["saved"],
+                "participant_facts_rejected_no_text": stats["rejected_no_text"],
+                "participant_facts_rejected_too_short": stats["rejected_too_short"],
+                "participant_facts_rejected_no_source": stats["rejected_no_source"],
+                "participant_facts_rejected_low_confidence": stats[
+                    "rejected_low_confidence"
+                ],
+                "participant_facts_rejected_invalid_key": stats["rejected_invalid_key"],
+            }
+        )
+        return stats
+
     async def _save_participant_facts(
         self,
         chat_id: int,
         data: dict[str, object],
         messages: list[StoredMessage],
-    ) -> int:
+    ) -> dict[str, int]:
         message_by_id = {message.message_id: message for message in messages if message.message_id > 0}
-        saved = 0
+        stats = _empty_fact_stats()
         for raw in _object_list(data.get("participant_facts")):
+            stats["returned"] += 1
             fact_text = str(raw.get("fact") or raw.get("fact_text") or raw.get("text") or "").strip()
             if not fact_text:
+                stats["rejected_no_text"] += 1
+                continue
+            if len(fact_text) < 12:
+                stats["rejected_too_short"] += 1
                 continue
             source_ids = [item for item in _int_list(raw.get("source_message_ids")) if item in message_by_id]
             if not source_ids:
+                stats["rejected_no_source"] += 1
                 continue
 
             fact_type = str(raw.get("fact_type") or "other").strip().lower()
@@ -662,6 +848,7 @@ participant_facts добавляй только с точным participant_key 
 
             confidence = str(raw.get("confidence") or "medium").strip().lower()
             if confidence not in {"high", "medium", "low"} or confidence == "low":
+                stats["rejected_low_confidence"] += 1
                 continue
 
             key = str(raw.get("participant_key") or "").strip()
@@ -674,6 +861,7 @@ participant_facts добавляй только с точным participant_key 
             if key not in source_senders and key not in {
                 participant_key(message.sender_id, message.sender_name) for message in messages
             }:
+                stats["rejected_invalid_key"] += 1
                 continue
 
             name = str(raw.get("participant_name") or "").strip()
@@ -695,8 +883,8 @@ participant_facts добавляй только с точным participant_key 
                 last_seen_at=last_seen,
                 expires_at=_expires_at(fact_type, last_seen, raw),
             )
-            saved += 1
-        return saved
+            stats["saved"] += 1
+        return stats
 
     async def _maintain_hierarchy(self, chat_id: int) -> None:
         await self._rollup_level(chat_id, source_level="chunk", target_level="rollup")

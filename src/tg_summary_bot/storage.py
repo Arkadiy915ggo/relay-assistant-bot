@@ -249,6 +249,14 @@ class MessageStore:
             )
             await db.execute(
                 """
+                CREATE TABLE IF NOT EXISTS chat_profile_state (
+                    chat_id INTEGER PRIMARY KEY,
+                    processed_until TEXT NOT NULL
+                )
+                """
+            )
+            await db.execute(
+                """
                 CREATE TABLE IF NOT EXISTS chat_participant_facts (
                     fact_id INTEGER PRIMARY KEY AUTOINCREMENT,
                     chat_id INTEGER NOT NULL,
@@ -609,6 +617,54 @@ class MessageStore:
             await cursor.close()
         return messages
 
+    async def get_profile_message_chunk(
+        self,
+        *,
+        chat_id: int,
+        after: str,
+        before: datetime,
+        limit_chars: int,
+    ) -> list[StoredMessage]:
+        if before.tzinfo is None:
+            before = before.replace(tzinfo=timezone.utc)
+        before_iso = before.astimezone(timezone.utc).isoformat()
+
+        messages: list[StoredMessage] = []
+        total_chars = 0
+        async with aiosqlite.connect(self.database_path) as db:
+            await self._prepare_connection(db)
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                """
+                SELECT
+                    message_id,
+                    chat_id,
+                    chat_type,
+                    sender_id,
+                    sender_name,
+                    text,
+                    created_at,
+                    reply_to_message_id
+                FROM messages
+                WHERE chat_id = ? AND created_at > ? AND created_at <= ?
+                ORDER BY created_at ASC, message_id ASC
+                """,
+                (chat_id, after, before_iso),
+            )
+            async for row in cursor:
+                text = str(row["text"])
+                row_created_at = str(row["created_at"])
+                if (
+                    total_chars + len(text) > limit_chars
+                    and messages
+                    and row_created_at != messages[-1].created_at
+                ):
+                    break
+                total_chars += len(text)
+                messages.append(_stored_message_from_row(row, text=text))
+            await cursor.close()
+        return messages
+
     async def get_latest_image(self, chat_id: int) -> StoredImage | None:
         async with aiosqlite.connect(self.database_path) as db:
             await self._prepare_connection(db)
@@ -820,6 +876,32 @@ class MessageStore:
             row = await cursor.fetchone()
             await cursor.close()
         return str(row[0]) if row else None
+
+    async def get_profile_processed_until(self, chat_id: int) -> str | None:
+        async with aiosqlite.connect(self.database_path) as db:
+            await self._prepare_connection(db)
+            cursor = await db.execute(
+                "SELECT processed_until FROM chat_profile_state WHERE chat_id = ?",
+                (chat_id,),
+            )
+            row = await cursor.fetchone()
+            await cursor.close()
+        return str(row[0]) if row else None
+
+    async def save_profile_processed_until(self, chat_id: int, processed_until: str) -> None:
+        async with self._write_lock:
+            async with aiosqlite.connect(self.database_path) as db:
+                await self._prepare_connection(db)
+                await db.execute(
+                    """
+                    INSERT INTO chat_profile_state (chat_id, processed_until)
+                    VALUES (?, ?)
+                    ON CONFLICT(chat_id) DO UPDATE SET
+                        processed_until = excluded.processed_until
+                    """,
+                    (chat_id, processed_until),
+                )
+                await db.commit()
 
     async def count_memory_blocks(self, chat_id: int, *, level: str | None = None) -> int:
         params: list[object] = [chat_id]

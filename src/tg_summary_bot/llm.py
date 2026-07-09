@@ -167,6 +167,8 @@ class OllamaClient(LLMClient):
                 "total_duration_s": round(total_duration, 3),
                 "eval_duration_s": round(eval_duration, 3),
                 "eval_tokens_per_second": round(tokens_per_second, 3),
+                "ctx_saturated": bool(prompt_eval_count >= self.num_ctx - 1),
+                "output_too_short": bool(eval_count <= 2),
             }
         )
         logging.info(
