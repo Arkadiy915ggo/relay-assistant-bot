@@ -46,6 +46,7 @@ class Settings:
     database_path: Path
     log_file: Path
     response_log_file: Path
+    telegram_download_limit_mb: int
     transcribe_voice: bool
     whisper_model: str
     whisper_device: str
@@ -126,6 +127,7 @@ def load_settings() -> Settings:
         database_path=Path(os.getenv("DATABASE_PATH", "data/messages.sqlite3")),
         log_file=Path(os.getenv("LOG_FILE", "data/bot.log")),
         response_log_file=Path(os.getenv("RESPONSE_LOG_FILE", "data/responses.log")),
+        telegram_download_limit_mb=int(os.getenv("TELEGRAM_DOWNLOAD_LIMIT_MB", "0")),
         transcribe_voice=_bool(os.getenv("TRANSCRIBE_VOICE", "false")),
         whisper_model=os.getenv("WHISPER_MODEL", "large-v3").strip(),
         whisper_device=os.getenv("WHISPER_DEVICE", "cuda").strip(),

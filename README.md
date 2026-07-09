@@ -26,6 +26,7 @@ A safe Telegram bot that stores new chat messages and produces short AI summarie
 - In groups, the bot sees all messages only if `Group Privacy` is disabled in `@BotFather`.
 - In channels, the bot must be an administrator. It can receive new channel posts, but it will not receive comments from a linked discussion group unless it is added there too.
 - In direct chats, the bot only sees messages sent directly to it.
+- The official cloud Telegram Bot API can reject large media downloads with `file is too big`. By default `TELEGRAM_DOWNLOAD_LIMIT_MB=0`, so the bot tries the download and handles Telegram's actual answer. Set a positive value only when you want an early local cutoff.
 
 ## OpenAI API vs ChatGPT Subscription
 
@@ -364,6 +365,7 @@ VIDEO_RECOGNITION_MODEL=qwen2.5vl:7b
 VIDEO_RECOGNITION_NUM_CTX=16384
 VIDEO_RECOGNITION_NUM_PREDICT=800
 MAX_VIDEO_SIZE_MB=50
+TELEGRAM_DOWNLOAD_LIMIT_MB=0
 MAX_VIDEO_SECONDS=120
 VIDEO_DOWNLOAD_DIR=data/video
 VIDEO_FRAME_DIR=data/video_frames
@@ -385,6 +387,7 @@ Behavior:
 - If `/video` is sent as a reply to a video or Telegram video note, the bot recognizes only the replied video.
 - If `/video` is sent without a reply, the bot recognizes the latest indexed video in the chat.
 - `/vocr` is an alias for `/video`.
+- Videos over `MAX_VIDEO_SIZE_MB` are rejected before recognition. If `TELEGRAM_DOWNLOAD_LIMIT_MB` is positive, it is also used as an early cutoff; otherwise the bot attempts the download and reports Telegram's real `file is too big` response if it happens.
 - The bot downloads the video, extracts key frames with `ffmpeg`, sends those frames to `VIDEO_RECOGNITION_MODEL`, extracts the audio track if present, transcribes speech with Whisper, unloads the model after the task, and deletes temporary files.
 - Repeated `/video` calls for the same message and same video settings use a SQLite cache instead of rerunning `ffmpeg` and Ollama.
 - The result is saved as a normal stored message, so future `/summary` and `/question` calls can use it.

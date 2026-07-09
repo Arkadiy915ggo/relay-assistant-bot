@@ -12,6 +12,7 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 from aiogram import Bot, Dispatcher, F
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command
 from aiogram.types import Message
 
@@ -30,6 +31,10 @@ from tg_summary_bot.video_recognizer import VideoRecognizer
 
 
 RESPONSE_LOGGER_NAME = "tg_summary_bot.responses"
+
+
+class TelegramDownloadTooLargeError(RuntimeError):
+    pass
 
 
 def telegram_html(text: str) -> str:
@@ -284,7 +289,19 @@ def video_from_message(message: Message) -> StoredVideo | None:
 def video_too_large(settings: Settings, video: StoredVideo) -> bool:
     if not video.file_size:
         return False
-    return video.file_size > settings.max_video_size_mb * 1024 * 1024
+    return video.file_size > effective_video_size_limit_mb(settings) * 1024 * 1024
+
+
+def effective_video_size_limit_mb(settings: Settings) -> int:
+    if settings.telegram_download_limit_mb <= 0:
+        return settings.max_video_size_mb
+    return min(settings.max_video_size_mb, settings.telegram_download_limit_mb)
+
+
+def telegram_download_limit_label(settings: Settings) -> str:
+    if settings.telegram_download_limit_mb <= 0:
+        return "не задан заранее; Telegram отклонил файл при скачивании"
+    return f"{settings.telegram_download_limit_mb} MB"
 
 
 def video_too_long(settings: Settings, video: StoredVideo) -> bool:
@@ -556,6 +573,8 @@ async def create_dispatcher(
             f"video_frame_count: `{settings.video_frame_count}`\n"
             f"video_frame_max_width: `{settings.video_frame_max_width}`\n"
             f"video_transcribe_audio: `{settings.video_transcribe_audio}`\n"
+            f"max_video_size_mb: `{settings.max_video_size_mb}`\n"
+            f"telegram_download_limit_mb: `{settings.telegram_download_limit_mb}`\n"
             f"ollama_timeout_seconds: `{settings.ollama_timeout_seconds}`\n"
             f"ollama_num_ctx: `{settings.ollama_num_ctx}`\n"
             f"ollama_num_predict: `{settings.ollama_num_predict}`\n"
@@ -1100,8 +1119,8 @@ async def create_dispatcher(
         if video_too_large(settings, video):
             await answer_logged(
                 request_message,
-                "Video is too large: "
-                f"{video.file_size} bytes. Limit: {settings.max_video_size_mb} MB.",
+                "Видео слишком большое для распознавания: "
+                f"{video.file_size} bytes. Лимит: {effective_video_size_limit_mb(settings)} MB.",
             )
             return
         if video_too_long(settings, video):
@@ -1192,9 +1211,13 @@ async def create_dispatcher(
             result = combine_video_result(visual_result, visual_note, audio_transcript, audio_note)
         except Exception as exc:  # noqa: BLE001
             logging.exception("Video recognition failed")
+            if isinstance(exc, TelegramDownloadTooLargeError):
+                text = str(exc)
+            else:
+                text = f"Failed to recognize video: `{type(exc).__name__}: {exc}`"
             await edit_text_logged(
                 wait_message,
-                f"Failed to recognize video: `{type(exc).__name__}: {exc}`",
+                text,
                 source_message=request_message,
             )
             return
@@ -1753,7 +1776,19 @@ async def download_video(settings: Settings, bot: Bot, video: StoredVideo) -> Pa
     if not suffix:
         suffix = ".mp4"
     video_path = settings.video_download_dir / f"{video.chat_id}_{video.message_id}{suffix}"
-    await bot.download(video.file_id, destination=video_path)
+    try:
+        await bot.download(video.file_id, destination=video_path)
+    except TelegramBadRequest as exc:
+        if "file is too big" in str(exc).lower():
+            video_path.unlink(missing_ok=True)
+            limit = effective_video_size_limit_mb(settings)
+            raise TelegramDownloadTooLargeError(
+                "Видео слишком большое для скачивания через Telegram Bot API. "
+                f"Лимит скачивания: {telegram_download_limit_label(settings)}. "
+                f"Лимит распознавания бота: {limit} MB. "
+                "Сожмите/обрежьте видео или отправьте кружочек/короткий фрагмент."
+            ) from exc
+        raise
     return video_path
 
 
