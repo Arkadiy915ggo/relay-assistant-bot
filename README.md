@@ -14,8 +14,10 @@ A safe Telegram bot that stores new chat messages and produces short AI summarie
 - restricts access with `ALLOWED_CHAT_IDS`;
 - optionally transcribes Telegram voice/audio messages locally with `faster-whisper`;
 - manually recognizes text from images with an Ollama vision model;
+- makes simple image memes with `/meme` from a replied/latest image;
 - manually recognizes videos through sampled key frames and auto-recognizes Telegram video notes;
 - answers contextual questions when the bot is mentioned in a message;
+- searches Wikipedia with `/wiki` and saves found excerpts for future context;
 - compresses old chat history into structured SQLite memory blocks for long `/question` and `/summary` periods;
 - keeps source-backed participant profile facts that can be used in answers;
 - optionally logs LLM traces to Opik for answer quality analysis.
@@ -145,6 +147,7 @@ Restart the bot.
 /summary today
 /question your question
 /question 24h your question
+/wiki what to search
 /memory
 /memory rebuild
 /profile
@@ -153,10 +156,31 @@ Restart the bot.
 /transcribe
 /image
 /ocr
+/meme
 /video
 /vocr
 /compare 10m
 ```
+
+## Wikipedia Search
+
+The bot can search Wikipedia without any API key:
+
+```text
+/wiki Python programming language
+```
+
+Configure:
+
+```env
+WIKI_SEARCH_ENABLED=true
+WIKI_LANGUAGE=ru
+WIKI_TIMEOUT_SECONDS=20
+WIKI_MAX_RESULTS=3
+WIKI_USER_AGENT=telegram-summary-bot/0.1 (https://github.com/Arkadiy915ggo/relay-assistant-bot)
+```
+
+`/wiki` returns short article extracts with source links and saves successful results as normal stored messages, so future `/summary` and `/question` calls can use them as chat context. This is not a full web search engine; it only uses the selected Wikipedia language edition.
 
 ## Chat Memory
 
@@ -304,7 +328,7 @@ WHISPER_MODEL=small
 
 ## Image Recognition
 
-The bot can recognize images manually through an Ollama vision model. It does not run OCR automatically for every incoming image. Incoming photos and image documents are only indexed by Telegram `file_id`, so the bot can later download the selected image when you explicitly ask.
+The bot can recognize images manually through an Ollama vision model. It does not run OCR automatically for every incoming image. Incoming photos and image documents are only indexed by Telegram `file_id`, so the bot can later download the selected image when you explicitly ask. It can also make a simple meme from the replied/latest image with `/meme`.
 
 Recommended local model for a good GPU such as RTX 4070 Ti Super:
 
@@ -319,6 +343,12 @@ IMAGE_RECOGNITION_MODEL=qwen2.5vl:7b
 IMAGE_RECOGNITION_NUM_CTX=8192
 MAX_IMAGE_SIZE_MB=20
 IMAGE_DOWNLOAD_DIR=data/images
+MEME_ENABLED=true
+MEME_MODEL=
+MEME_OUTPUT_DIR=data/memes
+MEME_FONT_PATH=
+MEME_MAX_IMAGE_SIZE_MB=20
+MEME_NUM_PREDICT=160
 OLLAMA_UNLOAD_AFTER_TASK=true
 ```
 
@@ -327,6 +357,7 @@ Usage:
 ```text
 /image
 /ocr
+/meme
 ```
 
 Behavior:
@@ -334,7 +365,8 @@ Behavior:
 - If `/image` is sent as a reply to an image, the bot recognizes only the replied image.
 - If `/image` is sent without a reply, the bot recognizes the latest indexed image in the chat.
 - `/ocr` is an alias for `/image`.
-- The result is saved as a normal stored message, so future `/summary` and `/question` calls can use it.
+- `/meme` uses the replied image or the latest indexed image, asks the vision model for a short safe Russian joke, renders classic top/bottom meme text with Pillow, sends the resulting image, and deletes temporary files.
+- `/image` and `/ocr` results are saved as normal stored messages, so future `/summary` and `/question` calls can use them. `/meme` does not save generated images in SQLite.
 
 The image response format is:
 
@@ -344,7 +376,7 @@ Russian translation if the text is English
 Short Russian summary of the image
 ```
 
-The vision model uses the same Ollama server settings as text models: `OLLAMA_BASE_URL`, `OLLAMA_TIMEOUT_SECONDS`, `OLLAMA_KEEP_ALIVE`, and `OLLAMA_NUM_PREDICT`. Image recognition uses its own context size through `IMAGE_RECOGNITION_NUM_CTX`, so changing it does not affect `/summary`. The bot runs image recognition inside the same GPU queue as summaries and voice transcription. After recognition, it unloads `IMAGE_RECOGNITION_MODEL` when `OLLAMA_UNLOAD_AFTER_TASK=true`.
+The vision model uses the same Ollama server settings as text models: `OLLAMA_BASE_URL`, `OLLAMA_TIMEOUT_SECONDS`, `OLLAMA_KEEP_ALIVE`, and `OLLAMA_NUM_PREDICT`. Image recognition uses its own context size through `IMAGE_RECOGNITION_NUM_CTX`, so changing it does not affect `/summary`. `/meme` uses `MEME_MODEL`, or `IMAGE_RECOGNITION_MODEL` when `MEME_MODEL` is empty. Meme rendering uses `MEME_FONT_PATH` when set, then tries DejaVu Sans Bold from the system, then falls back to Pillow's default font. The bot runs image recognition and meme caption generation inside the same GPU queue as summaries and voice transcription. After recognition, it unloads the vision model when `OLLAMA_UNLOAD_AFTER_TASK=true`.
 
 ## Video Recognition
 

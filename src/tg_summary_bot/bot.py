@@ -14,13 +14,14 @@ from pathlib import Path
 from aiogram import Bot, Dispatcher, F
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command
-from aiogram.types import Message
+from aiogram.types import FSInputFile, Message
 
 from tg_summary_bot.assistant import ChatAssistant
 from tg_summary_bot.config import Settings, load_settings
 from tg_summary_bot.image_recognizer import ImageRecognizer
 from tg_summary_bot.llm import build_llm_client
 from tg_summary_bot.memory import ChatMemory, MemoryCompressionError, participant_key, should_use_memory
+from tg_summary_bot.meme_generator import MemeGenerator
 from tg_summary_bot.observability import opik_track, update_opik_span_metadata
 from tg_summary_bot.periods import format_period, parse_period
 from tg_summary_bot.storage import MessageStore, StoredImage, StoredVideo
@@ -28,6 +29,7 @@ from tg_summary_bot.summarizer import Summarizer
 from tg_summary_bot.transcriber import FasterWhisperTranscriber
 from tg_summary_bot.transcript_formatter import TranscriptFormatter
 from tg_summary_bot.video_recognizer import VideoRecognizer
+from tg_summary_bot.web_search import WikipediaSearchClient, format_wiki_results
 
 
 RESPONSE_LOGGER_NAME = "tg_summary_bot.responses"
@@ -226,6 +228,12 @@ def image_too_large(settings: Settings, image: StoredImage) -> bool:
     if not image.file_size:
         return False
     return image.file_size > settings.max_image_size_mb * 1024 * 1024
+
+
+def meme_image_too_large(settings: Settings, image: StoredImage) -> bool:
+    if not image.file_size:
+        return False
+    return image.file_size > settings.meme_max_image_size_mb * 1024 * 1024
 
 
 def video_payload(
@@ -508,7 +516,9 @@ async def create_dispatcher(
     chat_assistant: ChatAssistant,
     chat_memory: ChatMemory | None,
     image_recognizer: ImageRecognizer,
+    meme_generator: MemeGenerator,
     video_recognizer: VideoRecognizer,
+    wiki_search: WikipediaSearchClient,
     transcriber: FasterWhisperTranscriber | None,
     transcript_formatter: TranscriptFormatter | None,
     gpu_lock: asyncio.Lock,
@@ -557,12 +567,14 @@ async def create_dispatcher(
             "`/summary 7d` - last 7 days\n"
             "`/summary today` - today in UTC\n"
             "`/question 24h <text>` - chat with the assistant using recent context\n"
+            "`/wiki <text>` - search Wikipedia and save the result for chat context\n"
             "`/memory` - compressed chat memory status; `/memory rebuild` resets blocks\n"
             "`/profile [name]` - show your, replied, or named participant profile\n"
             "`/profile correct [@name] <fact>` - save a profile fact for yourself, "
             "named, or replied participant\n"
             "`/transcribe` - transcribe replied voice/audio\n"
             "`/image` - recognize the latest image or replied image\n"
+            "`/meme` - make a meme from replied/latest image\n"
             "`/video` - recognize the latest video/video note or replied video\n"
             "`/compare 10m` - compare summaries across Ollama models\n"
             "`/stats` - chat_id and stored message count\n\n"
@@ -589,6 +601,9 @@ async def create_dispatcher(
             f"question_model: `{settings.question_model or settings.ollama_model}`\n"
             f"image_recognition_model: `{settings.image_recognition_model}`\n"
             f"image_recognition_num_ctx: `{settings.image_recognition_num_ctx}`\n"
+            f"meme_enabled: `{settings.meme_enabled}`\n"
+            f"meme_model: `{settings.meme_model or settings.image_recognition_model}`\n"
+            f"meme_output_dir: `{settings.meme_output_dir}`\n"
             f"video_recognition_model: `{settings.video_recognition_model}`\n"
             f"video_recognition_num_ctx: `{settings.video_recognition_num_ctx}`\n"
             f"video_frame_count: `{settings.video_frame_count}`\n"
@@ -603,6 +618,9 @@ async def create_dispatcher(
             f"opik_project_name: `{settings.opik_project_name}`\n"
             f"opik_capture_content: `{settings.opik_capture_content}`\n"
             f"memory_enabled: `{settings.memory_enabled}`\n"
+            f"wiki_search_enabled: `{settings.wiki_search_enabled}`\n"
+            f"wiki_language: `{settings.wiki_language}`\n"
+            f"wiki_max_results: `{settings.wiki_max_results}`\n"
             f"transcribe_voice: `{settings.transcribe_voice}`\n"
             f"whisper_model: `{settings.whisper_model}`\n"
             f"whisper_device: `{settings.whisper_device}`\n"
@@ -1040,6 +1058,46 @@ async def create_dispatcher(
         period_raw, question = parsed
         await answer_chat_question(message, period_raw=period_raw, question=question)
 
+    @dp.message(Command("wiki"))
+    async def wiki_command(message: Message) -> None:
+        if not is_allowed(settings, message.chat.id):
+            return
+        if not settings.wiki_search_enabled:
+            await answer_logged(message, "Wikipedia search is disabled: `WIKI_SEARCH_ENABLED=false`.")
+            return
+
+        query = (message.text or "").split(maxsplit=1)
+        if len(query) < 2 or not query[1].strip():
+            await answer_logged(message, "Usage: `/wiki what to search`")
+            return
+
+        search_query = query[1].strip()
+        wait_message = await answer_logged(message, f"Searching Wikipedia for `{search_query}`...")
+        try:
+            results = await wiki_search.search(search_query)
+        except Exception as exc:  # noqa: BLE001
+            logging.exception("Wikipedia search failed")
+            await edit_text_logged(
+                wait_message,
+                f"Failed to search Wikipedia: `{type(exc).__name__}: {exc}`",
+                source_message=message,
+            )
+            return
+
+        text = format_wiki_results(search_query, results)
+        if results:
+            await save_message_text(
+                settings,
+                store,
+                message,
+                f"Wikipedia search for {search_query}: {text}",
+                limit_chars=settings.max_transcription_chars,
+            )
+        parts = split_telegram_text(text)
+        await edit_text_logged(wait_message, parts[0], source_message=message)
+        for part in parts[1:]:
+            await answer_logged(message, part)
+
     @dp.message(Command("image", "ocr"))
     async def image_command(message: Message, bot: Bot) -> None:
         if not is_allowed(settings, message.chat.id):
@@ -1109,6 +1167,97 @@ async def create_dispatcher(
         await edit_text_logged(wait_message, parts[0], source_message=message)
         for part in parts[1:]:
             await answer_logged(message, part)
+
+    @dp.message(Command("meme"))
+    async def meme_command(message: Message, bot: Bot) -> None:
+        if not is_allowed(settings, message.chat.id):
+            return
+        if not settings.meme_enabled:
+            await answer_logged(message, "Meme generation is disabled: `MEME_ENABLED=false`.")
+            return
+        meme_model = settings.meme_model or settings.image_recognition_model
+        if not meme_model:
+            await answer_logged(
+                message,
+                "Meme generation is disabled: MEME_MODEL and IMAGE_RECOGNITION_MODEL are empty.",
+            )
+            return
+
+        image = await resolve_image_for_command(store, message)
+        if not image:
+            await answer_logged(
+                message,
+                "No image found. Reply to an image with `/meme`, or send `/meme` after an image.",
+            )
+            return
+        if meme_image_too_large(settings, image):
+            await answer_logged(
+                message,
+                "Image is too large: "
+                f"{image.file_size} bytes. Limit: {settings.meme_max_image_size_mb} MB.",
+            )
+            return
+
+        wait_message = await answer_logged(
+            message,
+            f"Делаю мем из картинки #{image.message_id} через `{meme_model}`...",
+        )
+        image_path: Path | None = None
+        output_path: Path | None = None
+        started = time.perf_counter()
+        try:
+            image_path = await download_image(settings, bot, image)
+            try:
+                async with gpu_lock:
+                    try:
+                        caption = await meme_generator.generate_caption(image_path)
+                    finally:
+                        await meme_generator.unload()
+            except Exception as exc:  # noqa: BLE001
+                logging.exception("Meme caption generation failed")
+                await edit_text_logged(
+                    wait_message,
+                    f"Failed to generate meme text: `{type(exc).__name__}: {exc}`",
+                    source_message=message,
+                )
+                return
+
+            output_path = settings.meme_output_dir / f"{image.chat_id}_{image.message_id}_meme.jpg"
+            try:
+                meme_generator.render_meme(image_path, caption, output_path)
+            except Exception as exc:  # noqa: BLE001
+                logging.exception("Meme rendering failed")
+                await edit_text_logged(
+                    wait_message,
+                    f"Failed to render meme: `{type(exc).__name__}: {exc}`",
+                    source_message=message,
+                )
+                return
+
+            elapsed = time.perf_counter() - started
+            response = await message.reply_photo(
+                photo=FSInputFile(output_path),
+                caption=f"Мем готов за {elapsed:.1f} сек.",
+            )
+            log_bot_response(
+                action="reply_photo",
+                text=f"Meme for image #{image.message_id}: {caption.alt_text}",
+                response_message=response,
+                source_message=message,
+            )
+            await wait_message.delete()
+        except Exception as exc:  # noqa: BLE001
+            logging.exception("Meme command failed")
+            await edit_text_logged(
+                wait_message,
+                f"Failed to create meme: `{type(exc).__name__}: {exc}`",
+                source_message=message,
+            )
+        finally:
+            if image_path:
+                image_path.unlink(missing_ok=True)
+            if output_path:
+                output_path.unlink(missing_ok=True)
 
     @opik_track(name="video.process")
     async def recognize_video_source(
@@ -1679,6 +1828,9 @@ async def resolve_image_for_command(store: MessageStore, message: Message) -> St
         if replied_image:
             return replied_image
         return await store.get_image_by_message_id(message.chat.id, message.reply_to_message.message_id)
+    current_image = image_from_message(message)
+    if current_image:
+        return current_image
     return await store.get_latest_image(message.chat.id)
 
 
@@ -1903,7 +2055,9 @@ async def main() -> None:
         else None
     )
     image_recognizer = ImageRecognizer(settings)
+    meme_generator = MemeGenerator(settings)
     video_recognizer = VideoRecognizer(settings)
+    wiki_search = WikipediaSearchClient(settings)
     transcriber = (
         FasterWhisperTranscriber(settings)
         if settings.transcribe_voice or settings.video_transcribe_audio
@@ -1919,7 +2073,9 @@ async def main() -> None:
         chat_assistant,
         chat_memory,
         image_recognizer,
+        meme_generator,
         video_recognizer,
+        wiki_search,
         transcriber,
         transcript_formatter,
         gpu_lock,
