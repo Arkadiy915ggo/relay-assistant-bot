@@ -146,7 +146,7 @@ def load_settings() -> Settings:
         whisper_model=os.getenv("WHISPER_MODEL", "large-v3").strip(),
         whisper_device=os.getenv("WHISPER_DEVICE", "cuda").strip(),
         whisper_compute_type=os.getenv("WHISPER_COMPUTE_TYPE", "float16").strip(),
-        whisper_language=os.getenv("WHISPER_LANGUAGE", "ru").strip(),
+        whisper_language=os.getenv("WHISPER_LANGUAGE", "").strip(),
         max_voice_seconds=int(os.getenv("MAX_VOICE_SECONDS", "600")),
         voice_download_dir=Path(os.getenv("VOICE_DOWNLOAD_DIR", "data/voice")),
         transcription_format_enabled=_bool(os.getenv("TRANSCRIPTION_FORMAT_ENABLED", "true")),

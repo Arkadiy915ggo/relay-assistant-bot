@@ -280,7 +280,7 @@ TRANSCRIBE_VOICE=true
 WHISPER_MODEL=large-v3
 WHISPER_DEVICE=cuda
 WHISPER_COMPUTE_TYPE=float16
-WHISPER_LANGUAGE=ru
+WHISPER_LANGUAGE=
 MAX_VOICE_SECONDS=600
 TRANSCRIPTION_FORMAT_ENABLED=true
 TRANSCRIPTION_FORMAT_PROVIDER=ollama
@@ -292,6 +292,8 @@ OLLAMA_UNLOAD_AFTER_TASK=true
 ```
 
 LLM tasks, transcription, and transcript formatting share a single GPU queue: the bot does not run Ollama and Whisper at the same time. The raw Whisper transcript is sent immediately; formatting is scheduled after that response and edits the sent messages when it finishes. After local LLM work, the Ollama model is explicitly unloaded when `OLLAMA_UNLOAD_AFTER_TASK=true`.
+
+Keep `WHISPER_LANGUAGE=` empty for automatic language detection, including Russian, Polish, and English speech. Use `WHISPER_LANGUAGE=ru`, `WHISPER_LANGUAGE=pl`, or another Whisper language code only when the chat is fixed to one language and auto-detection is worse on short messages. When transcript formatting is enabled, non-Russian speech is preserved in the original language and translated to Russian.
 
 Set `TRANSCRIPTION_FORMAT_ENABLED=false` to keep raw Whisper output only. Set `TRANSCRIPTION_FORMAT_MODEL=` to disable formatting by leaving no model configured. Very long transcripts above `MAX_TRANSCRIPTION_FORMAT_CHARS` are left unformatted rather than partially rewritten.
 
@@ -372,7 +374,7 @@ The image response format is:
 
 ```text
 Text from image in the original language
-Russian translation if the text is English
+Russian translation if the text is not Russian
 Short Russian summary of the image
 ```
 
@@ -424,7 +426,7 @@ Behavior:
 - If `/video` is sent without a reply, the bot recognizes the latest indexed video in the chat.
 - `/vocr` is an alias for `/video`.
 - Videos over `MAX_VIDEO_SIZE_MB` are rejected before recognition. If `TELEGRAM_DOWNLOAD_LIMIT_MB` is positive, it is also used as an early cutoff; otherwise the bot attempts the download and reports Telegram's real `file is too big` response if it happens.
-- The bot downloads the video, extracts key frames with `ffmpeg`, sends those frames to `VIDEO_RECOGNITION_MODEL`, extracts the audio track if present, transcribes speech with Whisper, unloads the model after the task, and deletes temporary files.
+- The bot downloads the video, extracts key frames with `ffmpeg`, sends those frames to `VIDEO_RECOGNITION_MODEL`, extracts the audio track if present, transcribes speech with Whisper, formats/translates non-Russian speech when transcript formatting is enabled, unloads the model after the task, and deletes temporary files.
 - Repeated `/video` calls for the same message and same video settings use a SQLite cache instead of rerunning `ffmpeg` and Ollama.
 - The result is saved as a normal stored message, so future `/summary` and `/question` calls can use it.
 
@@ -432,7 +434,7 @@ The video response format is:
 
 ```text
 Text from video frames in the original language
-Russian translation if the text is English
+Russian translation if the text is not Russian
 Short Russian summary of the video
 Short description of what happens in the video
 Audio transcript if the video contains speech
@@ -440,7 +442,7 @@ Audio transcript if the video contains speech
 
 Video recognition shares the same GPU queue as summaries, image recognition, and voice transcription, so heavy local tasks do not run at the same time.
 
-Audio transcription for videos uses the same local Whisper settings as voice messages: `WHISPER_MODEL`, `WHISPER_DEVICE`, `WHISPER_COMPUTE_TYPE`, and `WHISPER_LANGUAGE`. If `VIDEO_TRANSCRIBE_AUDIO=true`, install voice dependencies with `./run.sh install-voice` or `./run.sh install-voice-cuda`.
+Audio transcription for videos uses the same local Whisper settings as voice messages: `WHISPER_MODEL`, `WHISPER_DEVICE`, `WHISPER_COMPUTE_TYPE`, and `WHISPER_LANGUAGE`. If `VIDEO_TRANSCRIBE_AUDIO=true`, install voice dependencies with `./run.sh install-voice` or `./run.sh install-voice-cuda`. With `WHISPER_LANGUAGE=` the bot can auto-detect Polish speech in ordinary videos and Telegram video notes/circles.
 
 If video recognition hits a context error such as `request (...) exceeds the available context size`, the bot automatically retries with fewer and smaller frames. If even the compressed fallback is not enough, reduce the frame settings first:
 

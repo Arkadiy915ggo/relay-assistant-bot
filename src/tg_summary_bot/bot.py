@@ -322,6 +322,7 @@ def video_recognition_cache_key(
     settings: Settings,
     video_recognizer: VideoRecognizer,
     transcriber: FasterWhisperTranscriber | None,
+    transcript_formatter: TranscriptFormatter | None,
 ) -> str:
     if settings.video_transcribe_audio and transcriber:
         audio = (
@@ -332,7 +333,8 @@ def video_recognition_cache_key(
         audio = "audio=missing-transcriber"
     else:
         audio = "audio=off"
-    return f"{video_recognizer.cache_key}|{audio}"
+    formatter = transcript_formatter.cache_key if transcript_formatter else "transcript_format=off"
+    return f"{video_recognizer.cache_key}|{audio}|{formatter}"
 
 
 def combine_video_result(
@@ -1305,7 +1307,12 @@ async def create_dispatcher(
             )
             return
 
-        cache_key = video_recognition_cache_key(settings, video_recognizer, transcriber)
+        cache_key = video_recognition_cache_key(
+            settings,
+            video_recognizer,
+            transcriber,
+            transcript_formatter,
+        )
         cached = await store.get_video_recognition(
             chat_id=video.chat_id,
             message_id=video.message_id,
@@ -1376,6 +1383,13 @@ async def create_dispatcher(
                 if settings.video_transcribe_audio:
                     if audio_path and transcriber:
                         audio_transcript = await transcriber.transcribe(audio_path)
+                        if audio_transcript.strip() and transcript_formatter:
+                            try:
+                                audio_transcript = await transcript_formatter.format(audio_transcript)
+                            except Exception:  # noqa: BLE001
+                                logging.exception("Video audio transcript formatting failed")
+                            finally:
+                                await transcript_formatter.unload()
                     elif audio_path:
                         audio_note = "Аудио найдено, но Whisper transcription is not configured."
                 else:
@@ -2040,7 +2054,7 @@ async def main() -> None:
             num_ctx=settings.transcription_format_num_ctx,
             num_predict=settings.transcription_format_num_predict,
         )
-        if settings.transcribe_voice
+        if (settings.transcribe_voice or settings.video_transcribe_audio)
         and settings.transcription_format_enabled
         and settings.transcription_format_model
         else None
