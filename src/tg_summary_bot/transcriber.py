@@ -7,6 +7,7 @@ import time
 from pathlib import Path
 
 from tg_summary_bot.config import Settings
+from tg_summary_bot.observability import opik_track, update_opik_span_metadata
 
 
 class FasterWhisperTranscriber:
@@ -16,8 +17,20 @@ class FasterWhisperTranscriber:
         self.compute_type = settings.whisper_compute_type
         self.language = settings.whisper_language or None
 
+    @opik_track(name="audio.transcribe")
     async def transcribe(self, audio_path: Path) -> str:
-        return await asyncio.to_thread(self._transcribe_sync, audio_path)
+        update_opik_span_metadata(
+            {
+                "model": self.model_name,
+                "device": self.device,
+                "compute_type": self.compute_type,
+                "language": self.language or "auto",
+                "audio_size_bytes": audio_path.stat().st_size if audio_path.exists() else 0,
+            }
+        )
+        text = await asyncio.to_thread(self._transcribe_sync, audio_path)
+        update_opik_span_metadata({"output_chars": len(text)})
+        return text
 
     def _transcribe_sync(self, audio_path: Path) -> str:
         try:

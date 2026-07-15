@@ -8,6 +8,7 @@ dependencies = [
     "aiosqlite>=0.20,<1",
     "httpx>=0.27,<1",
     "openai>=1.40,<2",
+    "Pillow>=10,<12",
     "python-dotenv>=1.0,<2",
 ]
 

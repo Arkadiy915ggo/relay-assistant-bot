@@ -14,8 +14,12 @@ A safe Telegram bot that stores new chat messages and produces short AI summarie
 - restricts access with `ALLOWED_CHAT_IDS`;
 - optionally transcribes Telegram voice/audio messages locally with `faster-whisper`;
 - manually recognizes text from images with an Ollama vision model;
-- manually recognizes videos and Telegram video notes through sampled key frames;
-- compresses old chat history into SQLite memory blocks for long `/question` and `/summary` periods;
+- makes simple image memes with `/meme` from a replied/latest image;
+- manually recognizes videos through sampled key frames and auto-recognizes Telegram video notes;
+- answers contextual questions when the bot is mentioned in a message;
+- searches Wikipedia with `/wiki` and saves found excerpts for future context;
+- compresses old chat history into structured SQLite memory blocks for long `/question` and `/summary` periods;
+- keeps source-backed participant profile facts that can be used in answers;
 - optionally logs LLM traces to Opik for answer quality analysis.
 
 ## Telegram Limitations
@@ -24,6 +28,7 @@ A safe Telegram bot that stores new chat messages and produces short AI summarie
 - In groups, the bot sees all messages only if `Group Privacy` is disabled in `@BotFather`.
 - In channels, the bot must be an administrator. It can receive new channel posts, but it will not receive comments from a linked discussion group unless it is added there too.
 - In direct chats, the bot only sees messages sent directly to it.
+- The official cloud Telegram Bot API can reject large media downloads with `file is too big`. By default `TELEGRAM_DOWNLOAD_LIMIT_MB=0`, so the bot tries the download and handles Telegram's actual answer. Set a positive value only when you want an early local cutoff.
 
 ## OpenAI API vs ChatGPT Subscription
 
@@ -142,18 +147,50 @@ Restart the bot.
 /summary today
 /question your question
 /question 24h your question
+/wiki what to search
 /memory
+/memory rebuild
+/profile
+/profile forget
+/profile correct true fact
 /transcribe
 /image
 /ocr
+/meme
 /video
 /vocr
 /compare 10m
 ```
 
+## Wikipedia Search
+
+The bot can search Wikipedia without any API key:
+
+```text
+/wiki Python programming language
+```
+
+Configure:
+
+```env
+WIKI_SEARCH_ENABLED=true
+WIKI_LANGUAGE=ru
+WIKI_TIMEOUT_SECONDS=20
+WIKI_MAX_RESULTS=3
+WIKI_USER_AGENT=telegram-summary-bot/0.1 (https://github.com/Arkadiy915ggo/relay-assistant-bot)
+```
+
+`/wiki` returns short article extracts with source links and saves successful results as normal stored messages, so future `/summary` and `/question` calls can use them as chat context. This is not a full web search engine; it only uses the selected Wikipedia language edition.
+
 ## Chat Memory
 
-For periods longer than `MEMORY_RECENT_PERIOD`, the bot can compress older raw messages into short SQLite memory blocks. `/question` uses fresh raw messages plus relevant memory blocks; `/summary` uses fresh raw messages plus memory blocks for the requested period.
+For periods longer than `MEMORY_RECENT_PERIOD`, the bot can compress older raw messages into structured SQLite memory blocks. `/question` uses fresh raw messages plus relevant memory blocks; `/summary` uses fresh raw messages plus memory blocks for the requested period.
+
+Memory blocks now keep structured fields for summaries, decisions, tasks, open questions, important events, keywords, and source-backed participant facts. Old blocks are rolled up into higher-level blocks instead of being discarded immediately when the block count grows.
+
+Participant profiles are built from explicit facts with source message ids, confidence, status, and optional expiration for temporary facts. Question answers and mention-triggered answers can include only relevant participant profile facts, including the author of the question and the author of a replied message.
+
+Profile facts are updated in two ways: older messages are processed during long-memory compression, and recent raw messages are scanned after `/summary` and `/question` even for short periods. Recent profile scanning uses a separate, smaller chunk size derived from `OLLAMA_NUM_CTX` and capped by `CHUNK_CHARS`/`MEMORY_CHUNK_CHARS`, so a small context window automatically reduces profile extraction chunk size.
 
 Configure:
 
@@ -165,10 +202,28 @@ MEMORY_MAX_BLOCKS=200
 MEMORY_SEARCH_LIMIT=8
 ```
 
+With `OLLAMA_NUM_CTX=32768`, the default profile extraction chunk is already capped at a safe size. If you run Ollama with a much smaller context, keep `CHUNK_CHARS` and `MEMORY_CHUNK_CHARS` conservative or increase `OLLAMA_NUM_CTX`.
+
 Check status:
 
 ```text
 /memory
+```
+
+If you already have old unstructured memory blocks, reset them and let the bot rebuild them from stored raw messages on the next long `/summary` or `/question`:
+
+```text
+/memory rebuild
+```
+
+Inspect or edit participant profiles:
+
+```text
+/profile                 # show your profile, or reply to show another participant
+/profile <name>          # search profile facts by participant name
+/profile forget          # reply to a participant to forget active facts
+/profile forget <name>   # forget active facts found by name
+/profile correct <fact>  # reply to a participant to save a high-confidence correction
 ```
 
 ## Response Logs
@@ -225,7 +280,7 @@ TRANSCRIBE_VOICE=true
 WHISPER_MODEL=large-v3
 WHISPER_DEVICE=cuda
 WHISPER_COMPUTE_TYPE=float16
-WHISPER_LANGUAGE=ru
+WHISPER_LANGUAGE=
 MAX_VOICE_SECONDS=600
 TRANSCRIPTION_FORMAT_ENABLED=true
 TRANSCRIPTION_FORMAT_PROVIDER=ollama
@@ -237,6 +292,8 @@ OLLAMA_UNLOAD_AFTER_TASK=true
 ```
 
 LLM tasks, transcription, and transcript formatting share a single GPU queue: the bot does not run Ollama and Whisper at the same time. The raw Whisper transcript is sent immediately; formatting is scheduled after that response and edits the sent messages when it finishes. After local LLM work, the Ollama model is explicitly unloaded when `OLLAMA_UNLOAD_AFTER_TASK=true`.
+
+Keep `WHISPER_LANGUAGE=` empty for automatic language detection, including Russian, Polish, and English speech. Use `WHISPER_LANGUAGE=ru`, `WHISPER_LANGUAGE=pl`, or another Whisper language code only when the chat is fixed to one language and auto-detection is worse on short messages. When transcript formatting is enabled, non-Russian speech is preserved in the original language and translated to Russian.
 
 Set `TRANSCRIPTION_FORMAT_ENABLED=false` to keep raw Whisper output only. Set `TRANSCRIPTION_FORMAT_MODEL=` to disable formatting by leaving no model configured. Very long transcripts above `MAX_TRANSCRIPTION_FORMAT_CHARS` are left unformatted rather than partially rewritten.
 
@@ -273,7 +330,7 @@ WHISPER_MODEL=small
 
 ## Image Recognition
 
-The bot can recognize images manually through an Ollama vision model. It does not run OCR automatically for every incoming image. Incoming photos and image documents are only indexed by Telegram `file_id`, so the bot can later download the selected image when you explicitly ask.
+The bot can recognize images manually through an Ollama vision model. It does not run OCR automatically for every incoming image. Incoming photos and image documents are only indexed by Telegram `file_id`, so the bot can later download the selected image when you explicitly ask. It can also make a simple meme from the replied/latest image with `/meme`.
 
 Recommended local model for a good GPU such as RTX 4070 Ti Super:
 
@@ -288,6 +345,12 @@ IMAGE_RECOGNITION_MODEL=qwen2.5vl:7b
 IMAGE_RECOGNITION_NUM_CTX=8192
 MAX_IMAGE_SIZE_MB=20
 IMAGE_DOWNLOAD_DIR=data/images
+MEME_ENABLED=true
+MEME_MODEL=
+MEME_OUTPUT_DIR=data/memes
+MEME_FONT_PATH=
+MEME_MAX_IMAGE_SIZE_MB=20
+MEME_NUM_PREDICT=160
 OLLAMA_UNLOAD_AFTER_TASK=true
 ```
 
@@ -296,6 +359,7 @@ Usage:
 ```text
 /image
 /ocr
+/meme
 ```
 
 Behavior:
@@ -303,17 +367,18 @@ Behavior:
 - If `/image` is sent as a reply to an image, the bot recognizes only the replied image.
 - If `/image` is sent without a reply, the bot recognizes the latest indexed image in the chat.
 - `/ocr` is an alias for `/image`.
-- The result is saved as a normal stored message, so future `/summary` and `/question` calls can use it.
+- `/meme` uses the replied image or the latest indexed image, asks the vision model for a short safe Russian joke, renders classic top/bottom meme text with Pillow, sends the resulting image, and deletes temporary files.
+- `/image` and `/ocr` results are saved as normal stored messages, so future `/summary` and `/question` calls can use them. `/meme` does not save generated images in SQLite.
 
 The image response format is:
 
 ```text
 Text from image in the original language
-Russian translation if the text is English
+Russian translation if the text is not Russian
 Short Russian summary of the image
 ```
 
-The vision model uses the same Ollama server settings as text models: `OLLAMA_BASE_URL`, `OLLAMA_TIMEOUT_SECONDS`, `OLLAMA_KEEP_ALIVE`, and `OLLAMA_NUM_PREDICT`. Image recognition uses its own context size through `IMAGE_RECOGNITION_NUM_CTX`, so changing it does not affect `/summary`. The bot runs image recognition inside the same GPU queue as summaries and voice transcription. After recognition, it unloads `IMAGE_RECOGNITION_MODEL` when `OLLAMA_UNLOAD_AFTER_TASK=true`.
+The vision model uses the same Ollama server settings as text models: `OLLAMA_BASE_URL`, `OLLAMA_TIMEOUT_SECONDS`, `OLLAMA_KEEP_ALIVE`, and `OLLAMA_NUM_PREDICT`. Image recognition uses its own context size through `IMAGE_RECOGNITION_NUM_CTX`, so changing it does not affect `/summary`. `/meme` uses `MEME_MODEL`, or `IMAGE_RECOGNITION_MODEL` when `MEME_MODEL` is empty. Meme rendering uses `MEME_FONT_PATH` when set, then tries DejaVu Sans Bold from the system, then falls back to Pillow's default font. The bot runs image recognition and meme caption generation inside the same GPU queue as summaries and voice transcription. After recognition, it unloads the vision model when `OLLAMA_UNLOAD_AFTER_TASK=true`.
 
 ## Video Recognition
 
@@ -338,6 +403,7 @@ VIDEO_RECOGNITION_MODEL=qwen2.5vl:7b
 VIDEO_RECOGNITION_NUM_CTX=16384
 VIDEO_RECOGNITION_NUM_PREDICT=800
 MAX_VIDEO_SIZE_MB=50
+TELEGRAM_DOWNLOAD_LIMIT_MB=0
 MAX_VIDEO_SECONDS=120
 VIDEO_DOWNLOAD_DIR=data/video
 VIDEO_FRAME_DIR=data/video_frames
@@ -359,7 +425,8 @@ Behavior:
 - If `/video` is sent as a reply to a video or Telegram video note, the bot recognizes only the replied video.
 - If `/video` is sent without a reply, the bot recognizes the latest indexed video in the chat.
 - `/vocr` is an alias for `/video`.
-- The bot downloads the video, extracts key frames with `ffmpeg`, sends those frames to `VIDEO_RECOGNITION_MODEL`, extracts the audio track if present, transcribes speech with Whisper, unloads the model after the task, and deletes temporary files.
+- Videos over `MAX_VIDEO_SIZE_MB` are rejected before recognition. If `TELEGRAM_DOWNLOAD_LIMIT_MB` is positive, it is also used as an early cutoff; otherwise the bot attempts the download and reports Telegram's real `file is too big` response if it happens.
+- The bot downloads the video, extracts key frames with `ffmpeg`, sends those frames to `VIDEO_RECOGNITION_MODEL`, extracts the audio track if present, transcribes speech with Whisper, formats/translates non-Russian speech when transcript formatting is enabled, unloads the model after the task, and deletes temporary files.
 - Repeated `/video` calls for the same message and same video settings use a SQLite cache instead of rerunning `ffmpeg` and Ollama.
 - The result is saved as a normal stored message, so future `/summary` and `/question` calls can use it.
 
@@ -367,7 +434,7 @@ The video response format is:
 
 ```text
 Text from video frames in the original language
-Russian translation if the text is English
+Russian translation if the text is not Russian
 Short Russian summary of the video
 Short description of what happens in the video
 Audio transcript if the video contains speech
@@ -375,7 +442,7 @@ Audio transcript if the video contains speech
 
 Video recognition shares the same GPU queue as summaries, image recognition, and voice transcription, so heavy local tasks do not run at the same time.
 
-Audio transcription for videos uses the same local Whisper settings as voice messages: `WHISPER_MODEL`, `WHISPER_DEVICE`, `WHISPER_COMPUTE_TYPE`, and `WHISPER_LANGUAGE`. If `VIDEO_TRANSCRIBE_AUDIO=true`, install voice dependencies with `./run.sh install-voice` or `./run.sh install-voice-cuda`.
+Audio transcription for videos uses the same local Whisper settings as voice messages: `WHISPER_MODEL`, `WHISPER_DEVICE`, `WHISPER_COMPUTE_TYPE`, and `WHISPER_LANGUAGE`. If `VIDEO_TRANSCRIBE_AUDIO=true`, install voice dependencies with `./run.sh install-voice` or `./run.sh install-voice-cuda`. With `WHISPER_LANGUAGE=` the bot can auto-detect Polish speech in ordinary videos and Telegram video notes/circles.
 
 If video recognition hits a context error such as `request (...) exceeds the available context size`, the bot automatically retries with fewer and smaller frames. If even the compressed fallback is not enough, reduce the frame settings first:
 
@@ -481,7 +548,9 @@ If you see `ReadTimeout`, the model is usually loading or generating too slowly.
 - `MAX_MESSAGE_CHARS` truncates very long messages before storage.
 - `MAX_SUMMARY_INPUT_CHARS` limits how much text is sent to the model for one summary request.
 - `CHUNK_CHARS` controls chunk size for long discussions.
-- `OLLAMA_NUM_CTX` controls the Ollama context size. If it is too small, long chunks can produce `400 Bad Request`.
+- `MEMORY_CHUNK_CHARS` controls old-message memory compression chunks, capped by `CHUNK_CHARS`.
+- Recent participant profile extraction chooses a smaller dynamic chunk from `OLLAMA_NUM_CTX`, `CHUNK_CHARS`, and `MEMORY_CHUNK_CHARS`.
+- `OLLAMA_NUM_CTX` controls the Ollama context size. If it is too small, long chunks can produce `400 Bad Request` or very short model outputs.
 - `OLLAMA_NUM_PREDICT` limits response length. This helps avoid timeouts with slow 70B models.
 - `LOG_FILE` sets the bot log file, defaulting to `data/bot.log`.
 - SQLite uses WAL mode, which is enough for small and medium chats.

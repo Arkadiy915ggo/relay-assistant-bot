@@ -12,23 +12,31 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 from aiogram import Bot, Dispatcher, F
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command
-from aiogram.types import Message
+from aiogram.types import FSInputFile, Message
 
 from tg_summary_bot.assistant import ChatAssistant
 from tg_summary_bot.config import Settings, load_settings
 from tg_summary_bot.image_recognizer import ImageRecognizer
 from tg_summary_bot.llm import build_llm_client
-from tg_summary_bot.memory import ChatMemory, should_use_memory
+from tg_summary_bot.memory import ChatMemory, MemoryCompressionError, participant_key, should_use_memory
+from tg_summary_bot.meme_generator import MemeGenerator
+from tg_summary_bot.observability import opik_track, update_opik_span_metadata
 from tg_summary_bot.periods import format_period, parse_period
 from tg_summary_bot.storage import MessageStore, StoredImage, StoredVideo
 from tg_summary_bot.summarizer import Summarizer
 from tg_summary_bot.transcriber import FasterWhisperTranscriber
 from tg_summary_bot.transcript_formatter import TranscriptFormatter
 from tg_summary_bot.video_recognizer import VideoRecognizer
+from tg_summary_bot.web_search import WikipediaSearchClient, format_wiki_results
 
 
 RESPONSE_LOGGER_NAME = "tg_summary_bot.responses"
+
+
+class TelegramDownloadTooLargeError(RuntimeError):
+    pass
 
 
 def telegram_html(text: str) -> str:
@@ -55,6 +63,89 @@ def sender_name(message: Message) -> tuple[int | None, str]:
     if message.sender_chat:
         return message.sender_chat.id, message.sender_chat.title or str(message.sender_chat.id)
     return None, "Unknown"
+
+
+def participant_ref(message: Message) -> tuple[str, str]:
+    sender_id, name = sender_name(message)
+    return participant_key(sender_id, name), name
+
+
+def normalize_profile_target(value: str) -> str:
+    return re.sub(r"[^0-9a-zа-яё]+", "", value.strip().lstrip("@").lower())
+
+
+def split_profile_correction_target(text: str) -> tuple[str | None, str]:
+    text = text.strip()
+    target, separator, fact = text.partition(" ")
+    if target.startswith("@"):
+        return target.strip("@,:; "), fact.strip() if separator else ""
+    return None, text
+
+
+def ranked_profile_target_matches(
+    query: str,
+    candidates: list[tuple[str, str]],
+) -> list[tuple[str, str]]:
+    normalized_query = normalize_profile_target(query)
+    if not normalized_query:
+        return []
+
+    seen: set[str] = set()
+    scored: list[tuple[int, int, str, str]] = []
+    for key, name in candidates:
+        if key in seen:
+            continue
+        seen.add(key)
+        normalized_name = normalize_profile_target(name)
+        normalized_key = normalize_profile_target(key.removeprefix("name:"))
+        score = 0
+        if normalized_query in {normalized_name, normalized_key}:
+            score = 4
+        elif normalized_name.startswith(normalized_query) or normalized_key.startswith(
+            normalized_query
+        ):
+            score = 3
+        elif normalized_query in normalized_name or normalized_query in normalized_key:
+            score = 2
+        if score:
+            scored.append((score, -len(name), key, name))
+
+    scored.sort(reverse=True)
+    return [(key, name) for _, _, key, name in scored]
+
+
+async def resolve_profile_target(
+    store: MessageStore,
+    *,
+    chat_id: int,
+    query: str,
+) -> list[tuple[str, str]]:
+    candidates: list[tuple[str, str]] = []
+    for fact in await store.get_participant_facts(chat_id=chat_id, limit=200):
+        candidates.append((fact.participant_key, fact.participant_name))
+    for participant in await store.get_chat_participants(chat_id=chat_id, limit=200):
+        candidates.append(
+            (
+                participant_key(participant.sender_id, participant.sender_name),
+                participant.sender_name,
+            )
+        )
+    return ranked_profile_target_matches(query, candidates)
+
+
+def participant_refs_for_context(message: Message) -> tuple[list[str], list[str]]:
+    refs = [participant_ref(message)]
+    if message.reply_to_message:
+        refs.append(participant_ref(message.reply_to_message))
+
+    keys: list[str] = []
+    names: list[str] = []
+    for key, name in refs:
+        if key not in keys:
+            keys.append(key)
+        if name and name not in names:
+            names.append(name)
+    return keys, names
 
 
 def split_telegram_text(text: str, limit: int = 3900) -> list[str]:
@@ -139,6 +230,12 @@ def image_too_large(settings: Settings, image: StoredImage) -> bool:
     return image.file_size > settings.max_image_size_mb * 1024 * 1024
 
 
+def meme_image_too_large(settings: Settings, image: StoredImage) -> bool:
+    if not image.file_size:
+        return False
+    return image.file_size > settings.meme_max_image_size_mb * 1024 * 1024
+
+
 def video_payload(
     message: Message,
 ) -> tuple[str, str, int | None, int | None, str | None, str | None] | None:
@@ -200,7 +297,19 @@ def video_from_message(message: Message) -> StoredVideo | None:
 def video_too_large(settings: Settings, video: StoredVideo) -> bool:
     if not video.file_size:
         return False
-    return video.file_size > settings.max_video_size_mb * 1024 * 1024
+    return video.file_size > effective_video_size_limit_mb(settings) * 1024 * 1024
+
+
+def effective_video_size_limit_mb(settings: Settings) -> int:
+    if settings.telegram_download_limit_mb <= 0:
+        return settings.max_video_size_mb
+    return min(settings.max_video_size_mb, settings.telegram_download_limit_mb)
+
+
+def telegram_download_limit_label(settings: Settings) -> str:
+    if settings.telegram_download_limit_mb <= 0:
+        return "не задан заранее; Telegram отклонил файл при скачивании"
+    return f"{settings.telegram_download_limit_mb} MB"
 
 
 def video_too_long(settings: Settings, video: StoredVideo) -> bool:
@@ -213,6 +322,7 @@ def video_recognition_cache_key(
     settings: Settings,
     video_recognizer: VideoRecognizer,
     transcriber: FasterWhisperTranscriber | None,
+    transcript_formatter: TranscriptFormatter | None,
 ) -> str:
     if settings.video_transcribe_audio and transcriber:
         audio = (
@@ -223,7 +333,8 @@ def video_recognition_cache_key(
         audio = "audio=missing-transcriber"
     else:
         audio = "audio=off"
-    return f"{video_recognizer.cache_key}|{audio}"
+    formatter = transcript_formatter.cache_key if transcript_formatter else "transcript_format=off"
+    return f"{video_recognizer.cache_key}|{audio}|{formatter}"
 
 
 def combine_video_result(
@@ -407,13 +518,36 @@ async def create_dispatcher(
     chat_assistant: ChatAssistant,
     chat_memory: ChatMemory | None,
     image_recognizer: ImageRecognizer,
+    meme_generator: MemeGenerator,
     video_recognizer: VideoRecognizer,
+    wiki_search: WikipediaSearchClient,
     transcriber: FasterWhisperTranscriber | None,
     transcript_formatter: TranscriptFormatter | None,
     gpu_lock: asyncio.Lock,
 ) -> Dispatcher:
     dp = Dispatcher()
     bot_identity: tuple[int | None, str | None] | None = None
+    profile_refresh_tasks: set[asyncio.Task[None]] = set()
+
+    async def refresh_recent_profile_facts(chat_id: int, *, now: datetime) -> None:
+        if not chat_memory:
+            return
+        try:
+            async with gpu_lock:
+                try:
+                    saved = await chat_memory.ensure_recent_profiles_current(chat_id, now=now)
+                finally:
+                    await chat_memory.unload()
+            if saved:
+                logging.info("Recent profile facts refreshed chat_id=%s saved=%s", chat_id, saved)
+        except Exception:  # noqa: BLE001
+            logging.exception("Recent profile fact refresh failed chat_id=%s", chat_id)
+
+    def schedule_profile_refresh(chat_id: int, *, now: datetime) -> None:
+        if chat_memory:
+            task = asyncio.create_task(refresh_recent_profile_facts(chat_id, now=now))
+            profile_refresh_tasks.add(task)
+            task.add_done_callback(profile_refresh_tasks.discard)
 
     async def get_bot_identity(bot: Bot) -> tuple[int | None, str | None]:
         nonlocal bot_identity
@@ -435,9 +569,14 @@ async def create_dispatcher(
             "`/summary 7d` - last 7 days\n"
             "`/summary today` - today in UTC\n"
             "`/question 24h <text>` - chat with the assistant using recent context\n"
-            "`/memory` - compressed chat memory status\n"
+            "`/wiki <text>` - search Wikipedia and save the result for chat context\n"
+            "`/memory` - compressed chat memory status; `/memory rebuild` resets blocks\n"
+            "`/profile [name]` - show your, replied, or named participant profile\n"
+            "`/profile correct [@name] <fact>` - save a profile fact for yourself, "
+            "named, or replied participant\n"
             "`/transcribe` - transcribe replied voice/audio\n"
             "`/image` - recognize the latest image or replied image\n"
+            "`/meme` - make a meme from replied/latest image\n"
             "`/video` - recognize the latest video/video note or replied video\n"
             "`/compare 10m` - compare summaries across Ollama models\n"
             "`/stats` - chat_id and stored message count\n\n"
@@ -464,11 +603,16 @@ async def create_dispatcher(
             f"question_model: `{settings.question_model or settings.ollama_model}`\n"
             f"image_recognition_model: `{settings.image_recognition_model}`\n"
             f"image_recognition_num_ctx: `{settings.image_recognition_num_ctx}`\n"
+            f"meme_enabled: `{settings.meme_enabled}`\n"
+            f"meme_model: `{settings.meme_model or settings.image_recognition_model}`\n"
+            f"meme_output_dir: `{settings.meme_output_dir}`\n"
             f"video_recognition_model: `{settings.video_recognition_model}`\n"
             f"video_recognition_num_ctx: `{settings.video_recognition_num_ctx}`\n"
             f"video_frame_count: `{settings.video_frame_count}`\n"
             f"video_frame_max_width: `{settings.video_frame_max_width}`\n"
             f"video_transcribe_audio: `{settings.video_transcribe_audio}`\n"
+            f"max_video_size_mb: `{settings.max_video_size_mb}`\n"
+            f"telegram_download_limit_mb: `{settings.telegram_download_limit_mb}`\n"
             f"ollama_timeout_seconds: `{settings.ollama_timeout_seconds}`\n"
             f"ollama_num_ctx: `{settings.ollama_num_ctx}`\n"
             f"ollama_num_predict: `{settings.ollama_num_predict}`\n"
@@ -476,6 +620,9 @@ async def create_dispatcher(
             f"opik_project_name: `{settings.opik_project_name}`\n"
             f"opik_capture_content: `{settings.opik_capture_content}`\n"
             f"memory_enabled: `{settings.memory_enabled}`\n"
+            f"wiki_search_enabled: `{settings.wiki_search_enabled}`\n"
+            f"wiki_language: `{settings.wiki_language}`\n"
+            f"wiki_max_results: `{settings.wiki_max_results}`\n"
             f"transcribe_voice: `{settings.transcribe_voice}`\n"
             f"whisper_model: `{settings.whisper_model}`\n"
             f"whisper_device: `{settings.whisper_device}`\n"
@@ -499,21 +646,184 @@ async def create_dispatcher(
 
         args = (message.text or "").split(maxsplit=1)
         if len(args) > 1:
-            await answer_logged(message, "Usage: `/memory`")
+            action = args[1].strip().lower()
+            if action == "rebuild":
+                await chat_memory.reset_blocks(message.chat.id)
+                await answer_logged(
+                    message,
+                    "Memory blocks were reset. Participant profile facts were kept. "
+                    "The next long `/summary` or `/question` will rebuild structured memory.",
+                )
+                return
+            await answer_logged(message, "Usage: `/memory` or `/memory rebuild`")
             return
 
         status = await chat_memory.status(message.chat.id)
         await answer_logged(
             message,
             f"memory_blocks: `{status['memory_blocks']}`\n"
+            f"chunk_blocks: `{status['chunk_blocks']}`\n"
+            f"rollup_blocks: `{status['rollup_blocks']}`\n"
+            f"archive_blocks: `{status['archive_blocks']}`\n"
+            f"participant_facts: `{status['participant_facts']}`\n"
             f"processed_until: `{status['processed_until']}`\n"
+            f"profile_processed_until: `{status['profile_processed_until']}`\n"
             f"latest_raw_messages: `{status['latest_raw_messages']}`\n"
             f"pending_old_messages: `{status['pending_old_messages']}`\n"
             f"recent_period: `{status['recent_period']}`\n"
             f"chunk_chars: `{status['chunk_chars']}`\n"
-            f"max_blocks: `{status['max_blocks']}`\n"
+            f"profile_chunk_chars: `{status['profile_chunk_chars']}`\n"
+            f"max_blocks_per_level: `{status['max_blocks_per_level']}`\n"
             f"search_limit: `{status['search_limit']}`",
         )
+
+    @dp.message(Command("profile"))
+    async def profile_command(message: Message) -> None:
+        if not is_allowed(settings, message.chat.id):
+            return
+        if not chat_memory:
+            await answer_logged(message, "Chat memory is disabled: `MEMORY_ENABLED=false`.")
+            return
+
+        parts = (message.text or "").split(maxsplit=2)
+        action = parts[1].lower() if len(parts) > 1 else "show"
+
+        if action == "forget":
+            if message.reply_to_message:
+                keys = [participant_ref(message.reply_to_message)[0]]
+            elif len(parts) > 2:
+                facts = await store.get_participant_facts(
+                    chat_id=message.chat.id,
+                    participant_name=parts[2],
+                    limit=100,
+                )
+                keys = list(dict.fromkeys(fact.participant_key for fact in facts))
+            else:
+                await answer_logged(
+                    message,
+                    "Usage: reply with `/profile forget`, or `/profile forget <name>`.",
+                )
+                return
+            count = await chat_memory.forget_profile(
+                chat_id=message.chat.id,
+                participant_keys=keys,
+            )
+            await answer_logged(message, f"Forgot active profile facts: `{count}`.")
+            return
+
+        if action == "correct":
+            if len(parts) < 3 or not parts[2].strip():
+                await answer_logged(
+                    message,
+                    "Usage: `/profile correct <true fact>` for yourself, "
+                    "`/profile correct @name <true fact>` for a named participant, "
+                    "or reply to a participant with `/profile correct <true fact>`.",
+                )
+                return
+            fact_text = parts[2].strip()
+            if message.reply_to_message:
+                key, name = participant_ref(message.reply_to_message)
+            else:
+                target_query, parsed_fact = split_profile_correction_target(fact_text)
+                if target_query is None:
+                    key, name = participant_ref(message)
+                else:
+                    if not target_query or not parsed_fact:
+                        await answer_logged(
+                            message,
+                            "Usage: `/profile correct @name <true fact>`.",
+                        )
+                        return
+                    matches = await resolve_profile_target(
+                        store,
+                        chat_id=message.chat.id,
+                        query=target_query,
+                    )
+                    if not matches:
+                        await answer_logged(
+                            message,
+                            f"Не нашёл участника `{target_query}`. "
+                            "Ответьте на его сообщение `/profile correct <true fact>` "
+                            "или используйте часть отображаемого имени.",
+                        )
+                        return
+                    normalized_target = normalize_profile_target(target_query)
+                    exact_matches = [
+                        match
+                        for match in matches
+                        if normalized_target
+                        in {
+                            normalize_profile_target(match[0].removeprefix("name:")),
+                            normalize_profile_target(match[1]),
+                        }
+                    ]
+                    if len(matches) > 1 and len(exact_matches) != 1:
+                        candidates = "\n".join(
+                            f"- {candidate_name}" for _, candidate_name in matches[:5]
+                        )
+                        await answer_logged(
+                            message,
+                            f"Нашёл несколько участников для `{target_query}`. "
+                            "Уточните имя или ответьте на сообщение участника.\n"
+                            f"{candidates}",
+                        )
+                        return
+                    key, name = (exact_matches or matches)[0]
+                    fact_text = parsed_fact
+            await chat_memory.add_profile_correction(
+                chat_id=message.chat.id,
+                participant_key=key,
+                participant_name=name,
+                fact_text=fact_text,
+                source_message_id=message.message_id,
+                created_at=message.date,
+            )
+            text = await chat_memory.profile_text(
+                chat_id=message.chat.id,
+                participant_keys=[key],
+            )
+            await answer_logged(
+                message,
+                f"Saved profile correction for `{name}`.\n\n{text}",
+            )
+            return
+
+        if action == "show" and len(parts) > 2 and parts[2].strip():
+            text = await chat_memory.profile_text(
+                chat_id=message.chat.id,
+                participant_name=parts[2].strip(),
+            )
+            await answer_logged(message, text)
+            return
+
+        if action not in {"show", "forget", "correct"}:
+            participant_name = " ".join(parts[1:]).strip()
+            text = await chat_memory.profile_text(
+                chat_id=message.chat.id,
+                participant_name=participant_name,
+            )
+            await answer_logged(message, text)
+            return
+
+        if message.reply_to_message:
+            key, _ = participant_ref(message.reply_to_message)
+            text = await chat_memory.profile_text(
+                chat_id=message.chat.id,
+                participant_keys=[key],
+            )
+        else:
+            key, _ = participant_ref(message)
+            text = await chat_memory.profile_text(
+                chat_id=message.chat.id,
+                participant_keys=[key],
+            )
+            if text == "Паспорт участника пока пуст.":
+                text += (
+                    "\n\n`/profile` без reply показывает ваш профиль. "
+                    "Чтобы посмотреть другого участника, ответьте на его сообщение `/profile` "
+                    "или используйте `/profile <name>`."
+                )
+        await answer_logged(message, text)
 
     @dp.message(Command("summary"))
     async def summary_command(message: Message) -> None:
@@ -556,19 +866,34 @@ async def create_dispatcher(
                 try:
                     context_messages = messages
                     if use_memory and chat_memory:
-                        created_blocks = await chat_memory.ensure_current(message.chat.id, now=now)
-                        blocks = await chat_memory.blocks_for_summary(
-                            chat_id=message.chat.id,
-                            since=since,
-                            until=raw_since,
-                        )
-                        context_messages = chat_memory.blocks_as_messages(blocks) + messages
-                        logging.info(
-                            "Summary memory context chat_id=%s blocks=%s created_blocks=%s",
-                            message.chat.id,
-                            len(blocks),
-                            created_blocks,
-                        )
+                        try:
+                            created_blocks = await chat_memory.ensure_current(message.chat.id, now=now)
+                            blocks = await chat_memory.blocks_for_summary(
+                                chat_id=message.chat.id,
+                                since=since,
+                                until=raw_since,
+                            )
+                            context_messages = chat_memory.blocks_as_messages(blocks) + messages
+                            logging.info(
+                                "Summary memory context chat_id=%s blocks=%s created_blocks=%s",
+                                message.chat.id,
+                                len(blocks),
+                                created_blocks,
+                            )
+                        except MemoryCompressionError as exc:
+                            logging.warning(
+                                "Summary memory rebuild failed; falling back to raw messages chat_id=%s period=%s: %s",
+                                message.chat.id,
+                                period_raw,
+                                exc,
+                            )
+                            if raw_since != since:
+                                messages = await store.get_messages_since(
+                                    chat_id=message.chat.id,
+                                    since=since,
+                                    limit_chars=settings.max_summary_input_chars,
+                                )
+                            context_messages = messages
                     summary = await summarizer.summarize(context_messages, format_period(period_raw))
                 finally:
                     if use_memory and chat_memory:
@@ -595,6 +920,7 @@ async def create_dispatcher(
         await edit_text_logged(wait_message, parts[0], source_message=message)
         for part in parts[1:]:
             await answer_logged(message, part)
+        schedule_profile_refresh(message.chat.id, now=now)
 
     async def answer_chat_question(
         message: Message,
@@ -638,23 +964,54 @@ async def create_dispatcher(
         try:
             async with gpu_lock:
                 try:
+                    profile_context = ""
                     context_messages = messages
                     if use_memory and chat_memory:
-                        created_blocks = await chat_memory.ensure_current(message.chat.id, now=now)
-                        blocks = await chat_memory.search(
+                        try:
+                            created_blocks = await chat_memory.ensure_current(message.chat.id, now=now)
+                            blocks = await chat_memory.search(
+                                chat_id=message.chat.id,
+                                since=since,
+                                until=raw_since,
+                                query=question,
+                            )
+                            await chat_memory.unload()
+                            context_messages = chat_memory.blocks_as_messages(blocks) + messages
+                            logging.info(
+                                "Question memory context chat_id=%s blocks=%s created_blocks=%s",
+                                message.chat.id,
+                                len(blocks),
+                                created_blocks,
+                            )
+                        except MemoryCompressionError as exc:
+                            logging.warning(
+                                "Question memory rebuild failed; falling back to raw messages chat_id=%s period=%s: %s",
+                                message.chat.id,
+                                period_raw,
+                                exc,
+                            )
+                            if raw_since != since:
+                                messages = await store.get_messages_since(
+                                    chat_id=message.chat.id,
+                                    since=since,
+                                    limit_chars=settings.max_summary_input_chars,
+                                )
+                            context_messages = messages
+                    if chat_memory:
+                        participant_keys, participant_names = participant_refs_for_context(message)
+                        profile_context = await chat_memory.participant_context(
                             chat_id=message.chat.id,
-                            since=since,
-                            until=raw_since,
                             query=question,
+                            participant_keys=participant_keys,
+                            participant_names=participant_names,
                         )
-                        await chat_memory.unload()
-                        context_messages = chat_memory.blocks_as_messages(blocks) + messages
-                        logging.info(
-                            "Question memory context chat_id=%s blocks=%s created_blocks=%s",
-                            message.chat.id,
-                            len(blocks),
-                            created_blocks,
-                        )
+                    if profile_context and chat_memory:
+                        context_messages = [
+                            chat_memory.participant_context_as_message(
+                                message.chat.id,
+                                profile_context,
+                            )
+                        ] + context_messages
                     answer = await chat_assistant.ask(
                         context_messages,
                         format_period(period_raw),
@@ -684,6 +1041,7 @@ async def create_dispatcher(
         await edit_text_logged(wait_message, parts[0], source_message=message)
         for part in parts[1:]:
             await answer_logged(message, part)
+        schedule_profile_refresh(message.chat.id, now=now)
 
     @dp.message(Command("question"))
     async def question_command(message: Message) -> None:
@@ -701,6 +1059,46 @@ async def create_dispatcher(
 
         period_raw, question = parsed
         await answer_chat_question(message, period_raw=period_raw, question=question)
+
+    @dp.message(Command("wiki"))
+    async def wiki_command(message: Message) -> None:
+        if not is_allowed(settings, message.chat.id):
+            return
+        if not settings.wiki_search_enabled:
+            await answer_logged(message, "Wikipedia search is disabled: `WIKI_SEARCH_ENABLED=false`.")
+            return
+
+        query = (message.text or "").split(maxsplit=1)
+        if len(query) < 2 or not query[1].strip():
+            await answer_logged(message, "Usage: `/wiki what to search`")
+            return
+
+        search_query = query[1].strip()
+        wait_message = await answer_logged(message, f"Searching Wikipedia for `{search_query}`...")
+        try:
+            results = await wiki_search.search(search_query)
+        except Exception as exc:  # noqa: BLE001
+            logging.exception("Wikipedia search failed")
+            await edit_text_logged(
+                wait_message,
+                f"Failed to search Wikipedia: `{type(exc).__name__}: {exc}`",
+                source_message=message,
+            )
+            return
+
+        text = format_wiki_results(search_query, results)
+        if results:
+            await save_message_text(
+                settings,
+                store,
+                message,
+                f"Wikipedia search for {search_query}: {text}",
+                limit_chars=settings.max_transcription_chars,
+            )
+        parts = split_telegram_text(text)
+        await edit_text_logged(wait_message, parts[0], source_message=message)
+        for part in parts[1:]:
+            await answer_logged(message, part)
 
     @dp.message(Command("image", "ocr"))
     async def image_command(message: Message, bot: Bot) -> None:
@@ -772,6 +1170,98 @@ async def create_dispatcher(
         for part in parts[1:]:
             await answer_logged(message, part)
 
+    @dp.message(Command("meme"))
+    async def meme_command(message: Message, bot: Bot) -> None:
+        if not is_allowed(settings, message.chat.id):
+            return
+        if not settings.meme_enabled:
+            await answer_logged(message, "Meme generation is disabled: `MEME_ENABLED=false`.")
+            return
+        meme_model = settings.meme_model or settings.image_recognition_model
+        if not meme_model:
+            await answer_logged(
+                message,
+                "Meme generation is disabled: MEME_MODEL and IMAGE_RECOGNITION_MODEL are empty.",
+            )
+            return
+
+        image = await resolve_image_for_command(store, message)
+        if not image:
+            await answer_logged(
+                message,
+                "No image found. Reply to an image with `/meme`, or send `/meme` after an image.",
+            )
+            return
+        if meme_image_too_large(settings, image):
+            await answer_logged(
+                message,
+                "Image is too large: "
+                f"{image.file_size} bytes. Limit: {settings.meme_max_image_size_mb} MB.",
+            )
+            return
+
+        wait_message = await answer_logged(
+            message,
+            f"Делаю мем из картинки #{image.message_id} через `{meme_model}`...",
+        )
+        image_path: Path | None = None
+        output_path: Path | None = None
+        started = time.perf_counter()
+        try:
+            image_path = await download_image(settings, bot, image)
+            try:
+                async with gpu_lock:
+                    try:
+                        caption = await meme_generator.generate_caption(image_path)
+                    finally:
+                        await meme_generator.unload()
+            except Exception as exc:  # noqa: BLE001
+                logging.exception("Meme caption generation failed")
+                await edit_text_logged(
+                    wait_message,
+                    f"Failed to generate meme text: `{type(exc).__name__}: {exc}`",
+                    source_message=message,
+                )
+                return
+
+            output_path = settings.meme_output_dir / f"{image.chat_id}_{image.message_id}_meme.jpg"
+            try:
+                meme_generator.render_meme(image_path, caption, output_path)
+            except Exception as exc:  # noqa: BLE001
+                logging.exception("Meme rendering failed")
+                await edit_text_logged(
+                    wait_message,
+                    f"Failed to render meme: `{type(exc).__name__}: {exc}`",
+                    source_message=message,
+                )
+                return
+
+            elapsed = time.perf_counter() - started
+            response = await message.reply_photo(
+                photo=FSInputFile(output_path),
+                caption=f"Мем готов за {elapsed:.1f} сек.",
+            )
+            log_bot_response(
+                action="reply_photo",
+                text=f"Meme for image #{image.message_id}: {caption.alt_text}",
+                response_message=response,
+                source_message=message,
+            )
+            await wait_message.delete()
+        except Exception as exc:  # noqa: BLE001
+            logging.exception("Meme command failed")
+            await edit_text_logged(
+                wait_message,
+                f"Failed to create meme: `{type(exc).__name__}: {exc}`",
+                source_message=message,
+            )
+        finally:
+            if image_path:
+                image_path.unlink(missing_ok=True)
+            if output_path:
+                output_path.unlink(missing_ok=True)
+
+    @opik_track(name="video.process")
     async def recognize_video_source(
         *,
         video: StoredVideo,
@@ -783,6 +1273,17 @@ async def create_dispatcher(
     ) -> None:
         if not is_allowed(settings, request_message.chat.id):
             return
+        update_opik_span_metadata(
+            {
+                "chat_id": request_message.chat.id,
+                "message_id": video.message_id,
+                "media_type": video.media_type,
+                "duration_s": video.duration,
+                "file_size": video.file_size,
+                "model": settings.video_recognition_model,
+                "video_transcribe_audio": settings.video_transcribe_audio,
+            }
+        )
         if not settings.video_recognition_model:
             if notify_disabled:
                 await answer_logged(
@@ -794,8 +1295,8 @@ async def create_dispatcher(
         if video_too_large(settings, video):
             await answer_logged(
                 request_message,
-                "Video is too large: "
-                f"{video.file_size} bytes. Limit: {settings.max_video_size_mb} MB.",
+                "Видео слишком большое для распознавания: "
+                f"{video.file_size} bytes. Лимит: {effective_video_size_limit_mb(settings)} MB.",
             )
             return
         if video_too_long(settings, video):
@@ -806,13 +1307,19 @@ async def create_dispatcher(
             )
             return
 
-        cache_key = video_recognition_cache_key(settings, video_recognizer, transcriber)
+        cache_key = video_recognition_cache_key(
+            settings,
+            video_recognizer,
+            transcriber,
+            transcript_formatter,
+        )
         cached = await store.get_video_recognition(
             chat_id=video.chat_id,
             message_id=video.message_id,
             cache_key=cache_key,
         )
         if cached and cached.result.strip():
+            update_opik_span_metadata({"cache_hit": True})
             saved_text = (
                 f"🎞 Video recognition for message #{video.message_id} "
                 f"from {video.sender_name}: {cached.result}"
@@ -839,6 +1346,8 @@ async def create_dispatcher(
                 else:
                     await answer_logged(request_message, part)
             return
+
+        update_opik_span_metadata({"cache_hit": False})
 
         status_text = (
             f"Recognizing video #{video.message_id} "
@@ -874,6 +1383,13 @@ async def create_dispatcher(
                 if settings.video_transcribe_audio:
                     if audio_path and transcriber:
                         audio_transcript = await transcriber.transcribe(audio_path)
+                        if audio_transcript.strip() and transcript_formatter:
+                            try:
+                                audio_transcript = await transcript_formatter.format(audio_transcript)
+                            except Exception:  # noqa: BLE001
+                                logging.exception("Video audio transcript formatting failed")
+                            finally:
+                                await transcript_formatter.unload()
                     elif audio_path:
                         audio_note = "Аудио найдено, но Whisper transcription is not configured."
                 else:
@@ -883,9 +1399,13 @@ async def create_dispatcher(
             result = combine_video_result(visual_result, visual_note, audio_transcript, audio_note)
         except Exception as exc:  # noqa: BLE001
             logging.exception("Video recognition failed")
+            if isinstance(exc, TelegramDownloadTooLargeError):
+                text = str(exc)
+            else:
+                text = f"Failed to recognize video: `{type(exc).__name__}: {exc}`"
             await edit_text_logged(
                 wait_message,
-                f"Failed to recognize video: `{type(exc).__name__}: {exc}`",
+                text,
                 source_message=request_message,
             )
             return
@@ -1120,6 +1640,7 @@ async def create_dispatcher(
                 source_message=request_message,
             )
 
+    @opik_track(name="audio.process")
     async def transcribe_audio_source(
         source_message: Message,
         bot: Bot,
@@ -1131,6 +1652,17 @@ async def create_dispatcher(
         request_message = request_message or source_message
         if not is_allowed(settings, request_message.chat.id):
             return
+        update_opik_span_metadata(
+            {
+                "chat_id": request_message.chat.id,
+                "message_id": source_message.message_id,
+                "duration_s": audio_duration(source_message),
+                "model": settings.whisper_model,
+                "device": settings.whisper_device,
+                "compute_type": settings.whisper_compute_type,
+                "language": settings.whisper_language or "auto",
+            }
+        )
         if not settings.transcribe_voice:
             if notify_disabled:
                 await answer_logged(
@@ -1310,6 +1842,9 @@ async def resolve_image_for_command(store: MessageStore, message: Message) -> St
         if replied_image:
             return replied_image
         return await store.get_image_by_message_id(message.chat.id, message.reply_to_message.message_id)
+    current_image = image_from_message(message)
+    if current_image:
+        return current_image
     return await store.get_latest_image(message.chat.id)
 
 
@@ -1432,7 +1967,19 @@ async def download_video(settings: Settings, bot: Bot, video: StoredVideo) -> Pa
     if not suffix:
         suffix = ".mp4"
     video_path = settings.video_download_dir / f"{video.chat_id}_{video.message_id}{suffix}"
-    await bot.download(video.file_id, destination=video_path)
+    try:
+        await bot.download(video.file_id, destination=video_path)
+    except TelegramBadRequest as exc:
+        if "file is too big" in str(exc).lower():
+            video_path.unlink(missing_ok=True)
+            limit = effective_video_size_limit_mb(settings)
+            raise TelegramDownloadTooLargeError(
+                "Видео слишком большое для скачивания через Telegram Bot API. "
+                f"Лимит скачивания: {telegram_download_limit_label(settings)}. "
+                f"Лимит распознавания бота: {limit} MB. "
+                "Сожмите/обрежьте видео или отправьте кружочек/короткий фрагмент."
+            ) from exc
+        raise
     return video_path
 
 
@@ -1507,7 +2054,7 @@ async def main() -> None:
             num_ctx=settings.transcription_format_num_ctx,
             num_predict=settings.transcription_format_num_predict,
         )
-        if settings.transcribe_voice
+        if (settings.transcribe_voice or settings.video_transcribe_audio)
         and settings.transcription_format_enabled
         and settings.transcription_format_model
         else None
@@ -1522,7 +2069,9 @@ async def main() -> None:
         else None
     )
     image_recognizer = ImageRecognizer(settings)
+    meme_generator = MemeGenerator(settings)
     video_recognizer = VideoRecognizer(settings)
+    wiki_search = WikipediaSearchClient(settings)
     transcriber = (
         FasterWhisperTranscriber(settings)
         if settings.transcribe_voice or settings.video_transcribe_audio
@@ -1538,7 +2087,9 @@ async def main() -> None:
         chat_assistant,
         chat_memory,
         image_recognizer,
+        meme_generator,
         video_recognizer,
+        wiki_search,
         transcriber,
         transcript_formatter,
         gpu_lock,

@@ -7,6 +7,9 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 
+DEFAULT_WIKI_USER_AGENT = "telegram-summary-bot/0.1 (https://github.com/Arkadiy915ggo/relay-assistant-bot)"
+
+
 def _csv_ints(value: str) -> set[int]:
     result: set[int] = set()
     for item in value.split(","):
@@ -46,6 +49,7 @@ class Settings:
     database_path: Path
     log_file: Path
     response_log_file: Path
+    telegram_download_limit_mb: int
     transcribe_voice: bool
     whisper_model: str
     whisper_device: str
@@ -63,6 +67,12 @@ class Settings:
     image_recognition_num_ctx: int
     max_image_size_mb: int
     image_download_dir: Path
+    meme_enabled: bool
+    meme_model: str
+    meme_output_dir: Path
+    meme_font_path: Path | None
+    meme_max_image_size_mb: int
+    meme_num_predict: int
     video_recognition_model: str
     video_recognition_num_ctx: int
     video_recognition_num_predict: int
@@ -83,6 +93,11 @@ class Settings:
     memory_chunk_chars: int
     memory_max_blocks: int
     memory_search_limit: int
+    wiki_search_enabled: bool
+    wiki_language: str
+    wiki_timeout_seconds: int
+    wiki_max_results: int
+    wiki_user_agent: str
     opik_enabled: bool
     opik_project_name: str
     opik_capture_content: bool
@@ -126,11 +141,12 @@ def load_settings() -> Settings:
         database_path=Path(os.getenv("DATABASE_PATH", "data/messages.sqlite3")),
         log_file=Path(os.getenv("LOG_FILE", "data/bot.log")),
         response_log_file=Path(os.getenv("RESPONSE_LOG_FILE", "data/responses.log")),
+        telegram_download_limit_mb=int(os.getenv("TELEGRAM_DOWNLOAD_LIMIT_MB", "0")),
         transcribe_voice=_bool(os.getenv("TRANSCRIBE_VOICE", "false")),
         whisper_model=os.getenv("WHISPER_MODEL", "large-v3").strip(),
         whisper_device=os.getenv("WHISPER_DEVICE", "cuda").strip(),
         whisper_compute_type=os.getenv("WHISPER_COMPUTE_TYPE", "float16").strip(),
-        whisper_language=os.getenv("WHISPER_LANGUAGE", "ru").strip(),
+        whisper_language=os.getenv("WHISPER_LANGUAGE", "").strip(),
         max_voice_seconds=int(os.getenv("MAX_VOICE_SECONDS", "600")),
         voice_download_dir=Path(os.getenv("VOICE_DOWNLOAD_DIR", "data/voice")),
         transcription_format_enabled=_bool(os.getenv("TRANSCRIPTION_FORMAT_ENABLED", "true")),
@@ -146,6 +162,18 @@ def load_settings() -> Settings:
         image_recognition_num_ctx=int(os.getenv("IMAGE_RECOGNITION_NUM_CTX", "32768")),
         max_image_size_mb=int(os.getenv("MAX_IMAGE_SIZE_MB", "20")),
         image_download_dir=Path(os.getenv("IMAGE_DOWNLOAD_DIR", "data/images")),
+        meme_enabled=_bool(os.getenv("MEME_ENABLED", "true"), default=True),
+        meme_model=os.getenv("MEME_MODEL", "").strip(),
+        meme_output_dir=Path(os.getenv("MEME_OUTPUT_DIR", "data/memes")),
+        meme_font_path=(
+            Path(font_path)
+            if (font_path := os.getenv("MEME_FONT_PATH", "").strip())
+            else None
+        ),
+        meme_max_image_size_mb=int(
+            os.getenv("MEME_MAX_IMAGE_SIZE_MB", os.getenv("MAX_IMAGE_SIZE_MB", "20"))
+        ),
+        meme_num_predict=int(os.getenv("MEME_NUM_PREDICT", "160")),
         video_recognition_model=os.getenv("VIDEO_RECOGNITION_MODEL", "qwen2.5vl:7b").strip(),
         video_recognition_num_ctx=int(os.getenv("VIDEO_RECOGNITION_NUM_CTX", "32768")),
         video_recognition_num_predict=int(os.getenv("VIDEO_RECOGNITION_NUM_PREDICT", "800")),
@@ -166,6 +194,14 @@ def load_settings() -> Settings:
         memory_chunk_chars=int(os.getenv("MEMORY_CHUNK_CHARS", "18000")),
         memory_max_blocks=int(os.getenv("MEMORY_MAX_BLOCKS", "200")),
         memory_search_limit=int(os.getenv("MEMORY_SEARCH_LIMIT", "8")),
+        wiki_search_enabled=_bool(os.getenv("WIKI_SEARCH_ENABLED", "true"), default=True),
+        wiki_language=os.getenv("WIKI_LANGUAGE", "ru").strip() or "ru",
+        wiki_timeout_seconds=int(os.getenv("WIKI_TIMEOUT_SECONDS", "20")),
+        wiki_max_results=max(1, int(os.getenv("WIKI_MAX_RESULTS", "3"))),
+        wiki_user_agent=(
+            os.getenv("WIKI_USER_AGENT", DEFAULT_WIKI_USER_AGENT).strip()
+            or DEFAULT_WIKI_USER_AGENT
+        ),
         opik_enabled=_bool(os.getenv("OPIK_ENABLED", "false")),
         opik_project_name=os.getenv("OPIK_PROJECT_NAME", "telegram-summary-bot").strip(),
         opik_capture_content=_bool(os.getenv("OPIK_CAPTURE_CONTENT", "true"), default=True),
