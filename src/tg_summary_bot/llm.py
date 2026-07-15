@@ -28,10 +28,17 @@ class LLMClient(ABC):
 
 
 class OpenAIClient(LLMClient):
-    def __init__(self, api_key: str, model: str, *, opik_project_name: str = "") -> None:
-        if not api_key:
+    def __init__(
+        self,
+        api_key: str,
+        model: str,
+        *,
+        base_url: str = "",
+        opik_project_name: str = "",
+    ) -> None:
+        if not api_key and not base_url:
             raise RuntimeError("OPENAI_API_KEY is required for LLM_PROVIDER=openai")
-        self.client = AsyncOpenAI(api_key=api_key)
+        self.client = AsyncOpenAI(api_key=api_key or "not-needed", base_url=base_url or None)
         self.model = model
         self.last_usage: dict[str, int] = {}
         self.last_metadata: dict[str, Any] = {}
@@ -142,14 +149,25 @@ class OllamaClient(LLMClient):
         if response_format == "json":
             payload["format"] = "json"
         async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
-            response = await client.post(
-                f"{self.base_url}/api/chat",
-                json=payload,
-            )
+            try:
+                response = await client.post(
+                    f"{self.base_url}/api/chat",
+                    json=payload,
+                )
+            except httpx.RequestError as exc:
+                raise RuntimeError(
+                    f"Ollama is not reachable at {self.base_url}. "
+                    "Start Ollama and check: ollama list"
+                ) from exc
             try:
                 response.raise_for_status()
             except httpx.HTTPStatusError as exc:
                 detail = response.text.strip()[:1000] or str(exc)
+                if response.status_code == 404 and "model" in detail.lower():
+                    raise RuntimeError(
+                        f"Ollama model {self.model} is not installed. "
+                        f"Run: ollama pull {self.model}"
+                    ) from exc
                 raise RuntimeError(f"Ollama API error: {detail}") from exc
         data = response.json()
         total_duration = (data.get("total_duration") or 0) / 1_000_000_000
@@ -283,6 +301,7 @@ def build_llm_client(
         client: LLMClient = OpenAIClient(
             settings.openai_api_key,
             model or settings.openai_model,
+            base_url=settings.openai_base_url,
             opik_project_name=settings.opik_project_name if use_openai_integration else "",
         )
         if settings.opik_enabled and not use_openai_integration:

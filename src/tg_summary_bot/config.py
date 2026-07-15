@@ -36,6 +36,7 @@ class Settings:
     allowed_chat_ids: set[int]
     llm_provider: str
     openai_api_key: str
+    openai_base_url: str
     openai_model: str
     ollama_base_url: str
     ollama_model: str
@@ -128,6 +129,7 @@ def load_settings() -> Settings:
         allowed_chat_ids=_csv_ints(os.getenv("ALLOWED_CHAT_IDS", "")),
         llm_provider=provider,
         openai_api_key=os.getenv("OPENAI_API_KEY", "").strip(),
+        openai_base_url=os.getenv("OPENAI_BASE_URL", "").strip().rstrip("/"),
         openai_model=os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip(),
         ollama_base_url=os.getenv("OLLAMA_BASE_URL", "http://localhost:11434").strip().rstrip("/"),
         ollama_model=os.getenv("OLLAMA_MODEL", "llama3.1:8b").strip(),
@@ -144,8 +146,8 @@ def load_settings() -> Settings:
         telegram_download_limit_mb=int(os.getenv("TELEGRAM_DOWNLOAD_LIMIT_MB", "0")),
         transcribe_voice=_bool(os.getenv("TRANSCRIBE_VOICE", "false")),
         whisper_model=os.getenv("WHISPER_MODEL", "large-v3").strip(),
-        whisper_device=os.getenv("WHISPER_DEVICE", "cuda").strip(),
-        whisper_compute_type=os.getenv("WHISPER_COMPUTE_TYPE", "float16").strip(),
+        whisper_device=os.getenv("WHISPER_DEVICE", "cpu").strip(),
+        whisper_compute_type=os.getenv("WHISPER_COMPUTE_TYPE", "int8").strip(),
         whisper_language=os.getenv("WHISPER_LANGUAGE", "").strip(),
         max_voice_seconds=int(os.getenv("MAX_VOICE_SECONDS", "600")),
         voice_download_dir=Path(os.getenv("VOICE_DOWNLOAD_DIR", "data/voice")),
@@ -183,7 +185,7 @@ def load_settings() -> Settings:
         video_frame_dir=Path(os.getenv("VIDEO_FRAME_DIR", "data/video_frames")),
         video_frame_count=int(os.getenv("VIDEO_FRAME_COUNT", "8")),
         video_frame_max_width=int(os.getenv("VIDEO_FRAME_MAX_WIDTH", "960")),
-        video_transcribe_audio=_bool(os.getenv("VIDEO_TRANSCRIBE_AUDIO", "true")),
+        video_transcribe_audio=_bool(os.getenv("VIDEO_TRANSCRIBE_AUDIO", "false")),
         max_message_chars=int(os.getenv("MAX_MESSAGE_CHARS", "4000")),
         max_transcription_chars=int(os.getenv("MAX_TRANSCRIPTION_CHARS", "50000")),
         max_summary_input_chars=int(os.getenv("MAX_SUMMARY_INPUT_CHARS", "120000")),

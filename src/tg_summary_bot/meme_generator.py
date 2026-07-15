@@ -93,33 +93,44 @@ class MemeGenerator:
             }
         )
         async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
-            response = await client.post(
-                f"{self.base_url}/api/chat",
-                json={
-                    "model": self.model,
-                    "stream": False,
-                    "think": False,
-                    "keep_alive": self.keep_alive,
-                    "format": "json",
-                    "messages": [
-                        {"role": "system", "content": MEME_SYSTEM_PROMPT},
-                        {
-                            "role": "user",
-                            "content": MEME_USER_PROMPT,
-                            "images": [image_b64],
+            try:
+                response = await client.post(
+                    f"{self.base_url}/api/chat",
+                    json={
+                        "model": self.model,
+                        "stream": False,
+                        "think": False,
+                        "keep_alive": self.keep_alive,
+                        "format": "json",
+                        "messages": [
+                            {"role": "system", "content": MEME_SYSTEM_PROMPT},
+                            {
+                                "role": "user",
+                                "content": MEME_USER_PROMPT,
+                                "images": [image_b64],
+                            },
+                        ],
+                        "options": {
+                            "temperature": 0.8,
+                            "num_ctx": self.num_ctx,
+                            "num_predict": self.num_predict,
                         },
-                    ],
-                    "options": {
-                        "temperature": 0.8,
-                        "num_ctx": self.num_ctx,
-                        "num_predict": self.num_predict,
                     },
-                },
-            )
+                )
+            except httpx.RequestError as exc:
+                raise RuntimeError(
+                    f"Ollama is not reachable at {self.base_url}. "
+                    "Start Ollama and check: ollama list"
+                ) from exc
             try:
                 response.raise_for_status()
             except httpx.HTTPStatusError as exc:
                 detail = response.text.strip()[:1000] or str(exc)
+                if response.status_code == 404 and "model" in detail.lower():
+                    raise RuntimeError(
+                        f"Ollama model {self.model} is not installed. "
+                        f"Run: ollama pull {self.model}"
+                    ) from exc
                 raise RuntimeError(f"Ollama meme vision API error: {detail}") from exc
 
         data = response.json()

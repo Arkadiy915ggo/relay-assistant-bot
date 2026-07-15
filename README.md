@@ -46,6 +46,24 @@ Requirements:
 - `OPENAI_API_KEY`;
 - or local Ollama.
 
+Recommended Mac + local Ollama start:
+
+```bash
+brew install ollama ffmpeg
+ollama pull llama3.1:8b
+./run.sh install
+cp .env.ollama.example .env
+```
+
+Fill `TELEGRAM_BOT_TOKEN` in `.env`, then check and start:
+
+```bash
+./run.sh doctor
+./run.sh start
+```
+
+This profile starts with text summaries/questions only. After it works, enable image/video/voice options in `.env` and run `./run.sh doctor` again.
+
 Install:
 
 ```bash
@@ -62,7 +80,17 @@ Fill `.env`:
 TELEGRAM_BOT_TOKEN=123456789:your_real_token
 LLM_PROVIDER=openai
 OPENAI_API_KEY=sk-your-key
+OPENAI_BASE_URL=
 OPENAI_MODEL=gpt-4o-mini
+```
+
+For OpenAI-compatible local or hosted servers such as LM Studio, LiteLLM, vLLM, or OpenRouter:
+
+```env
+LLM_PROVIDER=openai
+OPENAI_BASE_URL=http://localhost:1234/v1
+OPENAI_API_KEY=not-needed
+OPENAI_MODEL=local-model-name
 ```
 
 Run:
@@ -75,6 +103,7 @@ Or use the shell helper from the project root:
 
 ```bash
 ./run.sh install
+./run.sh doctor
 ./run.sh start
 ```
 
@@ -291,6 +320,19 @@ MAX_TRANSCRIPTION_FORMAT_CHARS=12000
 OLLAMA_UNLOAD_AFTER_TASK=true
 ```
 
+Recommended first-run macOS/CPU settings:
+
+```env
+TRANSCRIBE_VOICE=true
+WHISPER_MODEL=small
+WHISPER_DEVICE=cpu
+WHISPER_COMPUTE_TYPE=int8
+WHISPER_LANGUAGE=
+TRANSCRIPTION_FORMAT_ENABLED=true
+TRANSCRIPTION_FORMAT_PROVIDER=ollama
+TRANSCRIPTION_FORMAT_MODEL=qwen2.5vl:7b
+```
+
 LLM tasks, transcription, and transcript formatting share a single GPU queue: the bot does not run Ollama and Whisper at the same time. The raw Whisper transcript is sent immediately; formatting is scheduled after that response and edits the sent messages when it finishes. After local LLM work, the Ollama model is explicitly unloaded when `OLLAMA_UNLOAD_AFTER_TASK=true`.
 
 Keep `WHISPER_LANGUAGE=` empty for automatic language detection, including Russian, Polish, and English speech. Use `WHISPER_LANGUAGE=ru`, `WHISPER_LANGUAGE=pl`, or another Whisper language code only when the chat is fixed to one language and auto-detection is worse on short messages. When transcript formatting is enabled, non-Russian speech is preserved in the original language and translated to Russian.
@@ -409,7 +451,7 @@ VIDEO_DOWNLOAD_DIR=data/video
 VIDEO_FRAME_DIR=data/video_frames
 VIDEO_FRAME_COUNT=8
 VIDEO_FRAME_MAX_WIDTH=960
-VIDEO_TRANSCRIBE_AUDIO=true
+VIDEO_TRANSCRIBE_AUDIO=false
 OLLAMA_UNLOAD_AFTER_TASK=true
 ```
 
@@ -426,7 +468,7 @@ Behavior:
 - If `/video` is sent without a reply, the bot recognizes the latest indexed video in the chat.
 - `/vocr` is an alias for `/video`.
 - Videos over `MAX_VIDEO_SIZE_MB` are rejected before recognition. If `TELEGRAM_DOWNLOAD_LIMIT_MB` is positive, it is also used as an early cutoff; otherwise the bot attempts the download and reports Telegram's real `file is too big` response if it happens.
-- The bot downloads the video, extracts key frames with `ffmpeg`, sends those frames to `VIDEO_RECOGNITION_MODEL`, extracts the audio track if present, transcribes speech with Whisper, formats/translates non-Russian speech when transcript formatting is enabled, unloads the model after the task, and deletes temporary files.
+- The bot downloads the video, extracts key frames with `ffmpeg`, sends those frames to `VIDEO_RECOGNITION_MODEL`, optionally extracts/transcribes the audio track when `VIDEO_TRANSCRIBE_AUDIO=true`, unloads the model after the task, and deletes temporary files.
 - Repeated `/video` calls for the same message and same video settings use a SQLite cache instead of rerunning `ffmpeg` and Ollama.
 - The result is saved as a normal stored message, so future `/summary` and `/question` calls can use it.
 
@@ -506,6 +548,7 @@ If the channel has a linked discussion group, add the bot to that group too. Com
 Install Ollama and pull a model:
 
 ```bash
+brew install ollama ffmpeg  # macOS
 ollama pull llama3.1:8b
 ```
 
@@ -519,7 +562,21 @@ OLLAMA_TIMEOUT_SECONDS=1800
 OLLAMA_KEEP_ALIVE=30m
 OLLAMA_NUM_CTX=4096
 OLLAMA_NUM_PREDICT=800
-COMPARE_MODELS=qwen3:14b,gemma3:27b,qwen3-coder:30b
+COMPARE_MODELS=
+```
+
+The recommended `.env.ollama.example` documents the maintainer's stable local model choices:
+
+- `llama3.1:8b` for the safest text summaries/questions baseline.
+- `qwen2.5vl:7b` for stable `/image`, `/ocr`, `/meme`, and `/video` frame recognition.
+- `qwen3:14b`, `gemma3:27b`, and `qwen3-coder:30b` for `/compare` on stronger local machines.
+
+A Mac with 48 GB unified memory can often run heavier models than a smaller desktop GPU setup. Start with `llama3.1:8b`, confirm the bot works with `./run.sh doctor`, then pull larger models and add them to `COMPARE_MODELS`.
+
+Check local setup before starting:
+
+```bash
+./run.sh doctor
 ```
 
 Run the bot:

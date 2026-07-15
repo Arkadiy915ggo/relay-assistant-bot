@@ -130,26 +130,37 @@ class VideoRecognizer:
             }
         )
         async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
-            response = await client.post(
-                f"{self.base_url}/api/generate",
-                json={
-                    "model": self.model,
-                    "stream": False,
-                    "keep_alive": self.keep_alive,
-                    "system": VIDEO_RECOGNITION_SYSTEM_PROMPT,
-                    "prompt": VIDEO_RECOGNITION_USER_PROMPT,
-                    "images": images,
-                    "options": {
-                        "temperature": 0.0,
-                        "num_ctx": self.num_ctx,
-                        "num_predict": self.num_predict,
+            try:
+                response = await client.post(
+                    f"{self.base_url}/api/generate",
+                    json={
+                        "model": self.model,
+                        "stream": False,
+                        "keep_alive": self.keep_alive,
+                        "system": VIDEO_RECOGNITION_SYSTEM_PROMPT,
+                        "prompt": VIDEO_RECOGNITION_USER_PROMPT,
+                        "images": images,
+                        "options": {
+                            "temperature": 0.0,
+                            "num_ctx": self.num_ctx,
+                            "num_predict": self.num_predict,
+                        },
                     },
-                },
-            )
+                )
+            except httpx.RequestError as exc:
+                raise RuntimeError(
+                    f"Ollama is not reachable at {self.base_url}. "
+                    "Start Ollama and check: ollama list"
+                ) from exc
             try:
                 response.raise_for_status()
             except httpx.HTTPStatusError as exc:
                 detail = response.text.strip()[:1000] or str(exc)
+                if response.status_code == 404 and "model" in detail.lower():
+                    raise RuntimeError(
+                        f"Ollama model {self.model} is not installed. "
+                        f"Run: ollama pull {self.model}"
+                    ) from exc
                 raise RuntimeError(f"Ollama vision API error: {detail}") from exc
 
         data = response.json()
