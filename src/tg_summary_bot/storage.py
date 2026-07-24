@@ -101,6 +101,15 @@ class ChatParticipant:
     message_count: int
 
 
+@dataclass(frozen=True)
+class ChatBotAlias:
+    chat_id: int
+    alias: str
+    normalized_alias: str
+    created_by_user_id: int | None
+    created_at: str
+
+
 class MessageStore:
     def __init__(self, database_path: Path) -> None:
         self.database_path = database_path
@@ -135,6 +144,24 @@ class MessageStore:
                 """
                 CREATE INDEX IF NOT EXISTS idx_messages_chat_created
                 ON messages (chat_id, created_at)
+                """
+            )
+            await db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS chat_bot_aliases (
+                    chat_id INTEGER NOT NULL,
+                    alias TEXT NOT NULL,
+                    normalized_alias TEXT NOT NULL,
+                    created_by_user_id INTEGER,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(chat_id, normalized_alias)
+                )
+                """
+            )
+            await db.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_chat_bot_aliases_chat
+                ON chat_bot_aliases (chat_id, normalized_alias)
                 """
             )
             await db.execute(
@@ -416,6 +443,82 @@ class MessageStore:
                     ),
                 )
                 await db.commit()
+
+    async def add_chat_bot_alias(
+        self,
+        *,
+        chat_id: int,
+        alias: str,
+        normalized_alias: str,
+        created_by_user_id: int | None,
+        created_at: datetime,
+    ) -> bool:
+        if created_at.tzinfo is None:
+            created_at = created_at.replace(tzinfo=timezone.utc)
+        async with self._write_lock:
+            async with aiosqlite.connect(self.database_path) as db:
+                await self._prepare_connection(db)
+                cursor = await db.execute(
+                    """
+                    INSERT OR IGNORE INTO chat_bot_aliases (
+                        chat_id, alias, normalized_alias, created_by_user_id, created_at
+                    ) VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        chat_id,
+                        alias,
+                        normalized_alias,
+                        created_by_user_id,
+                        created_at.astimezone(timezone.utc).isoformat(),
+                    ),
+                )
+                inserted = cursor.rowcount > 0
+                await cursor.close()
+                await db.commit()
+        return inserted
+
+    async def remove_chat_bot_alias(self, *, chat_id: int, normalized_alias: str) -> bool:
+        async with self._write_lock:
+            async with aiosqlite.connect(self.database_path) as db:
+                await self._prepare_connection(db)
+                cursor = await db.execute(
+                    "DELETE FROM chat_bot_aliases WHERE chat_id = ? AND normalized_alias = ?",
+                    (chat_id, normalized_alias),
+                )
+                deleted = cursor.rowcount > 0
+                await cursor.close()
+                await db.commit()
+        return deleted
+
+    async def get_chat_bot_aliases(self, chat_id: int) -> list[ChatBotAlias]:
+        async with aiosqlite.connect(self.database_path) as db:
+            await self._prepare_connection(db)
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                """
+                SELECT chat_id, alias, normalized_alias, created_by_user_id, created_at
+                FROM chat_bot_aliases
+                WHERE chat_id = ?
+                ORDER BY created_at ASC, normalized_alias ASC
+                """,
+                (chat_id,),
+            )
+            rows = await cursor.fetchall()
+            await cursor.close()
+        return [
+            ChatBotAlias(
+                chat_id=int(row["chat_id"]),
+                alias=str(row["alias"]),
+                normalized_alias=str(row["normalized_alias"]),
+                created_by_user_id=(
+                    int(row["created_by_user_id"])
+                    if row["created_by_user_id"] is not None
+                    else None
+                ),
+                created_at=str(row["created_at"]),
+            )
+            for row in rows
+        ]
 
     async def save_video(
         self,

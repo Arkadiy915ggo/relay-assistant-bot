@@ -16,6 +16,7 @@ from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command
 from aiogram.types import FSInputFile, Message
 
+from tg_summary_bot.addressing import remove_aliases_from_text, split_aliases
 from tg_summary_bot.assistant import ChatAssistant
 from tg_summary_bot.config import Settings, load_settings
 from tg_summary_bot.image_recognizer import ImageRecognizer
@@ -374,48 +375,38 @@ def entity_type_name(entity: object) -> str:
     return str(getattr(entity, "type", "")).lower().split(".")[-1]
 
 
-def has_mention_entity(message: Message) -> bool:
-    entities = message.entities if message.text else message.caption_entities
-    return any(
-        entity_type_name(entity) in {"mention", "text_mention"}
-        for entity in entities or []
-    )
-
-
-def bot_mention_question(
+def extract_addressed_request(
     message: Message,
     *,
     bot_id: int | None,
     bot_username: str | None,
+    normalized_aliases: list[str],
 ) -> str | None:
     text = message.text or message.caption or ""
     if not text:
         return None
 
     entities = message.entities if message.text else message.caption_entities
-    mentioned = False
+    addressed = False
+    request = text
     for entity in entities or []:
         entity_type = entity_type_name(entity)
         if entity_type == "mention" and bot_username:
             mention = entity.extract_from(text).lstrip("@").lower()
             if mention == bot_username.lower():
-                mentioned = True
+                addressed = True
+                request = request.replace(entity.extract_from(text), "", 1)
         elif entity_type == "text_mention" and bot_id:
             user = getattr(entity, "user", None)
             if user and user.id == bot_id:
-                mentioned = True
+                addressed = True
+                request = request.replace(entity.extract_from(text), "", 1)
 
-    if not mentioned:
-        return None
-
-    question = text
-    if bot_username:
-        question = re.sub(
-            rf"(?i)(?<!\w)@{re.escape(bot_username)}\b",
-            "",
-            question,
-        )
-    return " ".join(question.split())
+    without_aliases = remove_aliases_from_text(request, normalized_aliases)
+    if without_aliases is not None:
+        addressed = True
+        request = without_aliases
+    return " ".join(request.split()) if addressed else None
 
 
 def setup_logging(settings: Settings) -> None:
@@ -556,6 +547,18 @@ async def create_dispatcher(
             bot_identity = (me.id, me.username)
         return bot_identity
 
+    async def can_manage_aliases(message: Message, bot: Bot) -> bool:
+        if message.chat.type == "private":
+            return message.from_user is not None
+        if not message.from_user:
+            return False
+        try:
+            member = await bot.get_chat_member(message.chat.id, message.from_user.id)
+        except TelegramBadRequest:
+            logging.warning("Could not verify alias manager chat_id=%s", message.chat.id)
+            return False
+        return str(member.status).lower().split(".")[-1] in {"creator", "owner", "administrator"}
+
     @dp.message(Command("start", "help"))
     async def help_command(message: Message) -> None:
         if not is_allowed(settings, message.chat.id):
@@ -569,6 +572,9 @@ async def create_dispatcher(
             "`/summary 7d` - last 7 days\n"
             "`/summary today` - today in UTC\n"
             "`/question 24h <text>` - chat with the assistant using recent context\n"
+            "`/alias add <name[, name]>` - add chat names for the bot (admins only)\n"
+            "`/alias list` - show configured bot names\n"
+            "`/alias remove <name>` - remove a bot name (admins only)\n"
             "`/wiki <text>` - search Wikipedia and save the result for chat context\n"
             "`/memory` - compressed chat memory status; `/memory rebuild` resets blocks\n"
             "`/profile [name]` - show your, replied, or named participant profile\n"
@@ -585,6 +591,77 @@ async def create_dispatcher(
             "Mention the bot in a message to ask a contextual question.\n\n"
             f"Current chat_id: `{message.chat.id}`"
         )
+
+    @dp.message(Command("alias"))
+    async def alias_command(message: Message, bot: Bot) -> None:
+        if not is_allowed(settings, message.chat.id):
+            return
+        parts = (message.text or "").split(maxsplit=2)
+        action = parts[1].lower() if len(parts) > 1 else ""
+        argument = parts[2].strip() if len(parts) > 2 else ""
+
+        if action == "list" and not argument:
+            aliases = await store.get_chat_bot_aliases(message.chat.id)
+            if not aliases:
+                await answer_logged(message, "Алиасы для этого чата пока не настроены.")
+                return
+            await answer_logged(
+                message,
+                "Алиасы бота в этом чате:\n" + "\n".join(f"- `{item.alias}`" for item in aliases),
+            )
+            return
+
+        if action not in {"add", "remove"} or not argument:
+            await answer_logged(
+                message,
+                "Использование: `/alias add Реле, Релейка`\n"
+                "`/alias list`\n"
+                "`/alias remove Реле`",
+            )
+            return
+        if not await can_manage_aliases(message, bot):
+            await answer_logged(message, "Менять алиасы могут только администраторы этого чата.")
+            return
+
+        aliases = split_aliases(argument)
+        if not aliases:
+            await answer_logged(message, "Укажите имя бота из букв или цифр.")
+            return
+        if action == "remove" and len(aliases) != 1:
+            await answer_logged(message, "За один раз можно удалить только один алиас.")
+            return
+
+        if action == "add":
+            added: list[str] = []
+            existing: list[str] = []
+            for alias, normalized in aliases:
+                inserted = await store.add_chat_bot_alias(
+                    chat_id=message.chat.id,
+                    alias=alias,
+                    normalized_alias=normalized,
+                    created_by_user_id=message.from_user.id if message.from_user else None,
+                    created_at=message.date,
+                )
+                (added if inserted else existing).append(alias)
+            text = ""
+            if added:
+                text += "Добавлены алиасы: " + ", ".join(f"`{item}`" for item in added) + "."
+            if existing:
+                text += ("\n" if text else "") + "Уже есть: " + ", ".join(
+                    f"`{item}`" for item in existing
+                ) + "."
+            await answer_logged(message, text)
+            return
+
+        alias, normalized = aliases[0]
+        removed = await store.remove_chat_bot_alias(
+            chat_id=message.chat.id,
+            normalized_alias=normalized,
+        )
+        if removed:
+            await answer_logged(message, f"Алиас `{alias}` удалён.")
+        else:
+            await answer_logged(message, f"Алиас `{alias}` не найден в этом чате.")
 
     @dp.message(Command("stats"))
     async def stats_command(message: Message) -> None:
@@ -1042,6 +1119,30 @@ async def create_dispatcher(
         for part in parts[1:]:
             await answer_logged(message, part)
         schedule_profile_refresh(message.chat.id, now=now)
+
+    async def handle_addressed_message(message: Message, bot: Bot) -> bool:
+        if not is_allowed(settings, message.chat.id) or (message.from_user and message.from_user.is_bot):
+            return False
+        bot_id, bot_username = await get_bot_identity(bot)
+        aliases = await store.get_chat_bot_aliases(message.chat.id)
+        request = extract_addressed_request(
+            message,
+            bot_id=bot_id,
+            bot_username=bot_username,
+            normalized_aliases=[item.normalized_alias for item in aliases],
+        )
+        if request is None:
+            return False
+        if not request:
+            await reply_logged(message, "Да? Напишите, что нужно сделать.")
+            return True
+        await answer_chat_question(
+            message,
+            period_raw=settings.default_summary_period,
+            question=request,
+            reply_to_source=True,
+        )
+        return True
 
     @dp.message(Command("question"))
     async def question_command(message: Message) -> None:
@@ -1779,8 +1880,10 @@ async def create_dispatcher(
         await save_incoming_image(settings, store, message)
 
     @dp.message(F.photo | (F.document & F.document.mime_type.startswith("image/")))
-    async def save_regular_image(message: Message) -> None:
+    async def save_regular_image(message: Message, bot: Bot) -> None:
         await save_incoming_image(settings, store, message)
+        await save_incoming_message(settings, store, message)
+        await handle_addressed_message(message, bot)
 
     @dp.channel_post(F.video | F.video_note | (F.document & F.document.mime_type.startswith("video/")))
     async def save_channel_video(message: Message) -> None:
@@ -1789,6 +1892,9 @@ async def create_dispatcher(
     @dp.message(F.video | F.video_note | (F.document & F.document.mime_type.startswith("video/")))
     async def save_regular_video(message: Message, bot: Bot) -> None:
         await save_incoming_video(settings, store, message)
+        await save_incoming_message(settings, store, message)
+        if await handle_addressed_message(message, bot):
+            return
         if not message.video_note:
             return
 
@@ -1812,26 +1918,7 @@ async def create_dispatcher(
         if message.text and message.text.startswith("/"):
             return
         await save_incoming_message(settings, store, message)
-        if not has_mention_entity(message):
-            return
-
-        bot_id, bot_username = await get_bot_identity(bot)
-        question = bot_mention_question(
-            message,
-            bot_id=bot_id,
-            bot_username=bot_username,
-        )
-        if question is None:
-            return
-        if not question:
-            await reply_logged(message, "Напишите вопрос рядом с упоминанием бота.")
-            return
-        await answer_chat_question(
-            message,
-            period_raw=settings.default_summary_period,
-            question=question,
-            reply_to_source=True,
-        )
+        await handle_addressed_message(message, bot)
 
     return dp
 
