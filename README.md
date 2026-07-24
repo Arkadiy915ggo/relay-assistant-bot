@@ -17,6 +17,7 @@ A safe Telegram bot that stores new chat messages and produces short AI summarie
 - makes simple image memes with `/meme` from a replied/latest image;
 - manually recognizes videos through sampled key frames and auto-recognizes Telegram video notes;
 - answers contextual questions when the bot is mentioned in a message;
+- lets chat administrators add aliases for addressing the bot in regular messages and media captions;
 - searches Wikipedia with `/wiki` and saves found excerpts for future context;
 - compresses old chat history into structured SQLite memory blocks for long `/question` and `/summary` periods;
 - keeps source-backed participant profile facts that can be used in answers;
@@ -176,6 +177,9 @@ Restart the bot.
 /summary today
 /question your question
 /question 24h your question
+/alias add Реле, Релейка
+/alias list
+/alias remove Реле
 /wiki what to search
 /memory
 /memory rebuild
@@ -190,6 +194,20 @@ Restart the bot.
 /vocr
 /compare 10m
 ```
+
+## Bot Aliases
+
+Chat administrators can configure names that address the bot without using its Telegram username:
+
+```text
+/alias add Реле, Релейка
+/alias list
+/alias remove Реле
+```
+
+Aliases are local to a chat. The bot recognizes them in ordinary text and image/video captions,
+including a single typo for names with five or more characters. In direct chats, either participant
+can manage aliases.
 
 ## Wikipedia Search
 
