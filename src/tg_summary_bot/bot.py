@@ -5,6 +5,7 @@ import html
 import json
 import logging
 import mimetypes
+import random
 import re
 import time
 from datetime import datetime, timezone
@@ -20,6 +21,7 @@ from tg_summary_bot.addressing import remove_aliases_from_text, split_aliases
 from tg_summary_bot.assistant import ChatAssistant
 from tg_summary_bot.config import Settings, load_settings
 from tg_summary_bot.image_recognizer import ImageRecognizer
+from tg_summary_bot.intent_router import IntentRoute, IntentRouter, is_joke_request
 from tg_summary_bot.llm import build_llm_client
 from tg_summary_bot.memory import ChatMemory, MemoryCompressionError, participant_key, should_use_memory
 from tg_summary_bot.meme_generator import MemeGenerator
@@ -34,6 +36,7 @@ from tg_summary_bot.web_search import WikipediaSearchClient, format_wiki_results
 
 
 RESPONSE_LOGGER_NAME = "tg_summary_bot.responses"
+SURPRISE_MEME_CHANCE = 0.02
 
 
 class TelegramDownloadTooLargeError(RuntimeError):
@@ -223,6 +226,10 @@ def image_from_message(message: Message) -> StoredImage | None:
         file_name=file_name,
         mime_type=mime_type,
     )
+
+
+def has_current_or_replied_image(message: Message) -> bool:
+    return bool(image_from_message(message) or (message.reply_to_message and image_from_message(message.reply_to_message)))
 
 
 def image_too_large(settings: Settings, image: StoredImage) -> bool:
@@ -445,6 +452,19 @@ def command_name(message: Message | None) -> str | None:
     return message.text.split(maxsplit=1)[0]
 
 
+async def route_under_gpu_lock(
+    router: IntentRouter,
+    gpu_lock: asyncio.Lock,
+    request: str,
+) -> IntentRoute:
+    """Route and unload while holding the shared GPU lock; actions run afterwards."""
+    async with gpu_lock:
+        try:
+            return await router.route(request)
+        finally:
+            await router.unload()
+
+
 def log_bot_response(
     *,
     action: str,
@@ -515,6 +535,7 @@ async def create_dispatcher(
     transcriber: FasterWhisperTranscriber | None,
     transcript_formatter: TranscriptFormatter | None,
     gpu_lock: asyncio.Lock,
+    intent_router: IntentRouter,
 ) -> Dispatcher:
     dp = Dispatcher()
     bot_identity: tuple[int | None, str | None] | None = None
@@ -547,18 +568,6 @@ async def create_dispatcher(
             bot_identity = (me.id, me.username)
         return bot_identity
 
-    async def can_manage_aliases(message: Message, bot: Bot) -> bool:
-        if message.chat.type == "private":
-            return message.from_user is not None
-        if not message.from_user:
-            return False
-        try:
-            member = await bot.get_chat_member(message.chat.id, message.from_user.id)
-        except TelegramBadRequest:
-            logging.warning("Could not verify alias manager chat_id=%s", message.chat.id)
-            return False
-        return str(member.status).lower().split(".")[-1] in {"creator", "owner", "administrator"}
-
     @dp.message(Command("start", "help"))
     async def help_command(message: Message) -> None:
         if not is_allowed(settings, message.chat.id):
@@ -572,7 +581,7 @@ async def create_dispatcher(
             "`/summary 7d` - last 7 days\n"
             "`/summary today` - today in UTC\n"
             "`/question 24h <text>` - chat with the assistant using recent context\n"
-            "`/alias add <name[, name]>` - add chat names for the bot (admins only)\n"
+            "`/alias add <name[, name]>` - add chat names for the bot\n"
             "`/alias list` - show configured bot names\n"
             "`/alias remove <name>` - remove a bot name (admins only)\n"
             "`/wiki <text>` - search Wikipedia and save the result for chat context\n"
@@ -588,7 +597,8 @@ async def create_dispatcher(
             "`/stats` - chat_id and stored message count\n\n"
             "Voice messages are transcribed automatically when enabled. "
             "Video notes are recognized automatically. "
-            "Mention the bot in a message to ask a contextual question.\n\n"
+            "Mention the bot or use an alias in a message to ask, summarize, search Wikipedia, "
+            "recognize media, make a meme, transcribe a replied voice/audio, or show a profile.\n\n"
             f"Current chat_id: `{message.chat.id}`"
         )
 
@@ -619,8 +629,8 @@ async def create_dispatcher(
                 "`/alias remove Реле`",
             )
             return
-        if not await can_manage_aliases(message, bot):
-            await answer_logged(message, "Менять алиасы могут только администраторы этого чата.")
+        if not message.from_user:
+            await answer_logged(message, "Не удалось определить автора сообщения.")
             return
 
         aliases = split_aliases(argument)
@@ -678,6 +688,7 @@ async def create_dispatcher(
             f"llm_provider: `{settings.resolved_llm_provider}`\n"
             f"ollama_model: `{settings.ollama_model}`\n"
             f"question_model: `{settings.question_model or settings.ollama_model}`\n"
+            f"intent_router_model: `{settings.intent_router_model or settings.question_model or settings.ollama_model}`\n"
             f"image_recognition_model: `{settings.image_recognition_model}`\n"
             f"image_recognition_num_ctx: `{settings.image_recognition_num_ctx}`\n"
             f"meme_enabled: `{settings.meme_enabled}`\n"
@@ -902,13 +913,14 @@ async def create_dispatcher(
                 )
         await answer_logged(message, text)
 
-    @dp.message(Command("summary"))
-    async def summary_command(message: Message) -> None:
+    async def run_summary(
+        message: Message,
+        period_raw: str,
+        *,
+        exclude_message_id: int | None = None,
+    ) -> None:
         if not is_allowed(settings, message.chat.id):
             return
-
-        args = (message.text or "").split(maxsplit=1)
-        period_raw = args[1].strip() if len(args) > 1 else settings.default_summary_period
         try:
             period = parse_period(period_raw)
         except ValueError as exc:
@@ -927,6 +939,8 @@ async def create_dispatcher(
             since=raw_since,
             limit_chars=settings.max_summary_input_chars,
         )
+        if exclude_message_id is not None:
+            messages = [item for item in messages if item.message_id != exclude_message_id]
         logging.info(
             "Summary started chat_id=%s period=%s model=%s raw_messages=%s memory=%s",
             message.chat.id,
@@ -971,6 +985,10 @@ async def create_dispatcher(
                                     limit_chars=settings.max_summary_input_chars,
                                 )
                             context_messages = messages
+                    if exclude_message_id is not None:
+                        context_messages = [
+                            item for item in context_messages if item.message_id != exclude_message_id
+                        ]
                     summary = await summarizer.summarize(context_messages, format_period(period_raw))
                 finally:
                     if use_memory and chat_memory:
@@ -999,12 +1017,21 @@ async def create_dispatcher(
             await answer_logged(message, part)
         schedule_profile_refresh(message.chat.id, now=now)
 
+    @dp.message(Command("summary"))
+    async def summary_command(message: Message) -> None:
+        args = (message.text or "").split(maxsplit=1)
+        await run_summary(
+            message,
+            args[1].strip() if len(args) > 1 else settings.default_summary_period,
+        )
+
     async def answer_chat_question(
         message: Message,
         *,
         period_raw: str,
         question: str,
         reply_to_source: bool = False,
+        exclude_message_id: int | None = None,
     ) -> None:
         if not is_allowed(settings, message.chat.id):
             return
@@ -1030,6 +1057,8 @@ async def create_dispatcher(
             since=raw_since,
             limit_chars=settings.max_summary_input_chars,
         )
+        if exclude_message_id is not None:
+            messages = [item for item in messages if item.message_id != exclude_message_id]
         logging.info(
             "Question started chat_id=%s period=%s raw_messages=%s memory=%s",
             message.chat.id,
@@ -1089,10 +1118,16 @@ async def create_dispatcher(
                                 profile_context,
                             )
                         ] + context_messages
+                    if exclude_message_id is not None:
+                        context_messages = [
+                            item for item in context_messages if item.message_id != exclude_message_id
+                        ]
+                    aliases = await store.get_chat_bot_aliases(message.chat.id)
                     answer = await chat_assistant.ask(
                         context_messages,
                         format_period(period_raw),
                         question,
+                        bot_names=[item.alias for item in aliases],
                     )
                 finally:
                     if use_memory and chat_memory:
@@ -1121,7 +1156,14 @@ async def create_dispatcher(
         schedule_profile_refresh(message.chat.id, now=now)
 
     async def handle_addressed_message(message: Message, bot: Bot) -> bool:
-        if not is_allowed(settings, message.chat.id) or (message.from_user and message.from_user.is_bot):
+        if (
+            not is_allowed(settings, message.chat.id)
+            or message.chat.type == "channel"
+            or (message.from_user and message.from_user.is_bot)
+        ):
+            return False
+        entities = message.entities if message.text else message.caption_entities
+        if any(entity_type_name(entity) == "bot_command" for entity in entities or []):
             return False
         bot_id, bot_username = await get_bot_identity(bot)
         aliases = await store.get_chat_bot_aliases(message.chat.id)
@@ -1136,12 +1178,65 @@ async def create_dispatcher(
         if not request:
             await reply_logged(message, "Да? Напишите, что нужно сделать.")
             return True
-        await answer_chat_question(
-            message,
-            period_raw=settings.default_summary_period,
-            question=request,
-            reply_to_source=True,
+        started = time.perf_counter()
+        route = await route_under_gpu_lock(intent_router, gpu_lock, request)
+        logging.info(
+            "Intent route chat_id=%s message_id=%s action=%s valid=%s reason=%s elapsed_s=%.3f provider=%s model=%s",
+            message.chat.id,
+            message.message_id,
+            route.action,
+            route.valid,
+            route.reason,
+            time.perf_counter() - started,
+            settings.resolved_llm_provider,
+            getattr(intent_router.client, "model", ""),
         )
+        if (
+            route.reason == "meme_not_explicit"
+            and is_joke_request(request)
+            and has_current_or_replied_image(message)
+            and random.random() < SURPRISE_MEME_CHANCE
+        ):
+            await run_meme(message, bot)
+            return True
+        if not route.valid or route.action == "none":
+            await answer_chat_question(
+                message,
+                period_raw=settings.default_summary_period,
+                question=request,
+                reply_to_source=True,
+                exclude_message_id=message.message_id,
+            )
+            return True
+        if route.action == "question":
+            await answer_chat_question(
+                message,
+                period_raw=route.period or settings.default_summary_period,
+                question=request,
+                reply_to_source=True,
+                exclude_message_id=message.message_id,
+            )
+            return True
+        if route.action == "summary":
+            await run_summary(message, route.period or settings.default_summary_period, exclude_message_id=message.message_id)
+            return True
+        if route.action == "wiki":
+            await run_wiki(message, route.query or "", routed=True)
+            return True
+        if route.action == "image":
+            await run_image(message, bot, routed=True)
+            return True
+        if route.action == "meme":
+            await run_meme(message, bot)
+            return True
+        if route.action == "video":
+            await run_video(message, bot, routed=True)
+            return True
+        if route.action == "transcribe":
+            await run_transcribe(message, bot)
+            return True
+        if route.action == "profile_show":
+            await run_profile_show(message, route.query)
         return True
 
     @dp.message(Command("question"))
@@ -1161,20 +1256,17 @@ async def create_dispatcher(
         period_raw, question = parsed
         await answer_chat_question(message, period_raw=period_raw, question=question)
 
-    @dp.message(Command("wiki"))
-    async def wiki_command(message: Message) -> None:
+    async def run_wiki(message: Message, search_query: str, *, routed: bool = False) -> None:
         if not is_allowed(settings, message.chat.id):
             return
         if not settings.wiki_search_enabled:
             await answer_logged(message, "Wikipedia search is disabled: `WIKI_SEARCH_ENABLED=false`.")
             return
 
-        query = (message.text or "").split(maxsplit=1)
-        if len(query) < 2 or not query[1].strip():
+        if not search_query.strip():
             await answer_logged(message, "Usage: `/wiki what to search`")
             return
-
-        search_query = query[1].strip()
+        search_query = search_query.strip()
         wait_message = await answer_logged(message, f"Searching Wikipedia for `{search_query}`...")
         try:
             results = await wiki_search.search(search_query)
@@ -1192,17 +1284,23 @@ async def create_dispatcher(
             await save_message_text(
                 settings,
                 store,
-                message,
+                wait_message if routed else message,
                 f"Wikipedia search for {search_query}: {text}",
                 limit_chars=settings.max_transcription_chars,
             )
+            if routed:
+                text = text + "\n\nSaved for summaries."
         parts = split_telegram_text(text)
         await edit_text_logged(wait_message, parts[0], source_message=message)
         for part in parts[1:]:
             await answer_logged(message, part)
 
-    @dp.message(Command("image", "ocr"))
-    async def image_command(message: Message, bot: Bot) -> None:
+    @dp.message(Command("wiki"))
+    async def wiki_command(message: Message) -> None:
+        query = (message.text or "").split(maxsplit=1)
+        await run_wiki(message, query[1] if len(query) > 1 else "")
+
+    async def run_image(message: Message, bot: Bot, *, routed: bool = False) -> None:
         if not is_allowed(settings, message.chat.id):
             return
         if not settings.image_recognition_model:
@@ -1257,7 +1355,7 @@ async def create_dispatcher(
             f"🖼 Image recognition for message #{image.message_id} "
             f"from {image.sender_name}: {result}"
         )
-        await save_message_text(settings, store, message, saved_text)
+        await save_message_text(settings, store, wait_message if routed else message, saved_text)
         text = (
             f"**Image recognition for message #{image.message_id}**\n"
             f"Source: {image.sender_name}\n"
@@ -1271,8 +1369,11 @@ async def create_dispatcher(
         for part in parts[1:]:
             await answer_logged(message, part)
 
-    @dp.message(Command("meme"))
-    async def meme_command(message: Message, bot: Bot) -> None:
+    @dp.message(Command("image", "ocr"))
+    async def image_command(message: Message, bot: Bot) -> None:
+        await run_image(message, bot)
+
+    async def run_meme(message: Message, bot: Bot) -> None:
         if not is_allowed(settings, message.chat.id):
             return
         if not settings.meme_enabled:
@@ -1362,6 +1463,10 @@ async def create_dispatcher(
             if output_path:
                 output_path.unlink(missing_ok=True)
 
+    @dp.message(Command("meme"))
+    async def meme_command(message: Message, bot: Bot) -> None:
+        await run_meme(message, bot)
+
     @opik_track(name="video.process")
     async def recognize_video_source(
         *,
@@ -1371,6 +1476,7 @@ async def create_dispatcher(
         bot: Bot,
         notify_disabled: bool = False,
         status_as_reply: bool = False,
+        routed: bool = False,
     ) -> None:
         if not is_allowed(settings, request_message.chat.id):
             return
@@ -1421,6 +1527,9 @@ async def create_dispatcher(
         )
         if cached and cached.result.strip():
             update_opik_span_metadata({"cache_hit": True})
+            wait_message = (
+                await reply_logged(request_message, "Recognizing video...") if routed else None
+            )
             saved_text = (
                 f"🎞 Video recognition for message #{video.message_id} "
                 f"from {video.sender_name}: {cached.result}"
@@ -1428,7 +1537,7 @@ async def create_dispatcher(
             await save_message_text(
                 settings,
                 store,
-                save_target_message,
+                wait_message if wait_message else save_target_message,
                 saved_text,
                 limit_chars=settings.max_transcription_chars,
             )
@@ -1442,7 +1551,9 @@ async def create_dispatcher(
                 f"{cached.result}"
             )
             for index, part in enumerate(split_telegram_text(text)):
-                if index == 0 and status_as_reply:
+                if index == 0 and wait_message:
+                    await edit_text_logged(wait_message, part, source_message=request_message)
+                elif index == 0 and status_as_reply:
                     await reply_logged(request_message, part)
                 else:
                     await answer_logged(request_message, part)
@@ -1530,7 +1641,7 @@ async def create_dispatcher(
         await save_message_text(
             settings,
             store,
-            save_target_message,
+            wait_message if routed else save_target_message,
             saved_text,
             limit_chars=settings.max_transcription_chars,
         )
@@ -1548,8 +1659,7 @@ async def create_dispatcher(
         for part in parts[1:]:
             await answer_logged(request_message, part)
 
-    @dp.message(Command("video", "vocr"))
-    async def video_command(message: Message, bot: Bot) -> None:
+    async def run_video(message: Message, bot: Bot, *, routed: bool = False) -> None:
         if not is_allowed(settings, message.chat.id):
             return
 
@@ -1567,7 +1677,12 @@ async def create_dispatcher(
             save_target_message=message,
             bot=bot,
             notify_disabled=True,
+            routed=routed,
         )
+
+    @dp.message(Command("video", "vocr"))
+    async def video_command(message: Message, bot: Bot) -> None:
+        await run_video(message, bot)
 
     @dp.message(Command("compare"))
     async def compare_command(message: Message) -> None:
@@ -1852,8 +1967,7 @@ async def create_dispatcher(
                 )
             )
 
-    @dp.message(Command("transcribe"))
-    async def transcribe_command(message: Message, bot: Bot) -> None:
+    async def run_transcribe(message: Message, bot: Bot) -> None:
         if not is_allowed(settings, message.chat.id):
             return
         if not message.reply_to_message:
@@ -1870,6 +1984,42 @@ async def create_dispatcher(
             replace_existing=True,
             notify_disabled=True,
         )
+
+    @dp.message(Command("transcribe"))
+    async def transcribe_command(message: Message, bot: Bot) -> None:
+        await run_transcribe(message, bot)
+
+    async def run_profile_show(message: Message, query: str | None) -> None:
+        if not is_allowed(settings, message.chat.id):
+            return
+        if not chat_memory:
+            await answer_logged(message, "Chat memory is disabled: `MEMORY_ENABLED=false`.")
+            return
+        if message.reply_to_message:
+            key, _ = participant_ref(message.reply_to_message)
+            text = await chat_memory.profile_text(chat_id=message.chat.id, participant_keys=[key])
+        elif query and query.strip():
+            matches = await resolve_profile_target(store, chat_id=message.chat.id, query=query)
+            normalized = normalize_profile_target(query)
+            exact = [
+                match for match in matches
+                if normalized in {
+                    normalize_profile_target(match[0].removeprefix("name:")),
+                    normalize_profile_target(match[1]),
+                }
+            ]
+            if not matches or (len(matches) > 1 and len(exact) != 1):
+                await answer_logged(message, "Уточните имя участника или ответьте на его сообщение.")
+                return
+            key, _ = (exact or matches)[0]
+            text = await chat_memory.profile_text(chat_id=message.chat.id, participant_keys=[key])
+        elif message.from_user:
+            key, _ = participant_ref(message)
+            text = await chat_memory.profile_text(chat_id=message.chat.id, participant_keys=[key])
+        else:
+            await answer_logged(message, "Не удалось определить участника. Ответьте на его сообщение.")
+            return
+        await reply_logged(message, text)
 
     @dp.message(F.voice | F.audio)
     async def transcribe_audio_message(message: Message, bot: Bot) -> None:
@@ -1941,6 +2091,9 @@ async def resolve_video_for_command(store: MessageStore, message: Message) -> St
         if replied_video:
             return replied_video
         return await store.get_video_by_message_id(message.chat.id, message.reply_to_message.message_id)
+    current_video = video_from_message(message)
+    if current_video:
+        return current_video
     return await store.get_latest_video(message.chat.id)
 
 
@@ -2130,8 +2283,15 @@ async def main() -> None:
     await store.init()
     llm = build_llm_client(settings)
     question_llm = build_llm_client(settings, model=settings.question_model or None)
+    router_llm = build_llm_client(
+        settings,
+        model=settings.intent_router_model or settings.question_model or None,
+        num_ctx=2048,
+        num_predict=96,
+    )
     summarizer = Summarizer(llm, settings.chunk_chars)
     chat_assistant = ChatAssistant(question_llm, settings.chunk_chars)
+    intent_router = IntentRouter(router_llm)
     chat_memory = ChatMemory(store, llm, settings) if settings.memory_enabled else None
     transcript_formatter_llm = (
         build_llm_client(
@@ -2180,6 +2340,7 @@ async def main() -> None:
         transcriber,
         transcript_formatter,
         gpu_lock,
+        intent_router,
     )
 
     logging.info("Bot started with LLM provider: %s", settings.resolved_llm_provider)

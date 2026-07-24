@@ -16,8 +16,8 @@ A safe Telegram bot that stores new chat messages and produces short AI summarie
 - manually recognizes text from images with an Ollama vision model;
 - makes simple image memes with `/meme` from a replied/latest image;
 - manually recognizes videos through sampled key frames and auto-recognizes Telegram video notes;
-- answers contextual questions when the bot is mentioned in a message;
-- lets chat administrators add aliases for addressing the bot in regular messages and media captions;
+- routes addressed messages to contextual answers, summaries, Wikipedia, media recognition, transcription, memes, or profiles;
+- lets chat participants add aliases for addressing the bot in regular messages and media captions;
 - searches Wikipedia with `/wiki` and saves found excerpts for future context;
 - compresses old chat history into structured SQLite memory blocks for long `/question` and `/summary` periods;
 - keeps source-backed participant profile facts that can be used in answers;
@@ -197,7 +197,7 @@ Restart the bot.
 
 ## Bot Aliases
 
-Chat administrators can configure names that address the bot without using its Telegram username:
+Any chat participant can configure names that address the bot without using its Telegram username:
 
 ```text
 /alias add Реле, Релейка
@@ -206,8 +206,23 @@ Chat administrators can configure names that address the bot without using its T
 ```
 
 Aliases are local to a chat. The bot recognizes them in ordinary text and image/video captions,
-including a single typo for names with five or more characters. In direct chats, either participant
-can manage aliases.
+including a single typo for names with five or more characters.
+
+## Addressed Actions
+
+After a confirmed `@username`, Telegram text mention, or configured alias, the bot routes the
+cleaned request to one safe built-in action. For example:
+
+```text
+Реле, сделай саммари за 6 часов
+Релейка, найди в Википедии Ada Lovelace
+@relay_bot распознай эту картинку
+```
+
+The router accepts only a fixed action set: contextual question, summary, Wikipedia search, image
+recognition, meme, video recognition, replied voice/audio transcription, and profile display.
+Slash commands and channel posts are not routed. For image/video/meme actions, a matching reply has
+priority, then media in the addressed message, and only then the latest indexed media.
 
 ## Wikipedia Search
 
@@ -580,12 +595,20 @@ OLLAMA_TIMEOUT_SECONDS=1800
 OLLAMA_KEEP_ALIVE=30m
 OLLAMA_NUM_CTX=4096
 OLLAMA_NUM_PREDICT=800
+# Keep Gemma for questions, but use a small model for addressed-action routing.
+QUESTION_MODEL=gemma3:12b
+INTENT_ROUTER_MODEL=qwen2.5:1.5b
 COMPARE_MODELS=
 ```
 
 The recommended `.env.ollama.example` documents the maintainer's stable local model choices:
 
 - `llama3.1:8b` for the safest text summaries/questions baseline.
+
+`INTENT_ROUTER_MODEL` is only used to classify explicitly addressed natural-language requests. It defaults to
+`QUESTION_MODEL`, then `OLLAMA_MODEL`; set it to a smaller installed text model to avoid loading Gemma before
+every routed action. A vision model such as the configured OCR model can also route text if it supports ordinary
+text chat, but a small text-only model usually starts faster and uses less VRAM.
 - `qwen2.5vl:7b` for stable `/image`, `/ocr`, `/meme`, and `/video` frame recognition.
 - `qwen3:14b`, `gemma3:27b`, and `qwen3-coder:30b` for `/compare` on stronger local machines.
 

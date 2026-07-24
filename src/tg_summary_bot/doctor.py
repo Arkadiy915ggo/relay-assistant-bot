@@ -122,6 +122,10 @@ def main() -> int:
     else:
         _ok("COMPARE_MODELS is empty; /compare is disabled until models are configured")
 
+    if settings.intent_router_model and settings.resolved_llm_provider == "ollama":
+        if not _check_optional_model(ollama_models, settings.intent_router_model, "Intent router"):
+            warnings += 1
+
     if settings.image_recognition_model and ollama_models is not None:
         if not _check_optional_model(ollama_models, settings.image_recognition_model, "Image recognition"):
             warnings += 1

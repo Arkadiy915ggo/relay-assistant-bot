@@ -57,3 +57,27 @@ class AddressingTests(unittest.TestCase):
             ),
             "расскажи новости",
         )
+
+    def test_accepts_text_mention_for_bot_id(self) -> None:
+        class Mention:
+            type = "text_mention"
+            user = SimpleNamespace(id=42)
+
+            def extract_from(self, text: str) -> str:
+                return "Реле"
+
+        message = SimpleNamespace(
+            text="Реле помоги",
+            caption=None,
+            entities=[Mention()],
+            caption_entities=None,
+        )
+        self.assertEqual(
+            extract_addressed_request(
+                message,
+                bot_id=42,
+                bot_username=None,
+                normalized_aliases=[],
+            ),
+            "помоги",
+        )

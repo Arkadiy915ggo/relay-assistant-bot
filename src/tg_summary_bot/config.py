@@ -46,6 +46,7 @@ class Settings:
     ollama_num_ctx: int
     ollama_num_predict: int
     question_model: str
+    intent_router_model: str
     compare_models: list[str]
     database_path: Path
     log_file: Path
@@ -139,6 +140,7 @@ def load_settings() -> Settings:
         ollama_num_ctx=int(os.getenv("OLLAMA_NUM_CTX", "32768")),
         ollama_num_predict=int(os.getenv("OLLAMA_NUM_PREDICT", "800")),
         question_model=os.getenv("QUESTION_MODEL", "").strip(),
+        intent_router_model=os.getenv("INTENT_ROUTER_MODEL", "").strip(),
         compare_models=_csv_strings(os.getenv("COMPARE_MODELS", "")),
         database_path=Path(os.getenv("DATABASE_PATH", "data/messages.sqlite3")),
         log_file=Path(os.getenv("LOG_FILE", "data/bot.log")),
