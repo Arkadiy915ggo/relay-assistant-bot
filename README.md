@@ -191,6 +191,7 @@ Restart the bot.
 /ocr
 /meme
 /video
+/video https://youtu.be/example
 /vocr
 /compare 10m
 ```
@@ -499,10 +500,12 @@ Behavior:
 
 - If `/video` is sent as a reply to a video or Telegram video note, the bot recognizes only the replied video.
 - If `/video` is sent without a reply, the bot recognizes the latest indexed video in the chat.
+- `/video <YouTube URL>` downloads one on-demand YouTube video with `yt-dlp` and runs the same frame and optional audio analysis. Playlists, channels, live/upcoming streams, and videos with unknown duration are rejected. YouTube videos use `MAX_VIDEO_SIZE_MB` and `MAX_VIDEO_SECONDS` and are deleted after processing.
+- You can also reply to a YouTube link with `/video`.
 - `/vocr` is an alias for `/video`.
 - Videos over `MAX_VIDEO_SIZE_MB` are rejected before recognition. If `TELEGRAM_DOWNLOAD_LIMIT_MB` is positive, it is also used as an early cutoff; otherwise the bot attempts the download and reports Telegram's real `file is too big` response if it happens.
 - The bot downloads the video, extracts key frames with `ffmpeg`, sends those frames to `VIDEO_RECOGNITION_MODEL`, optionally extracts/transcribes the audio track when `VIDEO_TRANSCRIBE_AUDIO=true`, unloads the model after the task, and deletes temporary files.
-- Repeated `/video` calls for the same message and same video settings use a SQLite cache instead of rerunning `ffmpeg` and Ollama.
+- Repeated `/video` calls for the same Telegram message and settings use a SQLite cache instead of rerunning `ffmpeg` and Ollama. YouTube downloads are not cached in v1.
 - The result is saved as a normal stored message, so future `/summary` and `/question` calls can use it.
 
 The video response format is:

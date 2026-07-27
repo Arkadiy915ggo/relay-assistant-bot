@@ -33,6 +33,11 @@ from tg_summary_bot.transcriber import FasterWhisperTranscriber
 from tg_summary_bot.transcript_formatter import TranscriptFormatter
 from tg_summary_bot.video_recognizer import VideoRecognizer
 from tg_summary_bot.web_search import WikipediaSearchClient, format_wiki_results
+from tg_summary_bot.youtube import (
+    YouTubeDownloadError,
+    download_youtube_video,
+    youtube_url_from_message,
+)
 
 
 RESPONSE_LOGGER_NAME = "tg_summary_bot.responses"
@@ -592,7 +597,7 @@ async def create_dispatcher(
             "`/transcribe` - transcribe replied voice/audio\n"
             "`/image` - recognize the latest image or replied image\n"
             "`/meme` - make a meme from replied/latest image\n"
-            "`/video` - recognize the latest video/video note or replied video\n"
+            "`/video [YouTube URL]` - recognize a replied/latest Telegram video or one YouTube video\n"
             "`/compare 10m` - compare summaries across Ollama models\n"
             "`/stats` - chat_id and stored message count\n\n"
             "Voice messages are transcribed automatically when enabled. "
@@ -1230,7 +1235,7 @@ async def create_dispatcher(
             await run_meme(message, bot)
             return True
         if route.action == "video":
-            await run_video(message, bot, routed=True)
+            await run_video(message, bot, routed=True, youtube=youtube_url_from_message(message))
             return True
         if route.action == "transcribe":
             await run_transcribe(message, bot)
@@ -1594,7 +1599,12 @@ async def create_dispatcher(
 
                 if settings.video_transcribe_audio:
                     if audio_path and transcriber:
-                        audio_transcript = await transcriber.transcribe(audio_path)
+                        audio_transcript = await transcribe_video_audio(
+                            settings,
+                            audio_path,
+                            video.duration,
+                            transcriber,
+                        )
                         if audio_transcript.strip() and transcript_formatter:
                             try:
                                 audio_transcript = await transcript_formatter.format(audio_transcript)
@@ -1659,12 +1669,140 @@ async def create_dispatcher(
         for part in parts[1:]:
             await answer_logged(request_message, part)
 
-    async def run_video(message: Message, bot: Bot, *, routed: bool = False) -> None:
+    async def run_youtube_video(
+        message: Message,
+        bot: Bot,
+        url: str,
+        *,
+        routed: bool = False,
+    ) -> None:
+        if not settings.video_recognition_model:
+            await answer_logged(message, "Video recognition is disabled: VIDEO_RECOGNITION_MODEL is empty.")
+            return
+        wait_message = (
+            await reply_logged(message, "Downloading and recognizing YouTube video...")
+            if routed
+            else await answer_logged(message, "Downloading and recognizing YouTube video...")
+        )
+        downloaded = None
+        audio_path: Path | None = None
+        try:
+            downloaded = await download_youtube_video(
+                url=url,
+                directory=settings.video_download_dir,
+                max_size_mb=settings.max_video_size_mb,
+                max_seconds=settings.max_video_seconds,
+            )
+            source = StoredVideo(
+                message_id=message.message_id,
+                chat_id=message.chat.id,
+                chat_type=str(message.chat.type),
+                file_id="youtube",
+                media_type="youtube",
+                sender_name="YouTube",
+                created_at=message.date.isoformat(),
+                duration=downloaded.duration,
+                file_size=downloaded.path.stat().st_size,
+                file_name=downloaded.path.name,
+                mime_type="video/mp4",
+            )
+            if settings.video_transcribe_audio:
+                audio_path = await extract_video_audio(settings, downloaded.path, source)
+
+            visual_result = ""
+            visual_note = "Визуальный анализ кадров не дал результата."
+            audio_transcript = ""
+            audio_note = "Аудиодорожка не найдена или речь не распознана."
+            async with gpu_lock:
+                try:
+                    visual_result = await video_recognizer.recognize(
+                        downloaded.path,
+                        message_id=message.message_id,
+                        duration=downloaded.duration,
+                    )
+                except Exception:  # noqa: BLE001
+                    logging.exception("YouTube visual recognition failed")
+                    visual_note = "Визуальный анализ кадров не удался."
+                finally:
+                    await video_recognizer.unload()
+
+                if settings.video_transcribe_audio:
+                    if audio_path and transcriber:
+                        try:
+                            audio_transcript = await transcribe_video_audio(
+                                settings,
+                                audio_path,
+                                downloaded.duration,
+                                transcriber,
+                            )
+                            if audio_transcript.strip() and transcript_formatter:
+                                try:
+                                    audio_transcript = await transcript_formatter.format(audio_transcript)
+                                except Exception:  # noqa: BLE001
+                                    logging.exception("YouTube transcript formatting failed")
+                                finally:
+                                    await transcript_formatter.unload()
+                        except Exception:  # noqa: BLE001
+                            logging.exception("YouTube audio transcription failed")
+                            audio_note = "Расшифровка аудио не удалась."
+                    elif audio_path:
+                        audio_note = "Аудио найдено, но Whisper transcription is not configured."
+                else:
+                    audio_note = "Расшифровка аудио для видео отключена."
+            if not visual_result.strip() and not audio_transcript.strip():
+                raise RuntimeError(f"{visual_note}; {audio_note}")
+            result = combine_video_result(
+                visual_result,
+                visual_note,
+                audio_transcript,
+                audio_note,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logging.exception("YouTube video recognition failed")
+            detail = str(exc) if isinstance(exc, YouTubeDownloadError) else type(exc).__name__
+            await edit_text_logged(
+                wait_message,
+                f"Failed to recognize YouTube video: `{detail}`",
+                source_message=message,
+            )
+            return
+        finally:
+            if audio_path:
+                audio_path.unlink(missing_ok=True)
+            if downloaded:
+                downloaded.path.unlink(missing_ok=True)
+
+        saved_text = f"🎞 YouTube recognition for {downloaded.title}: {result}"
+        await save_message_text(settings, store, wait_message, saved_text, limit_chars=settings.max_transcription_chars)
+        text = f"**YouTube video recognition: {downloaded.title}**\nSaved for summaries.\n\n{result}"
+        parts = split_telegram_text(text)
+        await edit_text_logged(wait_message, parts[0], source_message=message)
+        for part in parts[1:]:
+            await answer_logged(message, part)
+
+    async def run_video(
+        message: Message,
+        bot: Bot,
+        *,
+        routed: bool = False,
+        youtube: str | None = None,
+    ) -> None:
         if not is_allowed(settings, message.chat.id):
             return
 
-        video = await resolve_video_for_command(store, message)
+        if message.reply_to_message:
+            video = await resolve_video_for_command(store, message)
+        else:
+            video = video_from_message(message)
+            if not video and youtube:
+                await run_youtube_video(message, bot, youtube, routed=routed)
+                return
+            if not video:
+                video = await store.get_latest_video(message.chat.id)
         if not video:
+            if youtube:
+                await run_youtube_video(message, bot, youtube, routed=routed)
+                return
             await answer_logged(
                 message,
                 "No video found. Reply to a video with `/video`, or send `/video` after a video.",
@@ -1682,7 +1820,7 @@ async def create_dispatcher(
 
     @dp.message(Command("video", "vocr"))
     async def video_command(message: Message, bot: Bot) -> None:
-        await run_video(message, bot)
+        await run_video(message, bot, youtube=youtube_url_from_message(message))
 
     @dp.message(Command("compare"))
     async def compare_command(message: Message) -> None:
@@ -2221,6 +2359,69 @@ async def download_video(settings: Settings, bot: Bot, video: StoredVideo) -> Pa
             ) from exc
         raise
     return video_path
+
+
+def audio_chunk_ranges(duration: int | None, max_seconds: int) -> list[tuple[int, int]]:
+    max_seconds = max(max_seconds, 1)
+    if not duration:
+        return [(0, max_seconds)]
+    if duration <= max_seconds:
+        return [(0, duration)]
+    return [
+        (start, min(max_seconds, duration - start))
+        for start in range(0, duration, max_seconds)
+    ]
+
+
+async def transcribe_video_audio(
+    settings: Settings,
+    audio_path: Path,
+    duration: int | None,
+    transcriber: FasterWhisperTranscriber,
+) -> str:
+    ranges = audio_chunk_ranges(duration, settings.max_voice_seconds)
+    if len(ranges) == 1:
+        return await transcriber.transcribe(audio_path)
+
+    chunks: list[Path] = []
+    transcripts: list[str] = []
+    try:
+        for index, (start, length) in enumerate(ranges, start=1):
+            chunk_path = audio_path.with_name(f"{audio_path.stem}_part_{index:03d}.wav")
+            chunks.append(chunk_path)
+            process = await asyncio.create_subprocess_exec(
+                "ffmpeg",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-ss",
+                str(start),
+                "-t",
+                str(length),
+                "-i",
+                str(audio_path),
+                "-ac",
+                "1",
+                "-ar",
+                "16000",
+                "-c:a",
+                "pcm_s16le",
+                str(chunk_path),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await process.communicate()
+            if process.returncode != 0:
+                detail = (stderr or stdout).decode("utf-8", errors="replace").strip()
+                raise RuntimeError(f"ffmpeg audio split failed: {detail[:1000]}")
+            transcript = (await transcriber.transcribe(chunk_path)).strip()
+            if transcript:
+                transcripts.append(transcript)
+    finally:
+        for chunk in chunks:
+            chunk.unlink(missing_ok=True)
+    return "\n\n".join(transcripts)
 
 
 async def extract_video_audio(settings: Settings, video_path: Path, video: StoredVideo) -> Path | None:

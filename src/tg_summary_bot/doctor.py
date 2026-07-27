@@ -145,6 +145,13 @@ def main() -> int:
             _warn("ffmpeg is required for video recognition/audio extraction. On Mac: brew install ffmpeg")
             warnings += 1
 
+    if settings.video_recognition_model:
+        if importlib.util.find_spec("yt_dlp"):
+            _ok("yt-dlp is installed for YouTube video recognition")
+        else:
+            _fail("yt-dlp is not installed. Reinstall the bot dependencies: ./run.sh install")
+            errors += 1
+
     if settings.transcribe_voice or settings.video_transcribe_audio:
         if importlib.util.find_spec("faster_whisper"):
             _ok("faster-whisper is installed")

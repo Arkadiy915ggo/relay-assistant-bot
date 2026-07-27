@@ -31,8 +31,9 @@ The bot uses the official Telegram Bot API through `aiogram`. It cannot read his
 - Install voice support with CUDA libs: `./run.sh install-voice-cuda`.
 - Start bot: `./run.sh start` or `python -m tg_summary_bot`.
 - Lightweight syntax check: `.venv/bin/python -m compileall src`.
+- Test suite: `.venv/bin/python -m unittest discover -s tests -v`.
 
-There is currently no dedicated automated test suite in the repository.
+The repository uses the standard-library `unittest` framework with fakes and temporary SQLite databases.
 
 ## Runtime Flow
 
@@ -54,6 +55,7 @@ There is currently no dedicated automated test suite in the repository.
 - `src/tg_summary_bot/assistant.py`: `/question` flow with relevant-context extraction for long histories.
 - `src/tg_summary_bot/image_recognizer.py`: manual `/image` and `/ocr` recognition through Ollama vision.
 - `src/tg_summary_bot/video_recognizer.py`: manual `/video` and `/vocr` key-frame recognition through Ollama vision with adaptive compression.
+- `src/tg_summary_bot/youtube.py`: validated single-video YouTube downloads through `yt-dlp` for the existing video recognition flow.
 - `src/tg_summary_bot/transcriber.py`: optional local Whisper transcription for voice/audio and video audio tracks.
 - `src/tg_summary_bot/transcript_formatter.py`: optional LLM post-processor that formats already-sent Whisper transcripts with minimal edits.
 - `src/tg_summary_bot/memory.py`: structured long-term chat memory, hybrid memory search, rollups, and participant profile facts used by `/summary`, `/question`, and mention answers.
@@ -69,7 +71,7 @@ There is currently no dedicated automated test suite in the repository.
 - `/profile`: show, forget, or correct source-backed participant profile facts.
 - `/transcribe`: transcribe a replied voice/audio message manually.
 - `/image`, `/ocr`: recognize replied image or latest indexed image; save result as a stored message.
-- `/video`, `/vocr`: recognize replied/latest indexed video or Telegram video note; cache result and save it as a stored message.
+- `/video`, `/vocr`: recognize replied/latest indexed Telegram video or one supplied YouTube URL; cache Telegram results and save recognition text as a stored message.
 - `/compare [period]`: run summaries through `COMPARE_MODELS`; only supported with `LLM_PROVIDER=ollama`.
 
 ## Data Model
