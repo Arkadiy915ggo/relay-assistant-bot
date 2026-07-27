@@ -72,8 +72,10 @@ class PointBalance:
 @dataclass(frozen=True)
 class JokeAwardResult:
     status: str
+    source_message_id: int | None = None
     participant_key: str | None = None
     participant_name: str | None = None
+    source_text: str | None = None
     balance: int | None = None
 
 
@@ -902,7 +904,7 @@ class MessageStore:
                     await db.execute("BEGIN IMMEDIATE")
                     cursor = await db.execute(
                         """
-                        SELECT message_id, chat_id, sender_id, sender_name, origin, kind
+                        SELECT message_id, chat_id, sender_id, sender_name, text, origin, kind
                         FROM messages WHERE chat_id = ? AND message_id = ?
                         """,
                         (chat_id, source_message_id),
@@ -920,18 +922,21 @@ class MessageStore:
 
                     sender_id = source["sender_id"]
                     name = str(source["sender_name"])
+                    source_text = str(source["text"])
                     key = _participant_key(int(sender_id) if sender_id is not None else None, name)
-                    try:
-                        await db.execute(
-                            """
-                            INSERT INTO chat_point_ledger (
-                                chat_id, participant_key, participant_name, delta, reason,
-                                source_message_id, created_at
-                            ) VALUES (?, ?, ?, 10, 'best_joke', ?, ?)
-                            """,
-                            (chat_id, key, name, source_message_id, awarded_at_iso),
-                        )
-                    except aiosqlite.IntegrityError:
+                    cursor = await db.execute(
+                        """
+                        INSERT INTO chat_point_ledger (
+                            chat_id, participant_key, participant_name, delta, reason,
+                            source_message_id, created_at
+                        ) VALUES (?, ?, ?, 10, 'best_joke', ?, ?)
+                        ON CONFLICT(chat_id, reason, source_message_id) DO NOTHING
+                        """,
+                        (chat_id, key, name, source_message_id, awarded_at_iso),
+                    )
+                    inserted = cursor.rowcount > 0
+                    await cursor.close()
+                    if not inserted:
                         cursor = await db.execute(
                             """
                             SELECT balance FROM chat_point_balances
@@ -944,8 +949,10 @@ class MessageStore:
                         await db.rollback()
                         return JokeAwardResult(
                             status="already_awarded",
+                            source_message_id=int(source["message_id"]),
                             participant_key=key,
                             participant_name=name,
+                            source_text=source_text,
                             balance=int(balance_row[0]) if balance_row else 0,
                         )
                     await db.execute(
@@ -972,8 +979,10 @@ class MessageStore:
                     await db.commit()
                     return JokeAwardResult(
                         status="awarded",
+                        source_message_id=int(source["message_id"]),
                         participant_key=key,
                         participant_name=name,
+                        source_text=source_text,
                         balance=int(balance_row[0]),
                     )
                 except Exception:

@@ -1263,8 +1263,8 @@ async def create_dispatcher(
                         leaderboard_needs_refresh = award.status == "awarded"
                         if award.status in {"awarded", "already_awarded"}:
                             joke_section = render_best_joke_section(
-                                winner_name=selection.winner.sender_name,
-                                winner_text=selection.winner.text,
+                                winner_name=award.participant_name,
+                                winner_text=award.source_text,
                                 award_status=award.status,
                             )
             except Exception:  # noqa: BLE001

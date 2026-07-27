@@ -143,6 +143,10 @@ class JokeStorageTests(unittest.IsolatedAsyncioTestCase):
             self.store.award_unique_joke(chat_id=1, source_message_id=1),
         )
         self.assertEqual({first.status, duplicate.status}, {"awarded", "already_awarded"})
+        for result in (first, duplicate):
+            self.assertEqual(result.source_message_id, 1)
+            self.assertEqual(result.participant_name, "Alice")
+            self.assertEqual(result.source_text, "joke")
         balance = await self.store.get_point_balance(chat_id=1, participant_key="id:10")
         self.assertEqual(balance.balance if balance else None, 10)
         self.assertEqual((await self.store.award_unique_joke(chat_id=2, source_message_id=1)).status, "not_found")
@@ -162,6 +166,26 @@ class JokeStorageTests(unittest.IsolatedAsyncioTestCase):
         async with aiosqlite.connect(self.path) as db:
             count = await (await db.execute("SELECT COUNT(*) FROM chat_point_ledger WHERE source_message_id = 3")).fetchone()
         self.assertEqual(count[0], 0)
+
+    async def test_unknown_ledger_integrity_error_is_not_duplicate_success(self) -> None:
+        await self._save(4)
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute(
+                """CREATE TRIGGER reject_award BEFORE INSERT ON chat_point_ledger
+                WHEN NEW.source_message_id = 4 BEGIN SELECT RAISE(ABORT, 'unexpected'); END"""
+            )
+            await db.commit()
+
+        with self.assertRaises(aiosqlite.IntegrityError):
+            await self.store.award_unique_joke(chat_id=1, source_message_id=4)
+        self.assertIsNone(await self.store.get_point_balance(chat_id=1, participant_key="id:10"))
+        async with aiosqlite.connect(self.path) as db:
+            row = await (
+                await db.execute(
+                    "SELECT COUNT(*) FROM chat_point_ledger WHERE source_message_id = 4"
+                )
+            ).fetchone()
+        self.assertEqual(row[0], 0)
 
     async def test_top_is_chat_scoped_and_deterministic(self) -> None:
         for message_id, name, sender in [(1, "zoe", 1), (2, "Anna", 2), (3, "anna", 3), (4, "Other", 4)]:
