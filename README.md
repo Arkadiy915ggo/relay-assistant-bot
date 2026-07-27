@@ -7,7 +7,8 @@ A safe Telegram bot that stores new chat messages and produces short AI summarie
 - stores new text messages and media captions in SQLite;
 - creates summaries with `/summary 24h`, `/summary 7d`, `/summary today`;
 - compares summaries from multiple Ollama models with `/compare 10m`;
-- includes a `Best joke` section in the generated report;
+- validates one best joke from eligible source messages after a successful summary and awards `+10` chat-scoped virtual points;
+- shows personal joke points with `/balance` and a deterministic top-10 with `/top`;
 - works in direct chats, groups, supergroups, and channels;
 - supports OpenAI API or a local Ollama model;
 - splits long discussions into chunks and merges the final summary;
@@ -171,6 +172,8 @@ Restart the bot.
 /start
 /help
 /stats
+/balance
+/top
 /summary
 /summary 30m
 /summary 6h
@@ -198,6 +201,25 @@ Restart the bot.
 /vocr
 /compare 10m
 ```
+
+## Joke Points
+
+After a successful `/summary`, the bot independently selects at most one real funny reply from the
+eligible raw-message snapshot and renders a verified quote. A newly selected source message earns its
+author `+10` virtual points in that chat. Repeating a summary cannot award the same source message
+twice. `/compare` never selects jokes or changes balances.
+
+Only new rows with explicit provenance can be candidates: incoming text, incoming captions, incoming
+voice transcripts, and final contextual assistant answers. Existing rows are migrated as
+`legacy/legacy_unclassified` and intentionally never become eligible. Recognition results, summaries,
+profiles, status messages, memory blocks, memes, errors, and generated context remain ineligible.
+
+Points are chat-scoped and have no monetary value. This feature does not include casino mechanics,
+wagers, payouts, refunds, transfers, purchases, or real money.
+
+After the first new award, the bot creates a `Топ шуток` message and tries to pin it. Each later new
+award edits that same message and re-pins it. If it was deleted, the bot creates a replacement. The bot
+needs Telegram permission to pin messages; without it, it still keeps and updates the leaderboard message.
 
 ## Bot Aliases
 

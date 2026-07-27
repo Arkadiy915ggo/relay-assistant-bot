@@ -9,10 +9,10 @@
 | 1, реализовано | [[Features/01 Aliases and Address Detection]] | Нет | Любой участник чата задаёт имена бота; адресованные сообщения безопасно распознаются. |
 | 2, реализовано | [[Features/02 Intent Router and User Actions]] | Фича 1 | Обращение по имени вызывает подходящее пользовательское действие. |
 | 2.5, реализовано | [[Features/02.5 Pre-Feature 03 Stabilization]] | Фичи 1-2 | Terminal outcomes, честная persistence policy и стабилизация спорных intent-ов перед очками. |
-| 3, запланировано | [[Features/03 Joke Points and Leaderboard]] | Завершённый этап 2.5 | Уникальная validated шутка получает очки; есть balance и top-10. |
-| 4, запланировано | [[Features/04 Casino Slots]] | Фича 3; адресованный intent также требует Фичу 2 | Виртуальные очки можно поставить в Telegram-слоте. |
+| 3, реализовано в worktree | [[Features/03 Joke Points and Leaderboard]] | Завершённый этап 2.5 | Уникальная validated шутка получает очки; есть spendable balance и top-10. |
+| 4, запланировано | [[Features/04 Casino Slots]] | Проверенная и отдельно зафиксированная Фича 3 | Виртуальные очки можно поставить в versioned Telegram-слоте с atomic reserve/settle/refund. |
 
-Фичи 1, 2 и стабилизация 2.5 уже реализованы. Feature 03 нельзя начинать от старого независимого плана: она зависит от принятого контракта 2.5 и делится на Foundation PR и Integration PR. Ядро Feature 04 идёт только после Feature 03; intent `casino` добавляется в роутер только вместе с Feature 04.
+Фичи 1, 2, стабилизация 2.5 и Feature 03 реализованы в текущем worktree. Перед Feature 04 изменения Feature 03 должны пройти полный suite и попасть в отдельный commit. Feature 04 делится на Domain/Storage, Slash Lifecycle/Recovery и Addressed Intent; intent `casino` добавляется только на третьем этапе.
 
 ## Зафиксированные продуктовые решения
 
@@ -25,7 +25,11 @@
 - Уникальная лучшая шутка даёт `+10` очков. Одна исходная реплика награждается только один раз за всю историю чата.
 - Legacy rows и generated YouTube/wiki/image/video/profile/status/summary text не участвуют в Feature 03; eligibility задаётся закрытым provenance allowlist.
 - `/compare` никогда не начисляет очки.
-- Стартовая ставка казино: `10` очков.
+- Ставка казино: `10` очков; gross payouts `0/5/50/250`, RTP `90.625%`.
+- Slot mapping фиксируется как `telegram_slots_base4_v1`; jackpot только `Dice.value=64` (`seven/seven/seven`).
+- Неизвестный/не committed Telegram Dice outcome считается void, stake возвращается.
+- `/top`, `/stats` leader и pinned `Топ балансов` показывают текущие spendable balances, включая casino changes.
+- Feature 04 поддерживает один активный процесс; multi-instance recovery не входит в v1.
 
 ## Общие инженерные ограничения
 

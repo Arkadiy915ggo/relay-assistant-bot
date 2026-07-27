@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import unicodedata
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -20,6 +21,67 @@ class StoredMessage:
     text: str
     created_at: str
     reply_to_message_id: int | None
+    origin: str = "legacy"
+    kind: str = "legacy_unclassified"
+
+
+ELIGIBLE_MESSAGE_PROVENANCE: frozenset[tuple[str, str]] = frozenset(
+    {
+        ("incoming", "text"),
+        ("incoming", "caption"),
+        ("incoming", "voice_transcript"),
+        ("assistant", "assistant_answer"),
+    }
+)
+
+
+def is_eligible_message_provenance(origin: str, kind: str) -> bool:
+    """Return eligibility from the closed Feature 03 provenance allowlist."""
+    return (origin, kind) in ELIGIBLE_MESSAGE_PROVENANCE
+
+
+def eligible_message_provenance_sql(*, table_alias: str = "") -> str:
+    prefix = f"{table_alias}." if table_alias else ""
+    return (
+        f"({prefix}origin = 'incoming' AND {prefix}kind IN ('text', 'caption', 'voice_transcript')) "
+        f"OR ({prefix}origin = 'assistant' AND {prefix}kind = 'assistant_answer')"
+    )
+
+
+@dataclass(frozen=True)
+class SnapshotBoundary:
+    created_at: str
+    message_id: int
+
+
+@dataclass(frozen=True)
+class RawSnapshotPage:
+    messages: list[StoredMessage]
+    next_cursor: SnapshotBoundary | None
+
+
+@dataclass(frozen=True)
+class PointBalance:
+    chat_id: int
+    participant_key: str
+    participant_name: str
+    balance: int
+    updated_at: str
+
+
+@dataclass(frozen=True)
+class JokeAwardResult:
+    status: str
+    participant_key: str | None = None
+    participant_name: str | None = None
+    balance: int | None = None
+
+
+@dataclass(frozen=True)
+class PinnedLeaderboard:
+    chat_id: int
+    message_id: int
+    updated_at: str
 
 
 @dataclass(frozen=True)
@@ -136,14 +198,70 @@ class MessageStore:
                     text TEXT NOT NULL,
                     created_at TEXT NOT NULL,
                     reply_to_message_id INTEGER,
+                    origin TEXT NOT NULL DEFAULT 'legacy',
+                    kind TEXT NOT NULL DEFAULT 'legacy_unclassified',
                     PRIMARY KEY (chat_id, message_id)
                 )
                 """
+            )
+            await self._ensure_column(
+                db,
+                table="messages",
+                column="origin",
+                definition="TEXT NOT NULL DEFAULT 'legacy'",
+            )
+            await self._ensure_column(
+                db,
+                table="messages",
+                column="kind",
+                definition="TEXT NOT NULL DEFAULT 'legacy_unclassified'",
             )
             await db.execute(
                 """
                 CREATE INDEX IF NOT EXISTS idx_messages_chat_created
                 ON messages (chat_id, created_at)
+                """
+            )
+            await db.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_messages_eligible_snapshot
+                ON messages (chat_id, origin, kind, created_at, message_id)
+                """
+            )
+            await db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS chat_point_ledger (
+                    entry_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    chat_id INTEGER NOT NULL,
+                    participant_key TEXT NOT NULL,
+                    participant_name TEXT NOT NULL,
+                    delta INTEGER NOT NULL,
+                    reason TEXT NOT NULL,
+                    source_message_id INTEGER NOT NULL,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(chat_id, reason, source_message_id)
+                )
+                """
+            )
+            await db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS chat_point_balances (
+                    chat_id INTEGER NOT NULL,
+                    participant_key TEXT NOT NULL,
+                    participant_name TEXT NOT NULL,
+                    balance INTEGER NOT NULL CHECK(balance >= 0),
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY(chat_id, participant_key)
+                )
+                """
+            )
+            await db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS chat_pinned_leaderboards (
+                    chat_id INTEGER PRIMARY KEY,
+                    message_id INTEGER NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
                 """
             )
             await db.execute(
@@ -400,6 +518,8 @@ class MessageStore:
         text: str,
         created_at: datetime,
         reply_to_message_id: int | None,
+        origin: str = "legacy",
+        kind: str = "legacy_unclassified",
         replace: bool = False,
     ) -> None:
         if created_at.tzinfo is None:
@@ -410,24 +530,26 @@ class MessageStore:
             async with aiosqlite.connect(self.database_path) as db:
                 await self._prepare_connection(db)
                 sql = """
-                INSERT OR IGNORE INTO messages (
-                    chat_id, message_id, chat_type, sender_id, sender_name,
-                    text, created_at, reply_to_message_id
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    INSERT OR IGNORE INTO messages (
+                        chat_id, message_id, chat_type, sender_id, sender_name,
+                        text, created_at, reply_to_message_id, origin, kind
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """
                 if replace:
                     sql = """
                     INSERT INTO messages (
                         chat_id, message_id, chat_type, sender_id, sender_name,
-                        text, created_at, reply_to_message_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        text, created_at, reply_to_message_id, origin, kind
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(chat_id, message_id) DO UPDATE SET
                         chat_type = excluded.chat_type,
                         sender_id = excluded.sender_id,
                         sender_name = excluded.sender_name,
                         text = excluded.text,
                         created_at = excluded.created_at,
-                        reply_to_message_id = excluded.reply_to_message_id
+                        reply_to_message_id = excluded.reply_to_message_id,
+                        origin = excluded.origin,
+                        kind = excluded.kind
                     """
                 await db.execute(
                     sql,
@@ -440,6 +562,8 @@ class MessageStore:
                         text,
                         created_at_iso,
                         reply_to_message_id,
+                        origin,
+                        kind,
                     ),
                 )
                 await db.commit()
@@ -665,6 +789,281 @@ class MessageStore:
                 )
             await cursor.close()
         return messages
+
+    async def get_eligible_snapshot_boundary(
+        self,
+        *,
+        chat_id: int,
+        since: datetime,
+    ) -> SnapshotBoundary | None:
+        if since.tzinfo is None:
+            since = since.replace(tzinfo=timezone.utc)
+        since_iso = since.astimezone(timezone.utc).isoformat()
+        async with aiosqlite.connect(self.database_path) as db:
+            await self._prepare_connection(db)
+            cursor = await db.execute(
+                f"""
+                SELECT created_at, message_id
+                FROM messages
+                WHERE chat_id = ? AND created_at >= ?
+                  AND ({eligible_message_provenance_sql()})
+                ORDER BY created_at DESC, message_id DESC
+                LIMIT 1
+                """,
+                (chat_id, since_iso),
+            )
+            row = await cursor.fetchone()
+            await cursor.close()
+        if not row:
+            return None
+        return SnapshotBoundary(created_at=str(row[0]), message_id=int(row[1]))
+
+    async def get_eligible_snapshot_page(
+        self,
+        *,
+        chat_id: int,
+        since: datetime,
+        boundary: SnapshotBoundary,
+        after: SnapshotBoundary | None,
+        row_limit: int,
+        char_budget: int,
+    ) -> RawSnapshotPage:
+        if row_limit <= 0 or char_budget <= 0:
+            raise ValueError("row_limit and char_budget must be positive")
+        if since.tzinfo is None:
+            since = since.replace(tzinfo=timezone.utc)
+        params: list[object] = [
+            chat_id,
+            since.astimezone(timezone.utc).isoformat(),
+            boundary.created_at,
+            boundary.created_at,
+            boundary.message_id,
+        ]
+        after_clause = ""
+        if after:
+            after_clause = (
+                "AND (created_at > ? OR (created_at = ? AND message_id > ?))"
+            )
+            params.extend([after.created_at, after.created_at, after.message_id])
+        params.append(row_limit)
+        async with aiosqlite.connect(self.database_path) as db:
+            await self._prepare_connection(db)
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                f"""
+                SELECT message_id, chat_id, chat_type, sender_id, sender_name, text,
+                       created_at, reply_to_message_id, origin, kind
+                FROM messages
+                WHERE chat_id = ? AND created_at >= ?
+                  AND (created_at < ? OR (created_at = ? AND message_id <= ?))
+                  {after_clause}
+                  AND ({eligible_message_provenance_sql()})
+                ORDER BY created_at ASC, message_id ASC
+                LIMIT ?
+                """,
+                params,
+            )
+            rows = await cursor.fetchall()
+            await cursor.close()
+
+        messages: list[StoredMessage] = []
+        total_chars = 0
+        for row in rows:
+            text = str(row["text"])
+            # An oversized first row forms its own page so the keyset cursor advances.
+            if messages and total_chars + len(text) > char_budget:
+                break
+            messages.append(_stored_message_from_row(row, text=text))
+            total_chars += len(text)
+        if not messages:
+            return RawSnapshotPage(messages=[], next_cursor=None)
+        last = messages[-1]
+        return RawSnapshotPage(
+            messages=messages,
+            next_cursor=SnapshotBoundary(created_at=last.created_at, message_id=last.message_id),
+        )
+
+    async def award_unique_joke(
+        self,
+        *,
+        chat_id: int,
+        source_message_id: int,
+        awarded_at: datetime | None = None,
+    ) -> JokeAwardResult:
+        awarded_at = awarded_at or datetime.now(timezone.utc)
+        if awarded_at.tzinfo is None:
+            awarded_at = awarded_at.replace(tzinfo=timezone.utc)
+        awarded_at_iso = awarded_at.astimezone(timezone.utc).isoformat()
+        async with self._write_lock:
+            async with aiosqlite.connect(self.database_path) as db:
+                await self._prepare_connection(db)
+                db.row_factory = aiosqlite.Row
+                try:
+                    await db.execute("BEGIN IMMEDIATE")
+                    cursor = await db.execute(
+                        """
+                        SELECT message_id, chat_id, sender_id, sender_name, origin, kind
+                        FROM messages WHERE chat_id = ? AND message_id = ?
+                        """,
+                        (chat_id, source_message_id),
+                    )
+                    source = await cursor.fetchone()
+                    await cursor.close()
+                    if not source:
+                        await db.rollback()
+                        return JokeAwardResult(status="not_found")
+                    origin = str(source["origin"])
+                    kind = str(source["kind"])
+                    if not is_eligible_message_provenance(origin, kind):
+                        await db.rollback()
+                        return JokeAwardResult(status="ineligible")
+
+                    sender_id = source["sender_id"]
+                    name = str(source["sender_name"])
+                    key = _participant_key(int(sender_id) if sender_id is not None else None, name)
+                    try:
+                        await db.execute(
+                            """
+                            INSERT INTO chat_point_ledger (
+                                chat_id, participant_key, participant_name, delta, reason,
+                                source_message_id, created_at
+                            ) VALUES (?, ?, ?, 10, 'best_joke', ?, ?)
+                            """,
+                            (chat_id, key, name, source_message_id, awarded_at_iso),
+                        )
+                    except aiosqlite.IntegrityError:
+                        cursor = await db.execute(
+                            """
+                            SELECT balance FROM chat_point_balances
+                            WHERE chat_id = ? AND participant_key = ?
+                            """,
+                            (chat_id, key),
+                        )
+                        balance_row = await cursor.fetchone()
+                        await cursor.close()
+                        await db.rollback()
+                        return JokeAwardResult(
+                            status="already_awarded",
+                            participant_key=key,
+                            participant_name=name,
+                            balance=int(balance_row[0]) if balance_row else 0,
+                        )
+                    await db.execute(
+                        """
+                        INSERT INTO chat_point_balances (
+                            chat_id, participant_key, participant_name, balance, updated_at
+                        ) VALUES (?, ?, ?, 10, ?)
+                        ON CONFLICT(chat_id, participant_key) DO UPDATE SET
+                            participant_name = excluded.participant_name,
+                            balance = chat_point_balances.balance + 10,
+                            updated_at = excluded.updated_at
+                        """,
+                        (chat_id, key, name, awarded_at_iso),
+                    )
+                    cursor = await db.execute(
+                        """
+                        SELECT balance FROM chat_point_balances
+                        WHERE chat_id = ? AND participant_key = ?
+                        """,
+                        (chat_id, key),
+                    )
+                    balance_row = await cursor.fetchone()
+                    await cursor.close()
+                    await db.commit()
+                    return JokeAwardResult(
+                        status="awarded",
+                        participant_key=key,
+                        participant_name=name,
+                        balance=int(balance_row[0]),
+                    )
+                except Exception:
+                    await db.rollback()
+                    raise
+
+    async def get_point_balance(self, *, chat_id: int, participant_key: str) -> PointBalance | None:
+        async with aiosqlite.connect(self.database_path) as db:
+            await self._prepare_connection(db)
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                """
+                SELECT chat_id, participant_key, participant_name, balance, updated_at
+                FROM chat_point_balances WHERE chat_id = ? AND participant_key = ?
+                """,
+                (chat_id, participant_key),
+            )
+            row = await cursor.fetchone()
+            await cursor.close()
+        return _point_balance_from_row(row) if row else None
+
+    async def get_top_point_balances(self, *, chat_id: int, limit: int = 10) -> list[PointBalance]:
+        async with aiosqlite.connect(self.database_path) as db:
+            await self._prepare_connection(db)
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                """
+                SELECT chat_id, participant_key, participant_name, balance, updated_at
+                FROM chat_point_balances
+                WHERE chat_id = ? AND balance > 0
+                ORDER BY balance DESC, participant_key ASC
+                """,
+                (chat_id,),
+            )
+            rows = await cursor.fetchall()
+            await cursor.close()
+        balances = [_point_balance_from_row(row) for row in rows]
+        balances.sort(
+            key=lambda item: (
+                -item.balance,
+                _normalized_participant_name(item.participant_name),
+                item.participant_key,
+            )
+        )
+        return balances[: max(0, limit)]
+
+    async def get_pinned_leaderboard(self, *, chat_id: int) -> PinnedLeaderboard | None:
+        async with aiosqlite.connect(self.database_path) as db:
+            await self._prepare_connection(db)
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                """
+                SELECT chat_id, message_id, updated_at
+                FROM chat_pinned_leaderboards WHERE chat_id = ?
+                """,
+                (chat_id,),
+            )
+            row = await cursor.fetchone()
+            await cursor.close()
+        if not row:
+            return None
+        return PinnedLeaderboard(
+            chat_id=int(row["chat_id"]),
+            message_id=int(row["message_id"]),
+            updated_at=str(row["updated_at"]),
+        )
+
+    async def save_pinned_leaderboard(self, *, chat_id: int, message_id: int) -> None:
+        updated_at = datetime.now(timezone.utc).isoformat()
+        async with self._write_lock:
+            async with aiosqlite.connect(self.database_path) as db:
+                await self._prepare_connection(db)
+                await db.execute(
+                    """
+                    INSERT INTO chat_pinned_leaderboards (chat_id, message_id, updated_at)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(chat_id) DO UPDATE SET
+                        message_id = excluded.message_id,
+                        updated_at = excluded.updated_at
+                    """,
+                    (chat_id, message_id, updated_at),
+                )
+                await db.commit()
+
+    async def delete_pinned_leaderboard(self, *, chat_id: int) -> None:
+        async with self._write_lock:
+            async with aiosqlite.connect(self.database_path) as db:
+                await self._prepare_connection(db)
+                await db.execute("DELETE FROM chat_pinned_leaderboards WHERE chat_id = ?", (chat_id,))
+                await db.commit()
 
     async def get_memory_message_chunk(
         self,
@@ -1722,6 +2121,29 @@ def _stored_message_from_row(row: aiosqlite.Row, *, text: str | None = None) -> 
         text=str(row["text"]) if text is None else text,
         created_at=str(row["created_at"]),
         reply_to_message_id=row["reply_to_message_id"],
+        origin=str(row["origin"]) if "origin" in row.keys() else "legacy",
+        kind=str(row["kind"]) if "kind" in row.keys() else "legacy_unclassified",
+    )
+
+
+def _participant_key(sender_id: int | None, sender_name: str) -> str:
+    if sender_id is not None:
+        return f"id:{sender_id}"
+    normalized = re.sub(r"[^\wа-яА-ЯёЁ]+", "_", sender_name.strip().lower()).strip("_")
+    return f"name:{normalized or 'unknown'}"
+
+
+def _normalized_participant_name(value: str) -> str:
+    return unicodedata.normalize("NFKC", value).casefold()
+
+
+def _point_balance_from_row(row: aiosqlite.Row) -> PointBalance:
+    return PointBalance(
+        chat_id=int(row["chat_id"]),
+        participant_key=str(row["participant_key"]),
+        participant_name=str(row["participant_name"]),
+        balance=int(row["balance"]),
+        updated_at=str(row["updated_at"]),
     )
 
 

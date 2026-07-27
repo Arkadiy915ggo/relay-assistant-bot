@@ -2,7 +2,7 @@
 
 Каждый блок ниже можно отдать отдельному агенту. Перед началом агент должен прочитать `AGENTS.md`, нужную спецификацию и проверить `git status --short`. Не читать `.env` и `data/`.
 
-Текущий статус: Feature 01, Feature 02 и Stage 02.5 реализованы. Feature 03 и Feature 04 не реализованы.
+Текущий статус: Feature 01, Feature 02, Stage 02.5 и Feature 03 реализованы в текущем worktree. Перед Feature 04 изменения Feature 03 нужно проверить и отдельно зафиксировать. Feature 04 не реализована.
 
 ## Фича 1: алиасы (реализовано)
 
@@ -61,9 +61,11 @@ Selector failure не должен ломать summary, /compare не начи�
 
 Файл: [04 Casino Slots.md](Features/04%20Casino%20Slots.md)
 
+Готовый standalone prompt: [04 Casino Slots Implementation Prompt.md](Prompts/04%20Casino%20Slots%20Implementation%20Prompt.md)
+
 ```text
-Реализуй фичу по спецификации relay-assistant-bot-doc/Features/04 Casino Slots.md.
-Фича 03 Joke Points and Leaderboard должна быть уже реализована. Сначала изучи AGENTS.md, storage.py и bot.py.
-Добавь только виртуальное казино со ставкой 10, нативной Telegram-анимацией 🎰, атомарным списанием/расчётом/возвратом и восстановлением pending-спинов. Не меняй правила начисления очков. Если Feature 02 уже есть в ветке, расширь её schema/allowlist intent-ом `casino`; иначе оставь только `/casino` и явно укажи отложенную интеграцию.
-Не читай .env и data/. Проверь конкурентные списания, недостаток баланса, сбой отправки и таблицу выплат. В финале опиши точную таблицу соответствия Dice value и выплат.
+Реализуй Feature 04 только по standalone prompt relay-assistant-bot-doc/Prompts/04 Casino Slots Implementation Prompt.md.
+Сначала проверь и отдельно зафиксируй Feature 03; не смешивай casino с её незавершёнными изменениями. Выполни три PR-ready этапа: Domain/Storage, Slash Lifecycle/Recovery, Addressed Intent.
+Используй stake 10, mapping telegram_slots_base4_v1, payouts 0/5/50/250, RTP 90.625%, void/refund для неизвестного Telegram outcome и текущие balances для Топ балансов.
+Не читай .env и data/. Не добавляй деньги, платежи, transfers, arbitrary delta API или второй GPU lock. Покрой все 64 Dice values, transaction races, startup recovery и mocked Telegram lifecycle.
 ```

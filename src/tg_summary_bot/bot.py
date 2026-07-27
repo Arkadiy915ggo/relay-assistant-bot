@@ -28,6 +28,7 @@ from tg_summary_bot.intent_router import (
     IntentRouterProtocol,
     is_joke_request,
 )
+from tg_summary_bot.joke_awards import JokeSelector
 from tg_summary_bot.llm import build_llm_client
 from tg_summary_bot.memory import ChatMemory, MemoryCompressionError, participant_key, should_use_memory
 from tg_summary_bot.meme_generator import MemeGenerator
@@ -38,7 +39,7 @@ from tg_summary_bot.observability import (
     update_opik_span_metadata,
 )
 from tg_summary_bot.periods import format_period, parse_period
-from tg_summary_bot.storage import MessageStore, StoredImage, StoredVideo
+from tg_summary_bot.storage import MessageStore, PointBalance, StoredImage, StoredVideo
 from tg_summary_bot.summarizer import Summarizer
 from tg_summary_bot.transcriber import FasterWhisperTranscriber
 from tg_summary_bot.transcript_formatter import TranscriptFormatter
@@ -512,6 +513,71 @@ def should_generate_surprise_meme(
     )
 
 
+def render_best_joke_section(
+    *,
+    winner_name: str | None = None,
+    winner_text: str | None = None,
+    award_status: str | None = None,
+) -> str:
+    if not winner_name or winner_text is None:
+        return "Лучшая шутка: Не нашлось."
+    quote = winner_text[:1000]
+    line = f"Лучшая шутка: {winner_name}: «{quote}»"
+    if award_status == "awarded":
+        return line + " (+10 очков)"
+    if award_status == "already_awarded":
+        return line + "\nУже была награждена; +0."
+    return "Лучшая шутка: не удалось определить; очки не начислены."
+
+
+def render_leaderboard(balances: list[PointBalance]) -> str:
+    if not balances:
+        return "Топ шуток: наград пока нет."
+    return "Топ шуток:\n" + "\n".join(
+        f"{index}. {balance.participant_name} - {balance.balance}"
+        for index, balance in enumerate(balances, start=1)
+    )
+
+
+async def refresh_pinned_leaderboard(
+    *,
+    bot: Bot,
+    store: MessageStore,
+    source_message: Message,
+) -> None:
+    """Best-effort refresh; leaderboard delivery never affects an awarded transaction."""
+    chat_id = source_message.chat.id
+    text = render_leaderboard(await store.get_top_point_balances(chat_id=chat_id, limit=10))
+    pinned = await store.get_pinned_leaderboard(chat_id=chat_id)
+    message_id: int | None = pinned.message_id if pinned else None
+    if message_id is not None:
+        try:
+            await bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=message_id,
+                text=telegram_html(text),
+                parse_mode="HTML",
+            )
+        except Exception:  # noqa: BLE001
+            logging.warning("Pinned leaderboard edit failed chat_id=%s", chat_id, exc_info=True)
+            try:
+                await store.delete_pinned_leaderboard(chat_id=chat_id)
+            except Exception:  # noqa: BLE001
+                logging.warning("Pinned leaderboard state cleanup failed chat_id=%s", chat_id, exc_info=True)
+            message_id = None
+    if message_id is None:
+        response = await answer_logged(source_message, text)
+        message_id = response.message_id
+        try:
+            await store.save_pinned_leaderboard(chat_id=chat_id, message_id=message_id)
+        except Exception:  # noqa: BLE001
+            logging.warning("Pinned leaderboard state save failed chat_id=%s", chat_id, exc_info=True)
+    try:
+        await bot.pin_chat_message(chat_id=chat_id, message_id=message_id, disable_notification=True)
+    except Exception:  # noqa: BLE001
+        logging.warning("Pinned leaderboard pin failed chat_id=%s", chat_id, exc_info=True)
+
+
 def log_bot_response(
     *,
     action: str,
@@ -583,6 +649,7 @@ async def create_dispatcher(
     transcript_formatter: TranscriptFormatter | None,
     gpu_lock: asyncio.Lock,
     intent_router: IntentRouterProtocol,
+    joke_selector: JokeSelector | None = None,
 ) -> Dispatcher:
     dp = Dispatcher()
     bot_identity: tuple[int | None, str | None] | None = None
@@ -708,6 +775,8 @@ async def create_dispatcher(
             "`/summary 6h` - last 6 hours\n"
             "`/summary 7d` - last 7 days\n"
             "`/summary today` - today in UTC\n"
+            "`/balance` - your joke points in this chat\n"
+            "`/top` - top joke points in this chat\n"
             "`/question 24h <text>` - chat with the assistant using recent context\n"
             "`/alias add <name[, name]>` - add chat names for the bot\n"
             "`/alias list` - show configured bot names\n"
@@ -806,6 +875,8 @@ async def create_dispatcher(
         count = await store.count_messages(message.chat.id)
         image_count = await store.count_images(message.chat.id)
         video_count = await store.count_videos(message.chat.id)
+        leaders = await store.get_top_point_balances(chat_id=message.chat.id, limit=1)
+        leader = f"{leaders[0].participant_name}: {leaders[0].balance}" if leaders else "none"
         await answer_logged(
             message,
             f"chat_id: `{message.chat.id}`\n"
@@ -849,8 +920,30 @@ async def create_dispatcher(
             f"transcription_format_num_predict: `{settings.transcription_format_num_predict}`\n"
             f"max_transcription_format_chars: `{settings.max_transcription_format_chars}`\n"
             f"max_transcription_chars: `{settings.max_transcription_chars}`\n"
+            f"leader: `{leader}`\n"
             f"access_allowed: `{is_allowed(settings, message.chat.id)}`"
         )
+
+    @dp.message(Command("balance"))
+    async def balance_command(message: Message) -> None:
+        if not is_allowed(settings, message.chat.id):
+            return
+        if not message.from_user:
+            await answer_logged(message, "Не удалось определить участника.")
+            return
+        key, name = participant_ref(message)
+        balance = await store.get_point_balance(chat_id=message.chat.id, participant_key=key)
+        await answer_logged(message, f"Баланс {name}: `{balance.balance if balance else 0}` очков.")
+
+    @dp.message(Command("top"))
+    async def top_command(message: Message) -> None:
+        if not is_allowed(settings, message.chat.id):
+            return
+        balances = await store.get_top_point_balances(chat_id=message.chat.id, limit=10)
+        if not balances:
+            await answer_logged(message, "Наград за шутки пока нет.")
+            return
+        await answer_logged(message, render_leaderboard(balances))
 
     @dp.message(Command("memory"))
     async def memory_command(message: Message) -> None:
@@ -1024,6 +1117,7 @@ async def create_dispatcher(
 
     async def run_summary(
         message: Message,
+        bot: Bot,
         period_raw: str,
         *,
         exclude_message_id: int | None = None,
@@ -1041,9 +1135,13 @@ async def create_dispatcher(
                 response_message_id=response.message_id,
             )
 
-        wait_message = await answer_logged(message, "Collecting messages and building summary...")
         now = datetime.now(timezone.utc)
         since = now - period
+        snapshot_boundary = await store.get_eligible_snapshot_boundary(
+            chat_id=message.chat.id,
+            since=since,
+        )
+        wait_message = await answer_logged(message, "Collecting messages and building summary...")
         use_memory = should_use_memory(period, chat_memory)
         raw_since = chat_memory.recent_since(now) if use_memory and chat_memory else since
         if raw_since < since:
@@ -1128,12 +1226,77 @@ async def create_dispatcher(
             time.perf_counter() - started,
         )
 
+        joke_section = "Лучшая шутка: не удалось определить; очки не начислены."
+        selector_status = "not_started"
+        award_status: str | None = None
+        leaderboard_needs_refresh = False
+        if snapshot_boundary is None:
+            joke_section = render_best_joke_section()
+            selector_status = "no_eligible_messages"
+        elif joke_selector:
+            try:
+                # This is deliberately a second lock phase: summary unload completed above.
+                async with gpu_lock:
+                    try:
+                        selection = await joke_selector.choose(
+                            store,
+                            chat_id=message.chat.id,
+                            since=since,
+                            boundary=snapshot_boundary,
+                            exclude_message_id=exclude_message_id,
+                        )
+                    finally:
+                        await joke_selector.unload()
+                selector_status = selection.status
+                if selection.status == "none":
+                    joke_section = render_best_joke_section()
+                elif selection.status == "selected" and selection.winner:
+                    try:
+                        award = await store.award_unique_joke(
+                            chat_id=message.chat.id,
+                            source_message_id=selection.winner.message_id,
+                        )
+                    except Exception:  # noqa: BLE001
+                        logging.exception("Joke award persistence failed chat_id=%s", message.chat.id)
+                    else:
+                        award_status = award.status
+                        leaderboard_needs_refresh = award.status == "awarded"
+                        if award.status in {"awarded", "already_awarded"}:
+                            joke_section = render_best_joke_section(
+                                winner_name=selection.winner.sender_name,
+                                winner_text=selection.winner.text,
+                                award_status=award.status,
+                            )
+            except Exception:  # noqa: BLE001
+                selector_status = "error"
+                logging.exception("Joke selection failed chat_id=%s", message.chat.id)
+        update_opik_span_metadata(
+            {
+                "joke_snapshot_boundary": (
+                    f"{snapshot_boundary.created_at}:{snapshot_boundary.message_id}"
+                    if snapshot_boundary
+                    else None
+                ),
+                "joke_selector_status": selector_status,
+                "joke_award_status": award_status,
+            }
+        )
+
         header = f"**Саммари за {format_period(period_raw)}**\n"
-        text = header + summary
+        text = header + summary + "\n\n" + joke_section
         parts = split_telegram_text(text)
         await edit_text_logged(wait_message, parts[0], source_message=message)
         for part in parts[1:]:
             await answer_logged(message, part)
+        if leaderboard_needs_refresh:
+            try:
+                await refresh_pinned_leaderboard(
+                    bot=bot,
+                    store=store,
+                    source_message=message,
+                )
+            except Exception:  # noqa: BLE001
+                logging.exception("Pinned leaderboard refresh failed chat_id=%s", message.chat.id)
         schedule_profile_refresh(message.chat.id, now=now)
         return OperationOutcome(
             "summary",
@@ -1143,13 +1306,14 @@ async def create_dispatcher(
         )
 
     @dp.message(Command("summary"))
-    async def summary_command(message: Message) -> None:
+    async def summary_command(message: Message, bot: Bot) -> None:
         args = (message.text or "").split(maxsplit=1)
         await execute_slash_operation(
             message,
             "summary",
             run_summary(
                 message,
+                bot,
                 args[1].strip() if len(args) > 1 else settings.default_summary_period,
             ),
         )
@@ -1292,11 +1456,13 @@ async def create_dispatcher(
         await edit_text_logged(wait_message, parts[0], source_message=message)
         for part in parts[1:]:
             await answer_logged(message, part)
+        persisted = await try_save_final_assistant_answer(settings, store, wait_message, text)
         schedule_profile_refresh(message.chat.id, now=now)
         return OperationOutcome(
             "question",
-            "succeeded",
-            "ok",
+            "succeeded" if persisted else "partial",
+            "ok" if persisted else "context_persistence_failed",
+            persisted=persisted,
             response_message_id=wait_message.message_id,
         )
 
@@ -1411,6 +1577,7 @@ async def create_dispatcher(
                 "summary",
                 run_summary(
                     message,
+                    bot,
                     route.period or settings.default_summary_period,
                     exclude_message_id=message.message_id,
                 ),
@@ -1565,6 +1732,8 @@ async def create_dispatcher(
                 wait_message if routed else message,
                 f"Wikipedia search for {search_query}: {text}",
                 limit_chars=settings.max_transcription_chars,
+                origin="generated",
+                kind="wiki_result",
             )
             text = text + f"\n\n{generated_context_note(persisted)}"
         parts = split_telegram_text(text)
@@ -1673,6 +1842,8 @@ async def create_dispatcher(
             store,
             wait_message if routed else message,
             saved_text,
+            origin="generated",
+            kind="image_recognition",
         )
         text = (
             f"**Image recognition for message #{image.message_id}**\n"
@@ -1882,6 +2053,8 @@ async def create_dispatcher(
                 wait_message if wait_message else save_target_message,
                 saved_text,
                 limit_chars=settings.max_transcription_chars,
+                origin="generated",
+                kind="video_recognition",
             )
             text = (
                 f"**Video recognition for message #{video.message_id}**\n"
@@ -2017,6 +2190,8 @@ async def create_dispatcher(
             wait_message if routed else save_target_message,
             saved_text,
             limit_chars=settings.max_transcription_chars,
+            origin="generated",
+            kind="video_recognition",
         )
         text = (
             f"**Video recognition for message #{video.message_id}**\n"
@@ -2168,6 +2343,8 @@ async def create_dispatcher(
             wait_message,
             saved_text,
             limit_chars=settings.max_transcription_chars,
+            origin="generated",
+            kind="youtube_recognition",
         )
         text = (
             f"**YouTube video recognition: {downloaded.title}**\n"
@@ -2381,6 +2558,8 @@ async def create_dispatcher(
             f"🎙 Voice message from {voice_sender_name}: {formatted}",
             limit_chars=settings.max_transcription_chars,
             replace_existing=True,
+            origin="incoming",
+            kind="voice_transcript",
         )
         format_elapsed = time.perf_counter() - started
         text = (
@@ -2493,6 +2672,8 @@ async def create_dispatcher(
             saved_text,
             limit_chars=settings.max_transcription_chars,
             replace_existing=replace_existing,
+            origin="incoming",
+            kind="voice_transcript",
         )
         elapsed = time.perf_counter() - started
         persistence_text = (
@@ -2712,7 +2893,14 @@ async def save_incoming_message(settings: Settings, store: MessageStore, message
     text = message_text(message)
     if not text:
         return
-    await save_message_text(settings, store, message, text)
+    await save_message_text(
+        settings,
+        store,
+        message,
+        text,
+        origin="incoming",
+        kind="caption" if message.caption else "text",
+    )
 
 
 async def save_incoming_image(settings: Settings, store: MessageStore, message: Message) -> None:
@@ -2774,6 +2962,8 @@ async def save_message_text(
     *,
     limit_chars: int | None = None,
     replace_existing: bool = False,
+    origin: str = "legacy",
+    kind: str = "legacy_unclassified",
 ) -> None:
     limit = settings.max_message_chars if limit_chars is None else limit_chars
     text = " ".join(text.split())[:limit]
@@ -2791,6 +2981,8 @@ async def save_message_text(
             if message.reply_to_message
             else None
         ),
+        origin=origin,
+        kind=kind,
         replace=replace_existing,
     )
 
@@ -2803,6 +2995,8 @@ async def try_save_generated_context(
     *,
     limit_chars: int | None = None,
     replace_existing: bool = False,
+    origin: str = "generated",
+    kind: str = "generated_context",
 ) -> bool:
     try:
         await save_message_text(
@@ -2812,12 +3006,39 @@ async def try_save_generated_context(
             text,
             limit_chars=limit_chars,
             replace_existing=replace_existing,
+            origin=origin,
+            kind=kind,
         )
     except Exception:  # noqa: BLE001
         logging.exception(
             "Generated context persistence failed chat_id=%s message_id=%s",
             message.chat.id,
             message.message_id,
+        )
+        return False
+    return True
+
+
+async def try_save_final_assistant_answer(
+    settings: Settings,
+    store: MessageStore,
+    response_message: Message,
+    text: str,
+) -> bool:
+    try:
+        await save_message_text(
+            settings,
+            store,
+            response_message,
+            text,
+            origin="assistant",
+            kind="assistant_answer",
+        )
+    except Exception:  # noqa: BLE001
+        logging.exception(
+            "Assistant answer persistence failed chat_id=%s message_id=%s",
+            response_message.chat.id,
+            response_message.message_id,
         )
         return False
     return True
@@ -2996,6 +3217,14 @@ async def main() -> None:
     )
     summarizer = Summarizer(llm, settings.chunk_chars)
     chat_assistant = ChatAssistant(question_llm, settings.chunk_chars)
+    joke_selector = JokeSelector(
+        build_llm_client(
+            settings,
+            model=settings.question_model or None,
+            num_ctx=4096,
+            num_predict=160,
+        )
+    )
     intent_router = IntentRouter(router_llm)
     chat_memory = ChatMemory(store, llm, settings) if settings.memory_enabled else None
     transcript_formatter_llm = (
@@ -3046,6 +3275,7 @@ async def main() -> None:
         transcript_formatter,
         gpu_lock,
         intent_router,
+        joke_selector,
     )
 
     logging.info("Bot started with LLM provider: %s", settings.resolved_llm_provider)

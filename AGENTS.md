@@ -75,6 +75,8 @@ Current focused tests:
 
 - `/start`, `/help`: describe bot commands and current chat id.
 - `/stats`: show chat id, stored counts, provider/model settings, and media/transcription settings.
+- `/balance`: show the command author's joke-point balance in the current chat.
+- `/top`: show up to ten positive joke-point balances in deterministic order.
 - `/summary [period]`: summarize stored messages for the period; default comes from `DEFAULT_SUMMARY_PERIOD`.
 - `/question [period] <text>`: answer using stored chat context when relevant.
 - `/memory`: show compressed chat memory status; `/memory rebuild` resets memory blocks/state so they can be rebuilt from stored raw messages.
@@ -89,12 +91,16 @@ Current focused tests:
 SQLite tables are initialized in `MessageStore.init()`:
 
 - `messages`: primary key `(chat_id, message_id)`, stores normalized text/captions/transcripts/OCR results with UTC `created_at` and optional `reply_to_message_id`.
+- `messages.origin`/`messages.kind`: explicit provenance. Only `incoming/text`, `incoming/caption`, `incoming/voice_transcript`, and `assistant/assistant_answer` are eligible Joke Points sources; migrated legacy rows remain ineligible.
 - `images`: primary key `(chat_id, message_id)`, stores Telegram `file_id` and metadata for later manual recognition.
 - `videos`: primary key `(chat_id, message_id)`, stores Telegram `file_id`, duration, size, and metadata for later manual recognition.
 - `video_recognitions`: primary key `(chat_id, message_id, cache_key)`, caches expensive video recognition results by prompt/model/frame/audio settings.
 - `chat_memory_blocks`: optional long-term structured memory blocks with period bounds, summary, topics, keywords, message count, structured JSON, and hierarchy level.
 - `chat_memory_state`: tracks the latest processed message timestamp per chat for memory compression.
 - `chat_participant_facts`: source-backed participant profile facts with type, confidence, status, source message ids, and optional expiration.
+- `chat_point_ledger`: append-only `best_joke` award entries, unique per chat/source message.
+- `chat_point_balances`: chat-scoped balance projection used by `/balance`, `/top`, and `/stats` leader.
+- `chat_pinned_leaderboards`: the chat-scoped Telegram `message_id` used for best-effort leaderboard edits and pinning.
 
 ## Important Behavior
 
@@ -107,10 +113,13 @@ SQLite tables are initialized in `MessageStore.init()`:
 - Voice/audio messages are transcribed only when `TRANSCRIBE_VOICE=true` and voice dependencies are installed. Optional transcript formatting runs after the raw Whisper response is already sent.
 - Video recognition can include audio transcription when `VIDEO_TRANSCRIBE_AUDIO=true` and a transcriber is configured.
 - Long summaries/questions are chunked before model calls; final summaries merge partials.
+- `/summary` takes an eligible raw snapshot, then runs a strict joke selector in a second acquisition of the existing shared `gpu_lock`; awards are committed atomically only after that lock is released. `/compare` never selects or awards jokes.
+- After a new joke award, the bot best-effort edits a chat-scoped `Топ шуток` message and tries to pin it. Deleted leaderboard messages are recreated; missing pin permission does not affect the committed award.
 - Mentioning the bot in a message triggers the same contextual answer flow as `/question` using the default period.
 - Wiki/image/video/YouTube context persistence is best effort: a completed result is still sent with a safe partial-success warning if SQLite persistence fails.
 - A surprise meme has a fixed 2% chance only for a valid routed joke question with an image in the current or replied message.
 - Telegram responses are split below the Telegram message limit by `split_telegram_text()`.
+- Feature 04 is not implemented: there is no casino intent, betting, payout/refund, transfer, purchase, or real-money behavior.
 
 ## Configuration
 
