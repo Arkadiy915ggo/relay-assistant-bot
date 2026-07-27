@@ -133,7 +133,9 @@ Then add the bot to the target chat.
 
 ## Access Control
 
-The first run can use an empty `ALLOWED_CHAT_IDS` to discover the target `chat_id`:
+`/stats` intentionally bypasses `ALLOWED_CHAT_IDS` so it can be used to discover a target `chat_id`. Its response includes `access_allowed: true|false`; this exception does not allow message storage, routed actions, or other commands in a denied chat.
+
+You may keep the normal allowlist configured while discovering another chat. An empty value still allows all chats and can be used for an unrestricted first run:
 
 ```env
 ALLOWED_CHAT_IDS=
@@ -152,6 +154,7 @@ chat_id: -1001234567890
 chat_type: supergroup
 saved_messages: 42
 llm_provider: openai
+access_allowed: false
 ```
 
 After that, restrict access:
@@ -207,7 +210,12 @@ Any chat participant can configure names that address the bot without using its 
 ```
 
 Aliases are local to a chat. The bot recognizes them in ordinary text and image/video captions,
-including a single typo for names with five or more characters.
+including a single insertion, deletion, or replacement for names whose normalized token length is at
+least five characters. A multi-token alias allows one typo in total, not one typo per word. Short
+aliases require an exact match.
+
+Allowing every participant in an allowed chat to manage aliases is the accepted current policy. An
+optional admin-only toggle may be added in the future, but no such setting or restriction exists now.
 
 ## Addressed Actions
 
@@ -224,6 +232,25 @@ The router accepts only a fixed action set: contextual question, summary, Wikipe
 recognition, meme, video recognition, replied voice/audio transcription, and profile display.
 Slash commands and channel posts are not routed. For image/video/meme actions, a matching reply has
 priority, then media in the addressed message, and only then the latest indexed media.
+
+If a routed Wikipedia intent has no search query, the bot asks what to search instead of silently
+falling back to a contextual question. Requests to joke remain normal questions, not meme commands.
+A surprise meme has an explicit 2% chance only after a valid `question` route, an explicit joke
+request, and an image in the current or replied message; router failures and the latest unrelated
+chat image cannot trigger it.
+
+## Operation Results And Persistence
+
+Summary, question, Wikipedia, image, video, and profile operations produce structured terminal
+outcomes for logs: `succeeded`, `rejected`, `partial`, or `failed`, with a stable reason and no raw
+query or transcript in the operation event. Slash and naturally routed calls use the same operation
+logic.
+
+Wikipedia, image, Telegram video, and YouTube results use best-effort context persistence. The bot
+shows `Saved for summaries.` only after the SQLite write succeeds. If generation succeeded but the
+write fails, the useful result is still sent with a safe warning and the operation is recorded as
+partial; private database error details are not shown. A video cache write failure is handled the
+same way and does not discard an already generated recognition result.
 
 ## Wikipedia Search
 
@@ -243,7 +270,7 @@ WIKI_MAX_RESULTS=3
 WIKI_USER_AGENT=telegram-summary-bot/0.1 (https://github.com/Arkadiy915ggo/relay-assistant-bot)
 ```
 
-`/wiki` returns short article extracts with source links and saves successful results as normal stored messages, so future `/summary` and `/question` calls can use them as chat context. This is not a full web search engine; it only uses the selected Wikipedia language edition.
+`/wiki` returns short article extracts with source links and attempts to save successful results as normal stored messages, so future `/summary` and `/question` calls can use them as chat context when the write succeeds. This is not a full web search engine; it only uses the selected Wikipedia language edition.
 
 ## Chat Memory
 
@@ -444,7 +471,7 @@ Behavior:
 - If `/image` is sent without a reply, the bot recognizes the latest indexed image in the chat.
 - `/ocr` is an alias for `/image`.
 - `/meme` uses the replied image or the latest indexed image, asks the vision model for a short safe Russian joke, renders classic top/bottom meme text with Pillow, sends the resulting image, and deletes temporary files.
-- `/image` and `/ocr` results are saved as normal stored messages, so future `/summary` and `/question` calls can use them. `/meme` does not save generated images in SQLite.
+- `/image` and `/ocr` results are saved as normal stored messages when the SQLite write succeeds, so future `/summary` and `/question` calls can use them. `/meme` does not save generated images in SQLite.
 
 The image response format is:
 
@@ -506,7 +533,7 @@ Behavior:
 - Videos over `MAX_VIDEO_SIZE_MB` are rejected before recognition. If `TELEGRAM_DOWNLOAD_LIMIT_MB` is positive, it is also used as an early cutoff; otherwise the bot attempts the download and reports Telegram's real `file is too big` response if it happens.
 - The bot downloads the video, extracts key frames with `ffmpeg`, sends those frames to `VIDEO_RECOGNITION_MODEL`, optionally extracts/transcribes the audio track when `VIDEO_TRANSCRIBE_AUDIO=true`, unloads the model after the task, and deletes temporary files.
 - Repeated `/video` calls for the same Telegram message and settings use a SQLite cache instead of rerunning `ffmpeg` and Ollama. YouTube downloads are not cached in v1.
-- The result is saved as a normal stored message, so future `/summary` and `/question` calls can use it.
+- The result is saved as a normal stored message when the SQLite write succeeds, so future `/summary` and `/question` calls can use it.
 
 The video response format is:
 

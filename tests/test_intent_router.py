@@ -1,9 +1,20 @@
 import asyncio
 import unittest
 
+import tg_summary_bot.bot as bot_module
 import tg_summary_bot.intent_router as intent_router
-from tg_summary_bot.intent_router import IntentRouter, is_joke_request, parse_route_response
-from tg_summary_bot.bot import route_under_gpu_lock
+from tg_summary_bot.intent_router import (
+    IntentRoute,
+    IntentRouter,
+    infer_profile_query,
+    is_joke_request,
+    parse_route_response,
+)
+from tg_summary_bot.bot import (
+    has_bot_command_entity,
+    route_under_gpu_lock,
+    should_generate_surprise_meme,
+)
 
 
 class FakeLLM:
@@ -28,6 +39,7 @@ class IntentRouteParserTests(unittest.TestCase):
         self.assertTrue(is_joke_request("пошути, пожалуйста"))
         self.assertTrue(is_joke_request("расскажи шутку"))
         self.assertFalse(is_joke_request("сделай мем"))
+
     def test_accepts_valid_object_and_ignores_extra_keys(self) -> None:
         route = parse_route_response('{"action":"summary","period":"6h","query":null,"extra":1}')
         self.assertTrue(route.valid)
@@ -43,6 +55,15 @@ class IntentRouteParserTests(unittest.TestCase):
         ):
             with self.subTest(value=value):
                 self.assertFalse(parse_route_response(value).valid)
+
+    def test_missing_wiki_query_has_a_stable_reason(self) -> None:
+        route = parse_route_response('{"action":"wiki","period":null,"query":""}')
+        self.assertFalse(route.valid)
+        self.assertEqual(route.reason, "missing_wiki_query")
+
+    def test_infers_named_profile_target_but_not_self_profile(self) -> None:
+        self.assertEqual(infer_profile_query("покажи профиль Артёма"), "Артёма")
+        self.assertIsNone(infer_profile_query("покажи мой профиль"))
 
     def test_rejects_unknown_action_and_wrong_types(self) -> None:
         for value in (
@@ -89,6 +110,22 @@ class IntentRouterTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(route.valid)
         self.assertEqual(route.action, "meme")
 
+    async def test_rejects_profile_route_without_an_explicit_profile_request(self) -> None:
+        router = IntentRouter(FakeLLM('{"action":"profile_show","period":null,"query":null}'))  # type: ignore[arg-type]
+        route = await router.route("расскажи про себя, какая ты модель?")
+        self.assertFalse(route.valid)
+        self.assertEqual(route.reason, "profile_not_explicit")
+
+    async def test_accepts_explicit_profile_request(self) -> None:
+        router = IntentRouter(FakeLLM('{"action":"profile_show","period":null,"query":null}'))  # type: ignore[arg-type]
+        route = await router.route("покажи профиль Артёма")
+        self.assertTrue(route.valid)
+        self.assertEqual(route.action, "profile_show")
+        self.assertEqual(route.query, "Артёма")
+
+    def test_production_router_constructor_is_imported(self) -> None:
+        self.assertIs(bot_module.IntentRouter, IntentRouter)
+
     async def test_timeout_becomes_fallback(self) -> None:
         class SlowLLM(FakeLLM):
             async def complete(self, **kwargs: object) -> str:
@@ -123,3 +160,86 @@ class IntentRouterTests(unittest.IsolatedAsyncioTestCase):
         events.append("action" if not lock.locked() else "action_locked")
         self.assertEqual(route.action, "summary")
         self.assertEqual(events, ["route", "unload", "action"])
+
+
+class SurpriseMemePolicyTests(unittest.TestCase):
+    def test_only_valid_question_can_trigger_surprise_meme(self) -> None:
+        valid_question = parse_route_response(
+            '{"action":"question","period":null,"query":null}'
+        )
+        self.assertTrue(
+            should_generate_surprise_meme(
+                route=valid_question,
+                request="расскажи шутку",
+                has_image=True,
+                random_value=0.0,
+            )
+        )
+        for route in (
+            intent_router.fallback_route("invalid_json"),
+            intent_router.fallback_route("meme_not_explicit"),
+            parse_route_response('{"action":"none","period":null,"query":null}'),
+            parse_route_response('{"action":"meme","period":null,"query":null}'),
+        ):
+            with self.subTest(route=route):
+                self.assertFalse(
+                    should_generate_surprise_meme(
+                        route=route,
+                        request="расскажи шутку",
+                        has_image=True,
+                        random_value=0.0,
+                    )
+                )
+
+        self.assertFalse(
+            should_generate_surprise_meme(
+                route=IntentRoute(action="question", valid=True, reason="custom"),
+                request="пошути",
+                has_image=True,
+                random_value=0.0,
+            )
+        )
+
+    def test_requires_joke_image_and_probability(self) -> None:
+        route = parse_route_response('{"action":"question","period":null,"query":null}')
+        self.assertFalse(
+            should_generate_surprise_meme(
+                route=route,
+                request="ответь на вопрос",
+                has_image=True,
+                random_value=0.0,
+            )
+        )
+        self.assertFalse(
+            should_generate_surprise_meme(
+                route=route,
+                request="пошути",
+                has_image=False,
+                random_value=0.0,
+            )
+        )
+        self.assertFalse(
+            should_generate_surprise_meme(
+                route=route,
+                request="пошути",
+                has_image=True,
+                random_value=0.5,
+            )
+        )
+
+
+class BotCommandEntityTests(unittest.TestCase):
+    def test_detects_commands_in_text_and_media_captions(self) -> None:
+        entity = type("Entity", (), {"type": "bot_command"})()
+        text_message = type(
+            "TextMessage",
+            (),
+            {"text": "/image", "entities": [entity], "caption_entities": None},
+        )()
+        caption_message = type(
+            "CaptionMessage",
+            (),
+            {"text": None, "entities": None, "caption_entities": [entity]},
+        )()
+        self.assertTrue(has_bot_command_entity(text_message))  # type: ignore[arg-type]
+        self.assertTrue(has_bot_command_entity(caption_message))  # type: ignore[arg-type]

@@ -8,6 +8,7 @@ import mimetypes
 import random
 import re
 import time
+from collections.abc import Awaitable
 from datetime import datetime, timezone
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -21,11 +22,21 @@ from tg_summary_bot.addressing import remove_aliases_from_text, split_aliases
 from tg_summary_bot.assistant import ChatAssistant
 from tg_summary_bot.config import Settings, load_settings
 from tg_summary_bot.image_recognizer import ImageRecognizer
-from tg_summary_bot.intent_router import IntentRoute, IntentRouter, is_joke_request
+from tg_summary_bot.intent_router import (
+    IntentRoute,
+    IntentRouter,
+    IntentRouterProtocol,
+    is_joke_request,
+)
 from tg_summary_bot.llm import build_llm_client
 from tg_summary_bot.memory import ChatMemory, MemoryCompressionError, participant_key, should_use_memory
 from tg_summary_bot.meme_generator import MemeGenerator
-from tg_summary_bot.observability import opik_track, update_opik_span_metadata
+from tg_summary_bot.observability import (
+    OperationOutcome,
+    log_operation_outcome,
+    opik_track,
+    update_opik_span_metadata,
+)
 from tg_summary_bot.periods import format_period, parse_period
 from tg_summary_bot.storage import MessageStore, StoredImage, StoredVideo
 from tg_summary_bot.summarizer import Summarizer
@@ -57,6 +68,15 @@ def telegram_html(text: str) -> str:
 
 def is_allowed(settings: Settings, chat_id: int) -> bool:
     return not settings.allowed_chat_ids or chat_id in settings.allowed_chat_ids
+
+
+def resolved_intent_router_model(settings: Settings) -> str:
+    fallback = (
+        settings.ollama_model
+        if settings.resolved_llm_provider == "ollama"
+        else settings.openai_model
+    )
+    return settings.intent_router_model or settings.question_model or fallback
 
 
 def message_text(message: Message) -> str:
@@ -387,6 +407,11 @@ def entity_type_name(entity: object) -> str:
     return str(getattr(entity, "type", "")).lower().split(".")[-1]
 
 
+def has_bot_command_entity(message: Message) -> bool:
+    entities = message.entities if message.text else message.caption_entities
+    return any(entity_type_name(entity) == "bot_command" for entity in entities or [])
+
+
 def extract_addressed_request(
     message: Message,
     *,
@@ -458,7 +483,7 @@ def command_name(message: Message | None) -> str | None:
 
 
 async def route_under_gpu_lock(
-    router: IntentRouter,
+    router: IntentRouterProtocol,
     gpu_lock: asyncio.Lock,
     request: str,
 ) -> IntentRoute:
@@ -468,6 +493,23 @@ async def route_under_gpu_lock(
             return await router.route(request)
         finally:
             await router.unload()
+
+
+def should_generate_surprise_meme(
+    *,
+    route: IntentRoute,
+    request: str,
+    has_image: bool,
+    random_value: float,
+) -> bool:
+    return (
+        route.valid
+        and route.action == "question"
+        and route.reason == "ok"
+        and is_joke_request(request)
+        and has_image
+        and random_value < SURPRISE_MEME_CHANCE
+    )
 
 
 def log_bot_response(
@@ -540,11 +582,92 @@ async def create_dispatcher(
     transcriber: FasterWhisperTranscriber | None,
     transcript_formatter: TranscriptFormatter | None,
     gpu_lock: asyncio.Lock,
-    intent_router: IntentRouter,
+    intent_router: IntentRouterProtocol,
 ) -> Dispatcher:
     dp = Dispatcher()
     bot_identity: tuple[int | None, str | None] | None = None
     profile_refresh_tasks: set[asyncio.Task[None]] = set()
+
+    async def execute_routed_operation(
+        message: Message,
+        route: IntentRoute,
+        operation: str,
+        action: Awaitable[OperationOutcome | None],
+        *,
+        started: float,
+    ) -> None:
+        try:
+            result = await action
+        except Exception as exc:
+            outcome = OperationOutcome(
+                operation=operation,
+                status="failed",
+                reason="unhandled_exception",
+            )
+            log_operation_outcome(
+                outcome,
+                chat_id=message.chat.id,
+                message_id=message.message_id,
+                invocation="routed",
+                route_action=route.action,
+                route_reason=route.reason,
+                elapsed_seconds=time.perf_counter() - started,
+                provider=settings.resolved_llm_provider,
+                model=resolved_intent_router_model(settings),
+            )
+            logging.exception(
+                "Routed operation failed operation=%s exception_type=%s",
+                operation,
+                type(exc).__name__,
+            )
+            raise
+        outcome = result or OperationOutcome(
+            operation=operation,
+            status="succeeded",
+            reason="completed",
+        )
+        log_operation_outcome(
+            outcome,
+            chat_id=message.chat.id,
+            message_id=message.message_id,
+            invocation="routed",
+            route_action=route.action,
+            route_reason=route.reason,
+            elapsed_seconds=time.perf_counter() - started,
+            provider=settings.resolved_llm_provider,
+            model=resolved_intent_router_model(settings),
+        )
+
+    async def execute_slash_operation(
+        message: Message,
+        operation: str,
+        action: Awaitable[OperationOutcome | None],
+    ) -> None:
+        started = time.perf_counter()
+        try:
+            result = await action
+        except Exception as exc:
+            outcome = OperationOutcome(operation, "failed", "unhandled_exception")
+            logging.exception(
+                "Slash operation failed operation=%s exception_type=%s",
+                operation,
+                type(exc).__name__,
+            )
+            log_operation_outcome(
+                outcome,
+                chat_id=message.chat.id,
+                message_id=message.message_id,
+                invocation="slash",
+                elapsed_seconds=time.perf_counter() - started,
+            )
+            raise
+        log_operation_outcome(
+            result or OperationOutcome(operation, "succeeded", "completed"),
+            chat_id=message.chat.id,
+            message_id=message.message_id,
+            invocation="slash",
+            elapsed_seconds=time.perf_counter() - started,
+        )
 
     async def refresh_recent_profile_facts(chat_id: int, *, now: datetime) -> None:
         if not chat_memory:
@@ -588,7 +711,7 @@ async def create_dispatcher(
             "`/question 24h <text>` - chat with the assistant using recent context\n"
             "`/alias add <name[, name]>` - add chat names for the bot\n"
             "`/alias list` - show configured bot names\n"
-            "`/alias remove <name>` - remove a bot name (admins only)\n"
+            "`/alias remove <name>` - remove a bot name\n"
             "`/wiki <text>` - search Wikipedia and save the result for chat context\n"
             "`/memory` - compressed chat memory status; `/memory rebuild` resets blocks\n"
             "`/profile [name]` - show your, replied, or named participant profile\n"
@@ -773,13 +896,20 @@ async def create_dispatcher(
     @dp.message(Command("profile"))
     async def profile_command(message: Message) -> None:
         if not is_allowed(settings, message.chat.id):
-            return
-        if not chat_memory:
-            await answer_logged(message, "Chat memory is disabled: `MEMORY_ENABLED=false`.")
+            log_operation_outcome(
+                OperationOutcome("profile_show", "rejected", "access_denied"),
+                chat_id=message.chat.id,
+                message_id=message.message_id,
+                invocation="slash",
+            )
             return
 
         parts = (message.text or "").split(maxsplit=2)
         action = parts[1].lower() if len(parts) > 1 else "show"
+
+        if action in {"forget", "correct"} and not chat_memory:
+            await answer_logged(message, "Chat memory is disabled: `MEMORY_ENABLED=false`.")
+            return
 
         if action == "forget":
             if message.reply_to_message:
@@ -881,56 +1011,35 @@ async def create_dispatcher(
             )
             return
 
-        if action == "show" and len(parts) > 2 and parts[2].strip():
-            text = await chat_memory.profile_text(
-                chat_id=message.chat.id,
-                participant_name=parts[2].strip(),
-            )
-            await answer_logged(message, text)
-            return
-
-        if action not in {"show", "forget", "correct"}:
-            participant_name = " ".join(parts[1:]).strip()
-            text = await chat_memory.profile_text(
-                chat_id=message.chat.id,
-                participant_name=participant_name,
-            )
-            await answer_logged(message, text)
-            return
-
-        if message.reply_to_message:
-            key, _ = participant_ref(message.reply_to_message)
-            text = await chat_memory.profile_text(
-                chat_id=message.chat.id,
-                participant_keys=[key],
-            )
-        else:
-            key, _ = participant_ref(message)
-            text = await chat_memory.profile_text(
-                chat_id=message.chat.id,
-                participant_keys=[key],
-            )
-            if text == "Паспорт участника пока пуст.":
-                text += (
-                    "\n\n`/profile` без reply показывает ваш профиль. "
-                    "Чтобы посмотреть другого участника, ответьте на его сообщение `/profile` "
-                    "или используйте `/profile <name>`."
-                )
-        await answer_logged(message, text)
+        query = (
+            parts[2].strip()
+            if action == "show" and len(parts) > 2
+            else " ".join(parts[1:]).strip() if action not in {"show", "forget", "correct"} else None
+        )
+        await execute_slash_operation(
+            message,
+            "profile_show",
+            run_profile_show(message, query, reply_to_source=False),
+        )
 
     async def run_summary(
         message: Message,
         period_raw: str,
         *,
         exclude_message_id: int | None = None,
-    ) -> None:
+    ) -> OperationOutcome:
         if not is_allowed(settings, message.chat.id):
-            return
+            return OperationOutcome("summary", "rejected", "access_denied")
         try:
             period = parse_period(period_raw)
         except ValueError as exc:
-            await answer_logged(message, f"Could not parse period: {exc}")
-            return
+            response = await answer_logged(message, f"Could not parse period: {exc}")
+            return OperationOutcome(
+                "summary",
+                "rejected",
+                "invalid_period",
+                response_message_id=response.message_id,
+            )
 
         wait_message = await answer_logged(message, "Collecting messages and building summary...")
         now = datetime.now(timezone.utc)
@@ -1006,7 +1115,12 @@ async def create_dispatcher(
                 f"Failed to build summary: `{type(exc).__name__}: {exc}`",
                 source_message=message,
             )
-            return
+            return OperationOutcome(
+                "summary",
+                "failed",
+                "generation_error",
+                response_message_id=wait_message.message_id,
+            )
         logging.info(
             "Summary finished chat_id=%s period=%s elapsed_s=%.1f",
             message.chat.id,
@@ -1021,13 +1135,23 @@ async def create_dispatcher(
         for part in parts[1:]:
             await answer_logged(message, part)
         schedule_profile_refresh(message.chat.id, now=now)
+        return OperationOutcome(
+            "summary",
+            "succeeded",
+            "ok",
+            response_message_id=wait_message.message_id,
+        )
 
     @dp.message(Command("summary"))
     async def summary_command(message: Message) -> None:
         args = (message.text or "").split(maxsplit=1)
-        await run_summary(
+        await execute_slash_operation(
             message,
-            args[1].strip() if len(args) > 1 else settings.default_summary_period,
+            "summary",
+            run_summary(
+                message,
+                args[1].strip() if len(args) > 1 else settings.default_summary_period,
+            ),
         )
 
     async def answer_chat_question(
@@ -1037,15 +1161,20 @@ async def create_dispatcher(
         question: str,
         reply_to_source: bool = False,
         exclude_message_id: int | None = None,
-    ) -> None:
+    ) -> OperationOutcome:
         if not is_allowed(settings, message.chat.id):
-            return
+            return OperationOutcome("question", "rejected", "access_denied")
 
         try:
             period = parse_period(period_raw)
         except ValueError as exc:
-            await answer_logged(message, f"Could not parse period: {exc}")
-            return
+            response = await answer_logged(message, f"Could not parse period: {exc}")
+            return OperationOutcome(
+                "question",
+                "rejected",
+                "invalid_period",
+                response_message_id=response.message_id,
+            )
 
         if reply_to_source:
             wait_message = await reply_logged(message, "Thinking...")
@@ -1145,7 +1274,12 @@ async def create_dispatcher(
                 f"Failed to answer question: `{type(exc).__name__}: {exc}`",
                 source_message=message,
             )
-            return
+            return OperationOutcome(
+                "question",
+                "failed",
+                "generation_error",
+                response_message_id=wait_message.message_id,
+            )
 
         logging.info(
             "Question finished chat_id=%s period=%s elapsed_s=%.1f",
@@ -1159,6 +1293,12 @@ async def create_dispatcher(
         for part in parts[1:]:
             await answer_logged(message, part)
         schedule_profile_refresh(message.chat.id, now=now)
+        return OperationOutcome(
+            "question",
+            "succeeded",
+            "ok",
+            response_message_id=wait_message.message_id,
+        )
 
     async def handle_addressed_message(message: Message, bot: Bot) -> bool:
         if (
@@ -1167,8 +1307,7 @@ async def create_dispatcher(
             or (message.from_user and message.from_user.is_bot)
         ):
             return False
-        entities = message.entities if message.text else message.caption_entities
-        if any(entity_type_name(entity) == "bot_command" for entity in entities or []):
+        if has_bot_command_entity(message):
             return False
         bot_id, bot_username = await get_bot_identity(bot)
         aliases = await store.get_chat_bot_aliases(message.chat.id)
@@ -1182,6 +1321,12 @@ async def create_dispatcher(
             return False
         if not request:
             await reply_logged(message, "Да? Напишите, что нужно сделать.")
+            log_operation_outcome(
+                OperationOutcome("router", "rejected", "empty_request"),
+                chat_id=message.chat.id,
+                message_id=message.message_id,
+                invocation="routed",
+            )
             return True
         started = time.perf_counter()
         route = await route_under_gpu_lock(intent_router, gpu_lock, request)
@@ -1194,83 +1339,205 @@ async def create_dispatcher(
             route.reason,
             time.perf_counter() - started,
             settings.resolved_llm_provider,
-            getattr(intent_router.client, "model", ""),
+            resolved_intent_router_model(settings),
         )
-        if (
-            route.reason == "meme_not_explicit"
-            and is_joke_request(request)
-            and has_current_or_replied_image(message)
-            and random.random() < SURPRISE_MEME_CHANCE
+        if route.reason == "missing_wiki_query":
+            response = await reply_logged(message, "Что именно найти в Википедии?")
+            log_operation_outcome(
+                OperationOutcome(
+                    "wiki",
+                    "rejected",
+                    "missing_query",
+                    response_message_id=response.message_id,
+                ),
+                chat_id=message.chat.id,
+                message_id=message.message_id,
+                invocation="routed",
+                route_action=route.action,
+                route_reason=route.reason,
+                elapsed_seconds=time.perf_counter() - started,
+                provider=settings.resolved_llm_provider,
+                model=resolved_intent_router_model(settings),
+            )
+            return True
+        if should_generate_surprise_meme(
+            route=route,
+            request=request,
+            has_image=has_current_or_replied_image(message),
+            random_value=random.random(),
         ):
-            await run_meme(message, bot)
+            await execute_routed_operation(
+                message,
+                route,
+                "meme",
+                run_meme(message, bot),
+                started=started,
+            )
             return True
         if not route.valid or route.action == "none":
-            await answer_chat_question(
+            await execute_routed_operation(
                 message,
-                period_raw=settings.default_summary_period,
-                question=request,
-                reply_to_source=True,
-                exclude_message_id=message.message_id,
+                route,
+                "question",
+                answer_chat_question(
+                    message,
+                    period_raw=settings.default_summary_period,
+                    question=request,
+                    reply_to_source=True,
+                    exclude_message_id=message.message_id,
+                ),
+                started=started,
             )
             return True
         if route.action == "question":
-            await answer_chat_question(
+            await execute_routed_operation(
                 message,
-                period_raw=route.period or settings.default_summary_period,
-                question=request,
-                reply_to_source=True,
-                exclude_message_id=message.message_id,
+                route,
+                "question",
+                answer_chat_question(
+                    message,
+                    period_raw=route.period or settings.default_summary_period,
+                    question=request,
+                    reply_to_source=True,
+                    exclude_message_id=message.message_id,
+                ),
+                started=started,
             )
             return True
         if route.action == "summary":
-            await run_summary(message, route.period or settings.default_summary_period, exclude_message_id=message.message_id)
+            await execute_routed_operation(
+                message,
+                route,
+                "summary",
+                run_summary(
+                    message,
+                    route.period or settings.default_summary_period,
+                    exclude_message_id=message.message_id,
+                ),
+                started=started,
+            )
             return True
         if route.action == "wiki":
-            await run_wiki(message, route.query or "", routed=True)
+            await execute_routed_operation(
+                message,
+                route,
+                "wiki",
+                run_wiki(message, route.query or "", routed=True),
+                started=started,
+            )
             return True
         if route.action == "image":
-            await run_image(message, bot, routed=True)
+            await execute_routed_operation(
+                message,
+                route,
+                "image",
+                run_image(message, bot, routed=True),
+                started=started,
+            )
             return True
         if route.action == "meme":
-            await run_meme(message, bot)
+            await execute_routed_operation(
+                message,
+                route,
+                "meme",
+                run_meme(message, bot),
+                started=started,
+            )
             return True
         if route.action == "video":
-            await run_video(message, bot, routed=True, youtube=youtube_url_from_message(message))
+            await execute_routed_operation(
+                message,
+                route,
+                "video",
+                run_video(message, bot, routed=True, youtube=youtube_url_from_message(message)),
+                started=started,
+            )
             return True
         if route.action == "transcribe":
-            await run_transcribe(message, bot)
+            await execute_routed_operation(
+                message,
+                route,
+                "transcribe",
+                run_transcribe(message, bot),
+                started=started,
+            )
             return True
         if route.action == "profile_show":
-            await run_profile_show(message, route.query)
+            await execute_routed_operation(
+                message,
+                route,
+                "profile_show",
+                run_profile_show(message, route.query, reply_to_source=True),
+                started=started,
+            )
         return True
 
     @dp.message(Command("question"))
     async def question_command(message: Message) -> None:
         if not is_allowed(settings, message.chat.id):
+            log_operation_outcome(
+                OperationOutcome("question", "rejected", "access_denied"),
+                chat_id=message.chat.id,
+                message_id=message.message_id,
+                invocation="slash",
+            )
             return
 
         parsed = parse_question_command(message.text or "", settings.default_summary_period)
         if not parsed:
-            await answer_logged(
+            response = await answer_logged(
                 message,
                 "Usage: `/question [period] your question`\n"
                 "Example: `/question 24h who promised to fix the issue?`",
             )
+            log_operation_outcome(
+                OperationOutcome(
+                    "question",
+                    "rejected",
+                    "missing_question",
+                    response_message_id=response.message_id,
+                ),
+                chat_id=message.chat.id,
+                message_id=message.message_id,
+                invocation="slash",
+            )
             return
 
         period_raw, question = parsed
-        await answer_chat_question(message, period_raw=period_raw, question=question)
+        await execute_slash_operation(
+            message,
+            "question",
+            answer_chat_question(message, period_raw=period_raw, question=question),
+        )
 
-    async def run_wiki(message: Message, search_query: str, *, routed: bool = False) -> None:
+    async def run_wiki(
+        message: Message,
+        search_query: str,
+        *,
+        routed: bool = False,
+    ) -> OperationOutcome:
         if not is_allowed(settings, message.chat.id):
-            return
+            return OperationOutcome("wiki", "rejected", "access_denied")
         if not settings.wiki_search_enabled:
-            await answer_logged(message, "Wikipedia search is disabled: `WIKI_SEARCH_ENABLED=false`.")
-            return
+            response = await answer_logged(
+                message,
+                "Wikipedia search is disabled: `WIKI_SEARCH_ENABLED=false`.",
+            )
+            return OperationOutcome(
+                "wiki",
+                "rejected",
+                "feature_disabled",
+                response_message_id=response.message_id,
+            )
 
         if not search_query.strip():
-            await answer_logged(message, "Usage: `/wiki what to search`")
-            return
+            response = await answer_logged(message, "Usage: `/wiki what to search`")
+            return OperationOutcome(
+                "wiki",
+                "rejected",
+                "missing_query",
+                response_message_id=response.message_id,
+            )
         search_query = search_query.strip()
         wait_message = await answer_logged(message, f"Searching Wikipedia for `{search_query}`...")
         try:
@@ -1282,53 +1549,89 @@ async def create_dispatcher(
                 f"Failed to search Wikipedia: `{type(exc).__name__}: {exc}`",
                 source_message=message,
             )
-            return
+            return OperationOutcome(
+                "wiki",
+                "failed",
+                "provider_error",
+                response_message_id=wait_message.message_id,
+            )
 
         text = format_wiki_results(search_query, results)
+        persisted: bool | None = None
         if results:
-            await save_message_text(
+            persisted = await try_save_generated_context(
                 settings,
                 store,
                 wait_message if routed else message,
                 f"Wikipedia search for {search_query}: {text}",
                 limit_chars=settings.max_transcription_chars,
             )
-            if routed:
-                text = text + "\n\nSaved for summaries."
+            text = text + f"\n\n{generated_context_note(persisted)}"
         parts = split_telegram_text(text)
         await edit_text_logged(wait_message, parts[0], source_message=message)
         for part in parts[1:]:
             await answer_logged(message, part)
+        return OperationOutcome(
+            "wiki",
+            "succeeded" if persisted is not False else "partial",
+            "ok" if results and persisted else "no_results" if not results else "context_persistence_failed",
+            persisted=persisted,
+            response_message_id=wait_message.message_id,
+        )
 
     @dp.message(Command("wiki"))
     async def wiki_command(message: Message) -> None:
         query = (message.text or "").split(maxsplit=1)
-        await run_wiki(message, query[1] if len(query) > 1 else "")
+        await execute_slash_operation(
+            message,
+            "wiki",
+            run_wiki(message, query[1] if len(query) > 1 else ""),
+        )
 
-    async def run_image(message: Message, bot: Bot, *, routed: bool = False) -> None:
+    async def run_image(
+        message: Message,
+        bot: Bot,
+        *,
+        routed: bool = False,
+    ) -> OperationOutcome:
         if not is_allowed(settings, message.chat.id):
-            return
+            return OperationOutcome("image", "rejected", "access_denied")
         if not settings.image_recognition_model:
-            await answer_logged(
+            response = await answer_logged(
                 message,
                 "Image recognition is disabled: IMAGE_RECOGNITION_MODEL is empty.",
             )
-            return
+            return OperationOutcome(
+                "image",
+                "rejected",
+                "feature_disabled",
+                response_message_id=response.message_id,
+            )
 
         image = await resolve_image_for_command(store, message)
         if not image:
-            await answer_logged(
+            response = await answer_logged(
                 message,
                 "No image found. Reply to an image with `/image`, or send `/image` after an image.",
             )
-            return
+            return OperationOutcome(
+                "image",
+                "rejected",
+                "missing_media",
+                response_message_id=response.message_id,
+            )
         if image_too_large(settings, image):
-            await answer_logged(
+            response = await answer_logged(
                 message,
                 "Image is too large: "
                 f"{image.file_size} bytes. Limit: {settings.max_image_size_mb} MB.",
             )
-            return
+            return OperationOutcome(
+                "image",
+                "rejected",
+                "media_too_large",
+                response_message_id=response.message_id,
+            )
 
         wait_message = await answer_logged(
             message,
@@ -1350,7 +1653,12 @@ async def create_dispatcher(
                 f"Failed to recognize image: `{type(exc).__name__}: {exc}`",
                 source_message=message,
             )
-            return
+            return OperationOutcome(
+                "image",
+                "failed",
+                "recognition_error",
+                response_message_id=wait_message.message_id,
+            )
         finally:
             if image_path:
                 image_path.unlink(missing_ok=True)
@@ -1360,23 +1668,35 @@ async def create_dispatcher(
             f"🖼 Image recognition for message #{image.message_id} "
             f"from {image.sender_name}: {result}"
         )
-        await save_message_text(settings, store, wait_message if routed else message, saved_text)
+        persisted = await try_save_generated_context(
+            settings,
+            store,
+            wait_message if routed else message,
+            saved_text,
+        )
         text = (
             f"**Image recognition for message #{image.message_id}**\n"
             f"Source: {image.sender_name}\n"
             f"Model: `{settings.image_recognition_model}`\n"
             f"Elapsed: {elapsed:.1f} sec\n"
-            "Saved for summaries.\n\n"
+            f"{generated_context_note(persisted)}\n\n"
             f"{result}"
         )
         parts = split_telegram_text(text)
         await edit_text_logged(wait_message, parts[0], source_message=message)
         for part in parts[1:]:
             await answer_logged(message, part)
+        return OperationOutcome(
+            "image",
+            "succeeded" if persisted else "partial",
+            "ok" if persisted else "context_persistence_failed",
+            persisted=persisted,
+            response_message_id=wait_message.message_id,
+        )
 
     @dp.message(Command("image", "ocr"))
     async def image_command(message: Message, bot: Bot) -> None:
-        await run_image(message, bot)
+        await execute_slash_operation(message, "image", run_image(message, bot))
 
     async def run_meme(message: Message, bot: Bot) -> None:
         if not is_allowed(settings, message.chat.id):
@@ -1470,7 +1790,7 @@ async def create_dispatcher(
 
     @dp.message(Command("meme"))
     async def meme_command(message: Message, bot: Bot) -> None:
-        await run_meme(message, bot)
+        await execute_slash_operation(message, "meme", run_meme(message, bot))
 
     @opik_track(name="video.process")
     async def recognize_video_source(
@@ -1482,9 +1802,9 @@ async def create_dispatcher(
         notify_disabled: bool = False,
         status_as_reply: bool = False,
         routed: bool = False,
-    ) -> None:
+    ) -> OperationOutcome:
         if not is_allowed(settings, request_message.chat.id):
-            return
+            return OperationOutcome("video", "rejected", "access_denied")
         update_opik_span_metadata(
             {
                 "chat_id": request_message.chat.id,
@@ -1497,27 +1817,44 @@ async def create_dispatcher(
             }
         )
         if not settings.video_recognition_model:
+            response_message_id = None
             if notify_disabled:
-                await answer_logged(
+                response = await answer_logged(
                     request_message,
                     "Video recognition is disabled: VIDEO_RECOGNITION_MODEL is empty.",
                 )
-            return
+                response_message_id = response.message_id
+            return OperationOutcome(
+                "video",
+                "rejected",
+                "feature_disabled",
+                response_message_id=response_message_id,
+            )
 
         if video_too_large(settings, video):
-            await answer_logged(
+            response = await answer_logged(
                 request_message,
                 "Видео слишком большое для распознавания: "
                 f"{video.file_size} bytes. Лимит: {effective_video_size_limit_mb(settings)} MB.",
             )
-            return
+            return OperationOutcome(
+                "video",
+                "rejected",
+                "media_too_large",
+                response_message_id=response.message_id,
+            )
         if video_too_long(settings, video):
-            await answer_logged(
+            response = await answer_logged(
                 request_message,
                 "Video is too long: "
                 f"{video.duration} sec. Limit: {settings.max_video_seconds} sec.",
             )
-            return
+            return OperationOutcome(
+                "video",
+                "rejected",
+                "media_too_long",
+                response_message_id=response.message_id,
+            )
 
         cache_key = video_recognition_cache_key(
             settings,
@@ -1539,7 +1876,7 @@ async def create_dispatcher(
                 f"🎞 Video recognition for message #{video.message_id} "
                 f"from {video.sender_name}: {cached.result}"
             )
-            await save_message_text(
+            persisted = await try_save_generated_context(
                 settings,
                 store,
                 wait_message if wait_message else save_target_message,
@@ -1552,17 +1889,28 @@ async def create_dispatcher(
                 f"Type: `{video.media_type}`\n"
                 f"Model: `{settings.video_recognition_model}`\n"
                 "Cache: `hit`\n"
-                "Saved for summaries.\n\n"
+                f"{generated_context_note(persisted)}\n\n"
                 f"{cached.result}"
             )
+            response_message_id = wait_message.message_id if wait_message else None
             for index, part in enumerate(split_telegram_text(text)):
                 if index == 0 and wait_message:
                     await edit_text_logged(wait_message, part, source_message=request_message)
                 elif index == 0 and status_as_reply:
-                    await reply_logged(request_message, part)
+                    response = await reply_logged(request_message, part)
+                    response_message_id = response.message_id
                 else:
-                    await answer_logged(request_message, part)
-            return
+                    response = await answer_logged(request_message, part)
+                    if index == 0:
+                        response_message_id = response.message_id
+            return OperationOutcome(
+                "video",
+                "succeeded" if persisted else "partial",
+                "ok" if persisted else "context_persistence_failed",
+                persisted=persisted,
+                cache_hit=True,
+                response_message_id=response_message_id,
+            )
 
         update_opik_span_metadata({"cache_hit": False})
 
@@ -1630,7 +1978,13 @@ async def create_dispatcher(
                 text,
                 source_message=request_message,
             )
-            return
+            return OperationOutcome(
+                "video",
+                "failed",
+                "recognition_error",
+                cache_hit=False,
+                response_message_id=wait_message.message_id,
+            )
         finally:
             if audio_path:
                 audio_path.unlink(missing_ok=True)
@@ -1642,13 +1996,22 @@ async def create_dispatcher(
             f"🎞 Video recognition for message #{video.message_id} "
             f"from {video.sender_name}: {result}"
         )
-        await store.save_video_recognition(
-            chat_id=video.chat_id,
-            message_id=video.message_id,
-            cache_key=cache_key,
-            result=result,
-        )
-        await save_message_text(
+        cache_persisted = True
+        try:
+            await store.save_video_recognition(
+                chat_id=video.chat_id,
+                message_id=video.message_id,
+                cache_key=cache_key,
+                result=result,
+            )
+        except Exception:  # noqa: BLE001
+            cache_persisted = False
+            logging.exception(
+                "Video recognition cache persistence failed chat_id=%s message_id=%s",
+                video.chat_id,
+                video.message_id,
+            )
+        persisted = await try_save_generated_context(
             settings,
             store,
             wait_message if routed else save_target_message,
@@ -1661,13 +2024,26 @@ async def create_dispatcher(
             f"Type: `{video.media_type}`\n"
             f"Model: `{settings.video_recognition_model}`\n"
             f"Elapsed: {elapsed:.1f} sec\n"
-            "Saved for summaries.\n\n"
+            f"{generated_context_note(persisted)}\n\n"
             f"{result}"
         )
         parts = split_telegram_text(text)
         await edit_text_logged(wait_message, parts[0], source_message=request_message)
         for part in parts[1:]:
             await answer_logged(request_message, part)
+        failures = []
+        if not cache_persisted:
+            failures.append("cache")
+        if not persisted:
+            failures.append("context")
+        return OperationOutcome(
+            "video",
+            "succeeded" if not failures else "partial",
+            "ok" if not failures else "_and_".join(failures) + "_persistence_failed",
+            persisted=persisted,
+            cache_hit=False,
+            response_message_id=wait_message.message_id,
+        )
 
     async def run_youtube_video(
         message: Message,
@@ -1675,10 +2051,18 @@ async def create_dispatcher(
         url: str,
         *,
         routed: bool = False,
-    ) -> None:
+    ) -> OperationOutcome:
         if not settings.video_recognition_model:
-            await answer_logged(message, "Video recognition is disabled: VIDEO_RECOGNITION_MODEL is empty.")
-            return
+            response = await answer_logged(
+                message,
+                "Video recognition is disabled: VIDEO_RECOGNITION_MODEL is empty.",
+            )
+            return OperationOutcome(
+                "video",
+                "rejected",
+                "feature_disabled",
+                response_message_id=response.message_id,
+            )
         wait_message = (
             await reply_logged(message, "Downloading and recognizing YouTube video...")
             if routed
@@ -1765,7 +2149,12 @@ async def create_dispatcher(
                 f"Failed to recognize YouTube video: `{detail}`",
                 source_message=message,
             )
-            return
+            return OperationOutcome(
+                "video",
+                "failed",
+                "youtube_processing_error",
+                response_message_id=wait_message.message_id,
+            )
         finally:
             if audio_path:
                 audio_path.unlink(missing_ok=True)
@@ -1773,12 +2162,29 @@ async def create_dispatcher(
                 downloaded.path.unlink(missing_ok=True)
 
         saved_text = f"🎞 YouTube recognition for {downloaded.title}: {result}"
-        await save_message_text(settings, store, wait_message, saved_text, limit_chars=settings.max_transcription_chars)
-        text = f"**YouTube video recognition: {downloaded.title}**\nSaved for summaries.\n\n{result}"
+        persisted = await try_save_generated_context(
+            settings,
+            store,
+            wait_message,
+            saved_text,
+            limit_chars=settings.max_transcription_chars,
+        )
+        text = (
+            f"**YouTube video recognition: {downloaded.title}**\n"
+            f"{generated_context_note(persisted)}\n\n{result}"
+        )
         parts = split_telegram_text(text)
         await edit_text_logged(wait_message, parts[0], source_message=message)
         for part in parts[1:]:
             await answer_logged(message, part)
+        return OperationOutcome(
+            "video",
+            "succeeded" if persisted else "partial",
+            "ok" if persisted else "context_persistence_failed",
+            persisted=persisted,
+            cache_hit=False,
+            response_message_id=wait_message.message_id,
+        )
 
     async def run_video(
         message: Message,
@@ -1786,30 +2192,33 @@ async def create_dispatcher(
         *,
         routed: bool = False,
         youtube: str | None = None,
-    ) -> None:
+    ) -> OperationOutcome:
         if not is_allowed(settings, message.chat.id):
-            return
+            return OperationOutcome("video", "rejected", "access_denied")
 
         if message.reply_to_message:
             video = await resolve_video_for_command(store, message)
         else:
             video = video_from_message(message)
             if not video and youtube:
-                await run_youtube_video(message, bot, youtube, routed=routed)
-                return
+                return await run_youtube_video(message, bot, youtube, routed=routed)
             if not video:
                 video = await store.get_latest_video(message.chat.id)
         if not video:
             if youtube:
-                await run_youtube_video(message, bot, youtube, routed=routed)
-                return
-            await answer_logged(
+                return await run_youtube_video(message, bot, youtube, routed=routed)
+            response = await answer_logged(
                 message,
                 "No video found. Reply to a video with `/video`, or send `/video` after a video.",
             )
-            return
+            return OperationOutcome(
+                "video",
+                "rejected",
+                "missing_media",
+                response_message_id=response.message_id,
+            )
 
-        await recognize_video_source(
+        return await recognize_video_source(
             video=video,
             request_message=message,
             save_target_message=message,
@@ -1820,7 +2229,11 @@ async def create_dispatcher(
 
     @dp.message(Command("video", "vocr"))
     async def video_command(message: Message, bot: Bot) -> None:
-        await run_video(message, bot, youtube=youtube_url_from_message(message))
+        await execute_slash_operation(
+            message,
+            "video",
+            run_video(message, bot, youtube=youtube_url_from_message(message)),
+        )
 
     @dp.message(Command("compare"))
     async def compare_command(message: Message) -> None:
@@ -2073,7 +2486,7 @@ async def create_dispatcher(
             return
 
         saved_text = f"🎙 Voice message from {voice_sender_name}: {transcript}"
-        await save_message_text(
+        persisted = await try_save_generated_context(
             settings,
             store,
             source_message,
@@ -2082,9 +2495,14 @@ async def create_dispatcher(
             replace_existing=replace_existing,
         )
         elapsed = time.perf_counter() - started
+        persistence_text = (
+            f"Saved for summaries in {elapsed:.1f} sec."
+            if persisted
+            else generated_context_note(False)
+        )
         text = (
             f"**Voice transcription from {voice_sender_name}**\n"
-            f"Saved for summaries in {elapsed:.1f} sec.\n\n"
+            f"{persistence_text}\n\n"
             f"{transcript}"
         )
         parts = split_telegram_text(text)
@@ -2125,14 +2543,26 @@ async def create_dispatcher(
 
     @dp.message(Command("transcribe"))
     async def transcribe_command(message: Message, bot: Bot) -> None:
-        await run_transcribe(message, bot)
+        await execute_slash_operation(message, "transcribe", run_transcribe(message, bot))
 
-    async def run_profile_show(message: Message, query: str | None) -> None:
+    async def run_profile_show(
+        message: Message,
+        query: str | None,
+        *,
+        reply_to_source: bool,
+    ) -> OperationOutcome:
         if not is_allowed(settings, message.chat.id):
-            return
+            return OperationOutcome("profile_show", "rejected", "access_denied")
         if not chat_memory:
-            await answer_logged(message, "Chat memory is disabled: `MEMORY_ENABLED=false`.")
-            return
+            response = await answer_logged(message, "Chat memory is disabled: `MEMORY_ENABLED=false`.")
+            return OperationOutcome(
+                "profile_show",
+                "rejected",
+                "memory_disabled",
+                response_message_id=response.message_id,
+            )
+
+        self_profile = False
         if message.reply_to_message:
             key, _ = participant_ref(message.reply_to_message)
             text = await chat_memory.profile_text(chat_id=message.chat.id, participant_keys=[key])
@@ -2147,17 +2577,43 @@ async def create_dispatcher(
                 }
             ]
             if not matches or (len(matches) > 1 and len(exact) != 1):
-                await answer_logged(message, "Уточните имя участника или ответьте на его сообщение.")
-                return
+                send = reply_logged if reply_to_source else answer_logged
+                response = await send(message, "Уточните имя участника или ответьте на его сообщение.")
+                return OperationOutcome(
+                    "profile_show",
+                    "rejected",
+                    "participant_ambiguous" if matches else "participant_not_found",
+                    response_message_id=response.message_id,
+                )
             key, _ = (exact or matches)[0]
             text = await chat_memory.profile_text(chat_id=message.chat.id, participant_keys=[key])
         elif message.from_user:
             key, _ = participant_ref(message)
             text = await chat_memory.profile_text(chat_id=message.chat.id, participant_keys=[key])
+            self_profile = True
         else:
-            await answer_logged(message, "Не удалось определить участника. Ответьте на его сообщение.")
-            return
-        await reply_logged(message, text)
+            send = reply_logged if reply_to_source else answer_logged
+            response = await send(message, "Не удалось определить участника. Ответьте на его сообщение.")
+            return OperationOutcome(
+                "profile_show",
+                "rejected",
+                "participant_unknown",
+                response_message_id=response.message_id,
+            )
+        if self_profile and text == "Паспорт участника пока пуст.":
+            text += (
+                "\n\n`/profile` без reply показывает ваш профиль. "
+                "Чтобы посмотреть другого участника, ответьте на его сообщение `/profile` "
+                "или используйте `/profile <name>`."
+            )
+        send = reply_logged if reply_to_source else answer_logged
+        response = await send(message, text)
+        return OperationOutcome(
+            "profile_show",
+            "succeeded",
+            "ok",
+            response_message_id=response.message_id,
+        )
 
     @dp.message(F.voice | F.audio)
     async def transcribe_audio_message(message: Message, bot: Bot) -> None:
@@ -2170,7 +2626,8 @@ async def create_dispatcher(
     @dp.message(F.photo | (F.document & F.document.mime_type.startswith("image/")))
     async def save_regular_image(message: Message, bot: Bot) -> None:
         await save_incoming_image(settings, store, message)
-        await save_incoming_message(settings, store, message)
+        if not has_bot_command_entity(message):
+            await save_incoming_message(settings, store, message)
         await handle_addressed_message(message, bot)
 
     @dp.channel_post(F.video | F.video_note | (F.document & F.document.mime_type.startswith("video/")))
@@ -2180,7 +2637,8 @@ async def create_dispatcher(
     @dp.message(F.video | F.video_note | (F.document & F.document.mime_type.startswith("video/")))
     async def save_regular_video(message: Message, bot: Bot) -> None:
         await save_incoming_video(settings, store, message)
-        await save_incoming_message(settings, store, message)
+        if not has_bot_command_entity(message):
+            await save_incoming_message(settings, store, message)
         if await handle_addressed_message(message, bot):
             return
         if not message.video_note:
@@ -2203,7 +2661,7 @@ async def create_dispatcher(
 
     @dp.message(F.text | F.caption)
     async def save_regular_message(message: Message, bot: Bot) -> None:
-        if message.text and message.text.startswith("/"):
+        if has_bot_command_entity(message) or (message.text and message.text.startswith("/")):
             return
         await save_incoming_message(settings, store, message)
         await handle_addressed_message(message, bot)
@@ -2216,7 +2674,13 @@ async def resolve_image_for_command(store: MessageStore, message: Message) -> St
         replied_image = image_from_message(message.reply_to_message)
         if replied_image:
             return replied_image
-        return await store.get_image_by_message_id(message.chat.id, message.reply_to_message.message_id)
+        indexed_reply = await store.get_image_by_message_id(
+            message.chat.id,
+            message.reply_to_message.message_id,
+        )
+        if indexed_reply:
+            return indexed_reply
+        return image_from_message(message)
     current_image = image_from_message(message)
     if current_image:
         return current_image
@@ -2228,7 +2692,13 @@ async def resolve_video_for_command(store: MessageStore, message: Message) -> St
         replied_video = video_from_message(message.reply_to_message)
         if replied_video:
             return replied_video
-        return await store.get_video_by_message_id(message.chat.id, message.reply_to_message.message_id)
+        indexed_reply = await store.get_video_by_message_id(
+            message.chat.id,
+            message.reply_to_message.message_id,
+        )
+        if indexed_reply:
+            return indexed_reply
+        return video_from_message(message)
     current_video = video_from_message(message)
     if current_video:
         return current_video
@@ -2323,6 +2793,40 @@ async def save_message_text(
         ),
         replace=replace_existing,
     )
+
+
+async def try_save_generated_context(
+    settings: Settings,
+    store: MessageStore,
+    message: Message,
+    text: str,
+    *,
+    limit_chars: int | None = None,
+    replace_existing: bool = False,
+) -> bool:
+    try:
+        await save_message_text(
+            settings,
+            store,
+            message,
+            text,
+            limit_chars=limit_chars,
+            replace_existing=replace_existing,
+        )
+    except Exception:  # noqa: BLE001
+        logging.exception(
+            "Generated context persistence failed chat_id=%s message_id=%s",
+            message.chat.id,
+            message.message_id,
+        )
+        return False
+    return True
+
+
+def generated_context_note(persisted: bool) -> str:
+    if persisted:
+        return "Saved for summaries."
+    return "Результат получен, но сохранить его для саммари не удалось."
 
 
 async def download_image(settings: Settings, bot: Bot, image: StoredImage) -> Path:

@@ -25,6 +25,24 @@ class AddressingTests(unittest.TestCase):
         result = remove_aliases_from_text("Релейк, ответь", ["релейка"])
         self.assertEqual(result, "ответь")
 
+    def test_multi_token_alias_allows_one_total_typo(self) -> None:
+        self.assertEqual(
+            remove_aliases_from_text("Старший рел, ответь", ["старший реле"]),
+            "ответь",
+        )
+        self.assertEqual(
+            remove_aliases_from_text("Старшый реле, ответь", ["старший реле"]),
+            "ответь",
+        )
+
+    def test_multi_token_alias_rejects_two_typos(self) -> None:
+        self.assertIsNone(
+            remove_aliases_from_text("Старшый рел, ответь", ["старший реле"])
+        )
+
+    def test_short_multi_token_alias_remains_exact(self) -> None:
+        self.assertIsNone(remove_aliases_from_text("А бо, ответь", ["а бот"]))
+
     def test_removes_multiple_aliases_once(self) -> None:
         result = remove_aliases_from_text("Реле, Релейка, ответь", ["реле", "релейка"])
         self.assertEqual(result, "ответь")

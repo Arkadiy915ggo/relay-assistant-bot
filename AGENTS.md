@@ -35,6 +35,16 @@ The bot uses the official Telegram Bot API through `aiogram`. It cannot read his
 
 The repository uses the standard-library `unittest` framework with fakes and temporary SQLite databases.
 
+Current focused tests:
+
+- `tests/test_addressing.py`: aliases, mentions, token boundaries, and one-total-typo behavior.
+- `tests/test_storage_aliases.py`: chat-scoped alias persistence.
+- `tests/test_intent_router.py`: strict routing, explicit meme/profile guards, GPU sequencing, surprise meme policy, and command admission.
+- `tests/test_operation_stabilization.py`: generated-context persistence and content-free terminal outcomes.
+- `tests/test_assistant_identity.py`: chat alias identity context.
+- `tests/test_youtube.py`: URL/download validation, limits, cleanup, and timeout cancellation.
+- `tests/test_video_audio_chunks.py`: bounded video-audio transcription chunks.
+
 ## Runtime Flow
 
 1. `python -m tg_summary_bot` runs `src/tg_summary_bot/__main__.py`.
@@ -89,12 +99,17 @@ SQLite tables are initialized in `MessageStore.init()`:
 ## Important Behavior
 
 - Access control is enforced by `ALLOWED_CHAT_IDS`; an empty set allows all chats.
+- `/stats` intentionally bypasses `ALLOWED_CHAT_IDS` for chat-id discovery and reports `access_allowed`; this exception does not apply to storage, routing, or other commands.
+- Any participant in an allowed chat may manage chat aliases. An optional admin-only toggle is a future possibility and is not implemented.
+- Multi-token aliases allow one typo in total when their normalized length is at least five characters; short aliases require exact matching.
 - Text and captions are stored passively unless the message is a slash command.
 - Images and videos are indexed passively by Telegram `file_id`; Telegram video notes are recognized automatically, while normal video files require explicit commands.
 - Voice/audio messages are transcribed only when `TRANSCRIBE_VOICE=true` and voice dependencies are installed. Optional transcript formatting runs after the raw Whisper response is already sent.
 - Video recognition can include audio transcription when `VIDEO_TRANSCRIBE_AUDIO=true` and a transcriber is configured.
 - Long summaries/questions are chunked before model calls; final summaries merge partials.
 - Mentioning the bot in a message triggers the same contextual answer flow as `/question` using the default period.
+- Wiki/image/video/YouTube context persistence is best effort: a completed result is still sent with a safe partial-success warning if SQLite persistence fails.
+- A surprise meme has a fixed 2% chance only for a valid routed joke question with an image in the current or replied message.
 - Telegram responses are split below the Telegram message limit by `split_telegram_text()`.
 
 ## Configuration
