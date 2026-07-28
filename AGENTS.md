@@ -77,6 +77,7 @@ Current focused tests:
 - `/stats`: show chat id, stored counts, provider/model settings, and media/transcription settings.
 - `/balance`: show the command author's joke-point balance in the current chat.
 - `/top`: show up to ten positive joke-point balances in deterministic order.
+- `/casino`: spin the Telegram `🎰` virtual slot for a fixed 10-point stake; no money, transfers, purchases, or withdrawals.
 - `/summary [period]`: summarize stored messages for the period; default comes from `DEFAULT_SUMMARY_PERIOD`.
 - `/question [period] <text>`: answer using stored chat context when relevant.
 - `/memory`: show compressed chat memory status; `/memory rebuild` resets memory blocks/state so they can be rebuilt from stored raw messages.
@@ -101,6 +102,7 @@ SQLite tables are initialized in `MessageStore.init()`:
 - `chat_point_ledger`: append-only `best_joke` award entries, unique per chat/source message.
 - `chat_point_balances`: chat-scoped balance projection used by `/balance`, `/top`, and `/stats` leader.
 - `chat_pinned_leaderboards`: the chat-scoped Telegram `message_id` used for best-effort leaderboard edits and pinning.
+- `chat_casino_spins`: idempotent virtual slot reserve/settle/refund records linked to ledger rows by `casino_spin_id`.
 
 ## Important Behavior
 
@@ -114,12 +116,12 @@ SQLite tables are initialized in `MessageStore.init()`:
 - Video recognition can include audio transcription when `VIDEO_TRANSCRIBE_AUDIO=true` and a transcriber is configured.
 - Long summaries/questions are chunked before model calls; final summaries merge partials.
 - `/summary` takes an eligible raw snapshot, then runs a strict joke selector in a second acquisition of the existing shared `gpu_lock`; awards are committed atomically only after that lock is released. `/compare` never selects or awards jokes.
-- After a new joke award, the bot best-effort edits a chat-scoped `Топ шуток` message and tries to pin it. Deleted leaderboard messages are recreated; missing pin permission does not affect the committed award.
+- `/top` and the pinned `Топ балансов` reflect current spendable balances after awards, bets, payouts, and refunds. Only a confirmed Telegram not-found error recreates the pinned message.
 - Mentioning the bot in a message triggers the same contextual answer flow as `/question` using the default period.
 - Wiki/image/video/YouTube context persistence is best effort: a completed result is still sent with a safe partial-success warning if SQLite persistence fails.
 - A surprise meme has a fixed 2% chance only for a valid routed joke question with an image in the current or replied message.
 - Telegram responses are split below the Telegram message limit by `split_telegram_text()`.
-- Feature 04 is not implemented: there is no casino intent, betting, payout/refund, transfer, purchase, or real-money behavior.
+- Casino uses `telegram_slots_base4_v1`, a fixed stake of 10, gross payouts 0/5/50/250, and RTP 90.625%. An unknown or uncommitted Telegram Dice outcome is void and refunded; there are no real-money, payment, transfer, purchase, or withdrawal features.
 
 ## Configuration
 

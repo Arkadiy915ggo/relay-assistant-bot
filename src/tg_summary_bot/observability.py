@@ -29,6 +29,7 @@ class OperationOutcome:
     persisted: bool | None = None
     cache_hit: bool | None = None
     response_message_id: int | None = None
+    metadata: dict[str, object] | None = None
 
 
 def log_operation_outcome(
@@ -43,6 +44,8 @@ def log_operation_outcome(
     provider: str | None = None,
     model: str | None = None,
 ) -> None:
+    outcome_data = asdict(outcome)
+    metadata = outcome_data.pop("metadata") or {}
     event = {
         "event": "operation_outcome",
         "created_at": datetime.now(timezone.utc).isoformat(),
@@ -54,7 +57,8 @@ def log_operation_outcome(
         "elapsed_ms": round(elapsed_seconds * 1000, 1) if elapsed_seconds is not None else None,
         "provider": provider,
         "model": model,
-        **asdict(outcome),
+        **outcome_data,
+        **metadata,
     }
     logging.getLogger("tg_summary_bot.operations").info(json.dumps(event, ensure_ascii=False))
     update_opik_span_metadata({key: value for key, value in event.items() if key != "created_at"})

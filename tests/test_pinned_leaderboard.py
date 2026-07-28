@@ -1,6 +1,9 @@
 import unittest
 from types import SimpleNamespace
 
+from aiogram.exceptions import TelegramBadRequest
+from aiogram.methods import SendMessage
+
 from tg_summary_bot.bot import refresh_pinned_leaderboard, render_leaderboard
 from tg_summary_bot.storage import PinnedLeaderboard, PointBalance
 
@@ -64,7 +67,7 @@ class PinnedLeaderboardTests(unittest.IsolatedAsyncioTestCase):
         rendered = render_leaderboard(
             [PointBalance(1, "id:1", "Alice", 10, "now")]
         )
-        self.assertEqual(rendered, "Топ шуток:\n1. Alice - 10")
+        self.assertEqual(rendered, "Топ балансов:\n1. Alice - 10")
 
     async def test_edits_and_repins_existing_leaderboard(self) -> None:
         store = FakeStore(PinnedLeaderboard(1, 44, "now"))
@@ -78,7 +81,13 @@ class PinnedLeaderboardTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_deleted_leaderboard_is_recreated_and_pinned(self) -> None:
         store = FakeStore(PinnedLeaderboard(1, 44, "now"))
-        bot = FakeBot(edit_error=RuntimeError("deleted"), pin_error=RuntimeError("not admin"))
+        bot = FakeBot(
+            edit_error=TelegramBadRequest(
+                method=SendMessage(chat_id=1, text="x"),
+                message="Bad Request: message to edit not found",
+            ),
+            pin_error=RuntimeError("not admin"),
+        )
         message = FakeMessage()
         with self.assertLogs(level="WARNING"):
             await refresh_pinned_leaderboard(bot=bot, store=store, source_message=message)  # type: ignore[arg-type]

@@ -10,9 +10,9 @@
 | 2, реализовано | [[Features/02 Intent Router and User Actions]] | Фича 1 | Обращение по имени вызывает подходящее пользовательское действие. |
 | 2.5, реализовано | [[Features/02.5 Pre-Feature 03 Stabilization]] | Фичи 1-2 | Terminal outcomes, честная persistence policy и стабилизация спорных intent-ов перед очками. |
 | 3, реализовано в worktree | [[Features/03 Joke Points and Leaderboard]] | Завершённый этап 2.5 | Уникальная validated шутка получает очки; есть spendable balance и top-10. |
-| 4, запланировано | [[Features/04 Casino Slots]] | Проверенная и отдельно зафиксированная Фича 3 | Виртуальные очки можно поставить в versioned Telegram-слоте с atomic reserve/settle/refund. |
+| 4, реализовано | [[Features/04 Casino Slots]] | Проверенная и отдельно зафиксированная Фича 3 | Виртуальные очки можно поставить в versioned Telegram-слоте с atomic reserve/settle/refund. |
 
-Фичи 1, 2, стабилизация 2.5 и Feature 03 реализованы в текущем worktree. Перед Feature 04 изменения Feature 03 должны пройти полный suite и попасть в отдельный commit. Feature 04 делится на Domain/Storage, Slash Lifecycle/Recovery и Addressed Intent; intent `casino` добавляется только на третьем этапе.
+Фичи 1-4 реализованы. Feature 04 прошла Domain/Storage, Slash Lifecycle/Recovery и Addressed Intent; `casino` добавлен в router только после стабильного slash lifecycle.
 
 ## Зафиксированные продуктовые решения
 

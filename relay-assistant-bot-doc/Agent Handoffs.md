@@ -2,7 +2,7 @@
 
 Каждый блок ниже можно отдать отдельному агенту. Перед началом агент должен прочитать `AGENTS.md`, нужную спецификацию и проверить `git status --short`. Не читать `.env` и `data/`.
 
-Текущий статус: Feature 01, Feature 02, Stage 02.5 и Feature 03 реализованы в текущем worktree. Перед Feature 04 изменения Feature 03 нужно проверить и отдельно зафиксировать. Feature 04 не реализована.
+Текущий статус: Feature 01-04 реализованы. Feature 04 использует только виртуальные chat-scoped points: нет денег, платежей, transfers или withdrawals; unknown Telegram Dice outcome void/refund-ится.
 
 ## Фича 1: алиасы (реализовано)
 

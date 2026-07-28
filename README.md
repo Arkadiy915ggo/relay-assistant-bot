@@ -9,6 +9,7 @@ A safe Telegram bot that stores new chat messages and produces short AI summarie
 - compares summaries from multiple Ollama models with `/compare 10m`;
 - validates one best joke from eligible source messages after a successful summary and awards `+10` chat-scoped virtual points;
 - shows personal joke points with `/balance` and a deterministic top-10 with `/top`;
+- spins one virtual Telegram slot with `/casino` for a fixed 10-point stake;
 - works in direct chats, groups, supergroups, and channels;
 - supports OpenAI API or a local Ollama model;
 - splits long discussions into chunks and merges the final summary;
@@ -174,6 +175,7 @@ Restart the bot.
 /stats
 /balance
 /top
+/casino
 /summary
 /summary 30m
 /summary 6h
@@ -214,12 +216,25 @@ voice transcripts, and final contextual assistant answers. Existing rows are mig
 `legacy/legacy_unclassified` and intentionally never become eligible. Recognition results, summaries,
 profiles, status messages, memory blocks, memes, errors, and generated context remain ineligible.
 
-Points are chat-scoped and have no monetary value. This feature does not include casino mechanics,
-wagers, payouts, refunds, transfers, purchases, or real money.
+Points are chat-scoped and have no monetary value. They cannot be bought, transferred, withdrawn, or
+exchanged for money or any real-world value.
 
-After the first new award, the bot creates a `Топ шуток` message and tries to pin it. Each later new
-award edits that same message and re-pins it. If it was deleted, the bot creates a replacement. The bot
+After the first new award, the bot creates a `Топ балансов` message and tries to pin it. Each later
+award, slot settlement, or slot refund edits that same message and re-pins it. If it was deleted, the bot creates a replacement. The bot
 needs Telegram permission to pin messages; without it, it still keeps and updates the leaderboard message.
+
+## Virtual Casino Slot
+
+`/casino` and an explicitly addressed request such as `Реле, прокрути слот` use one Telegram `🎰`
+Dice animation. The fixed stake is 10 virtual points. Gross payouts are 0 for no match, 5 for one pair,
+50 for three equal non-seven symbols, and 250 for `seven/seven/seven`; the corresponding net outcomes
+after stake are -10, -5, +40, and +240. The v1 return-to-player is 90.625%.
+
+The mapping is the versioned community contract `telegram_slots_base4_v1`. Telegram does not formally
+document it, so every spin stores that rules version; jackpot is only `Dice.value=64`. If Telegram may
+have shown Dice but the bot has no committed SQLite settlement, the spin is void and the stake is
+refunded. This intentionally does not promise exactly-once Telegram Dice delivery. The casino has no
+real money, payments, purchases, transfers, arbitrary stakes, or withdrawals.
 
 ## Bot Aliases
 
@@ -251,7 +266,8 @@ cleaned request to one safe built-in action. For example:
 ```
 
 The router accepts only a fixed action set: contextual question, summary, Wikipedia search, image
-recognition, meme, video recognition, replied voice/audio transcription, and profile display.
+recognition, meme, video recognition, replied voice/audio transcription, profile display, and the
+explicit virtual casino slot request.
 Slash commands and channel posts are not routed. For image/video/meme actions, a matching reply has
 priority, then media in the addressed message, and only then the latest indexed media.
 

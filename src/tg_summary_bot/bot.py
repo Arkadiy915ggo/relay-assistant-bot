@@ -20,6 +20,7 @@ from aiogram.types import FSInputFile, Message
 
 from tg_summary_bot.addressing import remove_aliases_from_text, split_aliases
 from tg_summary_bot.assistant import ChatAssistant
+from tg_summary_bot.casino import CASINO_STAKE, slot_result
 from tg_summary_bot.config import Settings, load_settings
 from tg_summary_bot.image_recognizer import ImageRecognizer
 from tg_summary_bot.intent_router import (
@@ -39,7 +40,7 @@ from tg_summary_bot.observability import (
     update_opik_span_metadata,
 )
 from tg_summary_bot.periods import format_period, parse_period
-from tg_summary_bot.storage import MessageStore, PointBalance, StoredImage, StoredVideo
+from tg_summary_bot.storage import CasinoSpin, MessageStore, PointBalance, StoredImage, StoredVideo
 from tg_summary_bot.summarizer import Summarizer
 from tg_summary_bot.transcriber import FasterWhisperTranscriber
 from tg_summary_bot.transcript_formatter import TranscriptFormatter
@@ -532,8 +533,8 @@ def render_best_joke_section(
 
 def render_leaderboard(balances: list[PointBalance]) -> str:
     if not balances:
-        return "Топ шуток: наград пока нет."
-    return "Топ шуток:\n" + "\n".join(
+        return "Топ балансов: пока нет положительных балансов."
+    return "Топ балансов:\n" + "\n".join(
         f"{index}. {balance.participant_name} - {balance.balance}"
         for index, balance in enumerate(balances, start=1)
     )
@@ -546,7 +547,26 @@ async def refresh_pinned_leaderboard(
     source_message: Message,
 ) -> None:
     """Best-effort refresh; leaderboard delivery never affects an awarded transaction."""
-    chat_id = source_message.chat.id
+    await refresh_pinned_leaderboard_for_chat(
+        bot=bot,
+        store=store,
+        chat_id=source_message.chat.id,
+        source_message=source_message,
+    )
+
+
+def telegram_message_not_found(error: Exception) -> bool:
+    return isinstance(error, TelegramBadRequest) and "not found" in str(error).lower()
+
+
+async def refresh_pinned_leaderboard_for_chat(
+    *,
+    bot: Bot,
+    store: MessageStore,
+    chat_id: int,
+    source_message: Message | None = None,
+) -> None:
+    """Refresh current wallets; recreate only a confirmed deleted Telegram message."""
     text = render_leaderboard(await store.get_top_point_balances(chat_id=chat_id, limit=10))
     pinned = await store.get_pinned_leaderboard(chat_id=chat_id)
     message_id: int | None = pinned.message_id if pinned else None
@@ -558,15 +578,20 @@ async def refresh_pinned_leaderboard(
                 text=telegram_html(text),
                 parse_mode="HTML",
             )
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
             logging.warning("Pinned leaderboard edit failed chat_id=%s", chat_id, exc_info=True)
-            try:
-                await store.delete_pinned_leaderboard(chat_id=chat_id)
-            except Exception:  # noqa: BLE001
-                logging.warning("Pinned leaderboard state cleanup failed chat_id=%s", chat_id, exc_info=True)
-            message_id = None
+            if telegram_message_not_found(exc):
+                try:
+                    await store.delete_pinned_leaderboard(chat_id=chat_id)
+                except Exception:  # noqa: BLE001
+                    logging.warning("Pinned leaderboard state cleanup failed chat_id=%s", chat_id, exc_info=True)
+                message_id = None
     if message_id is None:
-        response = await answer_logged(source_message, text)
+        response = (
+            await answer_logged(source_message, text)
+            if source_message
+            else await bot.send_message(chat_id, telegram_html(text), parse_mode="HTML")
+        )
         message_id = response.message_id
         try:
             await store.save_pinned_leaderboard(chat_id=chat_id, message_id=message_id)
@@ -632,6 +657,151 @@ async def edit_text_logged(
         text=text,
         response_message=message,
         source_message=source_message,
+    )
+
+
+def valid_slot_dice(sent: object, *, chat_id: int) -> tuple[int, int] | None:
+    chat = getattr(sent, "chat", None)
+    dice = getattr(sent, "dice", None)
+    message_id = getattr(sent, "message_id", None)
+    value = getattr(dice, "value", None)
+    if (
+        not chat
+        or getattr(chat, "id", None) != chat_id
+        or type(message_id) is not int
+        or message_id <= 0
+        or not dice
+        or getattr(dice, "emoji", None) != "🎰"
+        or type(value) is not int
+        or not 1 <= value <= 64
+    ):
+        return None
+    return message_id, value
+
+
+def render_casino_spin(spin: CasinoSpin) -> str:
+    if spin.status == "pending":
+        return "Этот спин уже обрабатывается."
+    if spin.status == "refunded":
+        return (
+            f"Спин отменён; ставка {spin.stake} очков возвращена. "
+            f"Баланс: {spin.terminal_balance}."
+        )
+    net = (spin.payout or 0) - spin.stake
+    category = {"none": "нет совпадений", "pair": "пара", "triple": "три одинаковых", "jackpot": "джекпот"}.get(
+        spin.category or "", "неизвестно"
+    )
+    return (
+        f"Слот: {category}. Ставка: {spin.stake}; выплата: {spin.payout}; "
+        f"итог: {net:+d}; баланс: {spin.terminal_balance}."
+    )
+
+
+def casino_outcome_metadata(spin: CasinoSpin | None) -> dict[str, object]:
+    if not spin:
+        return {}
+    return {
+        "spin_id": spin.spin_id,
+        "spin_status": spin.status,
+        "rules_version": spin.rules_version,
+        "stake": spin.stake,
+        "category": spin.category,
+        "payout": spin.payout,
+        "net": (spin.payout - spin.stake) if spin.payout is not None else None,
+        "terminal_balance": spin.terminal_balance,
+    }
+
+
+async def spin_casino(
+    settings: Settings,
+    store: MessageStore,
+    bot: Bot,
+    message: Message,
+) -> OperationOutcome:
+    """Run one idempotent virtual slot operation without the shared GPU lock."""
+    if not is_allowed(settings, message.chat.id):
+        return OperationOutcome("casino", "rejected", "access_denied")
+    if (
+        message.chat.type == "channel"
+        or not message.from_user
+        or message.from_user.is_bot
+        or message.sender_chat is not None
+        or type(message.message_id) is not int
+        or message.message_id <= 0
+    ):
+        return OperationOutcome("casino", "rejected", "invalid_sender")
+    key, name = participant_ref(message)
+    reserve = await store.reserve_casino_spin(
+        chat_id=message.chat.id,
+        request_message_id=message.message_id,
+        participant_key=key,
+        participant_name=name,
+    )
+    if reserve.status == "insufficient_balance":
+        response = await reply_logged(message, f"Для слота нужно {CASINO_STAKE} очков.")
+        return OperationOutcome("casino", "rejected", "insufficient_balance", response_message_id=response.message_id)
+    if reserve.status == "identity_conflict":
+        logging.error("Casino invariant identity_conflict chat_id=%s message_id=%s", message.chat.id, message.message_id)
+        response = await reply_logged(message, "Не удалось безопасно обработать повторный спин.")
+        return OperationOutcome("casino", "rejected", "identity_conflict", response_message_id=response.message_id)
+    if reserve.status.startswith("existing_") and reserve.spin:
+        response = await reply_logged(message, render_casino_spin(reserve.spin))
+        return OperationOutcome(
+            "casino", "succeeded", reserve.status, response_message_id=response.message_id,
+            metadata=casino_outcome_metadata(reserve.spin),
+        )
+    if reserve.status != "created" or not reserve.spin:
+        return OperationOutcome("casino", "failed", "reserve_failed")
+    spin = reserve.spin
+    try:
+        sent = await message.reply_dice(emoji="🎰")
+    except asyncio.CancelledError:
+        await asyncio.shield(store.refund_casino_spin(spin_id=spin.spin_id, reason="telegram_cancelled"))
+        raise
+    except Exception:  # noqa: BLE001
+        logging.exception("Casino Dice send failed chat_id=%s spin_id=%s", message.chat.id, spin.spin_id)
+        refunded = await store.refund_casino_spin(spin_id=spin.spin_id, reason="telegram_outcome_unknown")
+        response = await reply_logged(message, render_casino_spin(refunded.spin or spin))
+        try:
+            await refresh_pinned_leaderboard(bot=bot, store=store, source_message=message)
+        except Exception:  # noqa: BLE001
+            logging.exception("Casino leaderboard refresh failed chat_id=%s", message.chat.id)
+        return OperationOutcome(
+            "casino", "partial", "telegram_outcome_unknown", response_message_id=response.message_id,
+            metadata=casino_outcome_metadata(refunded.spin),
+        )
+    dice = valid_slot_dice(sent, chat_id=message.chat.id)
+    if not dice:
+        refunded = await store.refund_casino_spin(spin_id=spin.spin_id, reason="telegram_response_invalid")
+        response = await reply_logged(message, render_casino_spin(refunded.spin or spin))
+        try:
+            await refresh_pinned_leaderboard(bot=bot, store=store, source_message=message)
+        except Exception:  # noqa: BLE001
+            logging.exception("Casino leaderboard refresh failed chat_id=%s", message.chat.id)
+        return OperationOutcome(
+            "casino", "partial", "telegram_response_invalid", response_message_id=response.message_id,
+            metadata=casino_outcome_metadata(refunded.spin),
+        )
+    dice_message_id, dice_value = dice
+    try:
+        settled = await store.settle_casino_spin(
+            spin_id=spin.spin_id,
+            dice_message_id=dice_message_id,
+            dice_value=dice_value,
+        )
+    except Exception:  # noqa: BLE001
+        logging.exception("Casino settlement failed chat_id=%s spin_id=%s", message.chat.id, spin.spin_id)
+        return OperationOutcome("casino", "failed", "settlement_unconfirmed")
+    if settled.status != "completed" or not settled.spin:
+        return OperationOutcome("casino", "failed", settled.status)
+    response = await reply_logged(message, render_casino_spin(settled.spin))
+    try:
+        await refresh_pinned_leaderboard(bot=bot, store=store, source_message=message)
+    except Exception:  # noqa: BLE001
+        logging.exception("Casino leaderboard refresh failed chat_id=%s", message.chat.id)
+    return OperationOutcome(
+        "casino", "succeeded", "completed", response_message_id=response.message_id,
+        metadata=casino_outcome_metadata(settled.spin),
     )
 
 
@@ -777,6 +947,7 @@ async def create_dispatcher(
             "`/summary today` - today in UTC\n"
             "`/balance` - your joke points in this chat\n"
             "`/top` - top joke points in this chat\n"
+            "`/casino` - spin the virtual slot for 10 chat points\n"
             "`/question 24h <text>` - chat with the assistant using recent context\n"
             "`/alias add <name[, name]>` - add chat names for the bot\n"
             "`/alias list` - show configured bot names\n"
@@ -935,13 +1106,17 @@ async def create_dispatcher(
         balance = await store.get_point_balance(chat_id=message.chat.id, participant_key=key)
         await answer_logged(message, f"Баланс {name}: `{balance.balance if balance else 0}` очков.")
 
+    @dp.message(Command("casino"))
+    async def casino_command(message: Message, bot: Bot) -> None:
+        await execute_slash_operation(message, "casino", spin_casino(settings, store, bot, message))
+
     @dp.message(Command("top"))
     async def top_command(message: Message) -> None:
         if not is_allowed(settings, message.chat.id):
             return
         balances = await store.get_top_point_balances(chat_id=message.chat.id, limit=10)
         if not balances:
-            await answer_logged(message, "Наград за шутки пока нет.")
+            await answer_logged(message, "Положительных балансов пока нет.")
             return
         await answer_logged(message, render_leaderboard(balances))
 
@@ -1581,6 +1756,15 @@ async def create_dispatcher(
                     route.period or settings.default_summary_period,
                     exclude_message_id=message.message_id,
                 ),
+                started=started,
+            )
+            return True
+        if route.action == "casino":
+            await execute_routed_operation(
+                message,
+                route,
+                "casino",
+                spin_casino(settings, store, bot, message),
                 started=started,
             )
             return True
@@ -3207,6 +3391,14 @@ async def main() -> None:
     setup_logging(settings)
     store = MessageStore(settings.database_path)
     await store.init()
+    startup_cutoff = datetime.now(timezone.utc)
+    bot = Bot(token=settings.telegram_bot_token)
+    recovery = await store.refund_pending_casino_spins(created_before=startup_cutoff)
+    for chat_id in recovery.chat_ids:
+        try:
+            await refresh_pinned_leaderboard_for_chat(bot=bot, store=store, chat_id=chat_id)
+        except Exception:  # noqa: BLE001
+            logging.exception("Startup casino leaderboard refresh failed chat_id=%s", chat_id)
     llm = build_llm_client(settings)
     question_llm = build_llm_client(settings, model=settings.question_model or None)
     router_llm = build_llm_client(
@@ -3260,7 +3452,6 @@ async def main() -> None:
     )
     gpu_lock = asyncio.Lock()
 
-    bot = Bot(token=settings.telegram_bot_token)
     dp = await create_dispatcher(
         settings,
         store,

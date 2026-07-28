@@ -10,6 +10,8 @@ from pathlib import Path
 
 import aiosqlite
 
+from tg_summary_bot.casino import CASINO_RULES_VERSION, CASINO_STAKE, slot_result
+
 
 @dataclass(frozen=True)
 class StoredMessage:
@@ -84,6 +86,40 @@ class PinnedLeaderboard:
     chat_id: int
     message_id: int
     updated_at: str
+
+
+@dataclass(frozen=True)
+class CasinoSpin:
+    spin_id: int
+    chat_id: int
+    request_message_id: int
+    participant_key: str
+    participant_name: str
+    rules_version: str
+    stake: int
+    dice_message_id: int | None
+    dice_value: int | None
+    category: str | None
+    payout: int | None
+    status: str
+    terminal_balance: int | None
+    terminal_reason: str | None
+    created_at: str
+    updated_at: str
+    completed_at: str | None
+    refunded_at: str | None
+
+
+@dataclass(frozen=True)
+class CasinoSpinResult:
+    status: str
+    spin: CasinoSpin | None = None
+
+
+@dataclass(frozen=True)
+class CasinoRecoveryResult:
+    spin_ids: tuple[int, ...]
+    chat_ids: tuple[int, ...]
 
 
 @dataclass(frozen=True)
@@ -245,6 +281,19 @@ class MessageStore:
                 )
                 """
             )
+            await self._ensure_column(
+                db,
+                table="chat_point_ledger",
+                column="casino_spin_id",
+                definition="INTEGER",
+            )
+            await db.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS uq_point_ledger_casino_spin_reason
+                ON chat_point_ledger(chat_id, reason, casino_spin_id)
+                WHERE casino_spin_id IS NOT NULL
+                """
+            )
             await db.execute(
                 """
                 CREATE TABLE IF NOT EXISTS chat_point_balances (
@@ -255,6 +304,43 @@ class MessageStore:
                     updated_at TEXT NOT NULL,
                     PRIMARY KEY(chat_id, participant_key)
                 )
+                """
+            )
+            await db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS chat_casino_spins (
+                    spin_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    chat_id INTEGER NOT NULL,
+                    request_message_id INTEGER NOT NULL CHECK(request_message_id > 0),
+                    participant_key TEXT NOT NULL,
+                    participant_name TEXT NOT NULL,
+                    rules_version TEXT NOT NULL,
+                    stake INTEGER NOT NULL CHECK(stake = 10),
+                    dice_message_id INTEGER CHECK(dice_message_id > 0),
+                    dice_value INTEGER CHECK(dice_value BETWEEN 1 AND 64),
+                    category TEXT CHECK(category IN ('none', 'pair', 'triple', 'jackpot')),
+                    payout INTEGER CHECK(payout IN (0, 5, 50, 250)),
+                    status TEXT NOT NULL CHECK(status IN ('pending', 'completed', 'refunded')),
+                    terminal_balance INTEGER CHECK(terminal_balance >= 0),
+                    terminal_reason TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    completed_at TEXT,
+                    refunded_at TEXT,
+                    UNIQUE(chat_id, request_message_id)
+                )
+                """
+            )
+            await db.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_chat_casino_spins_pending_created
+                ON chat_casino_spins(status, created_at)
+                """
+            )
+            await db.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_chat_casino_spins_chat_participant
+                ON chat_casino_spins(chat_id, participant_key, created_at)
                 """
             )
             await db.execute(
@@ -988,6 +1074,307 @@ class MessageStore:
                 except Exception:
                     await db.rollback()
                     raise
+
+    async def reserve_casino_spin(
+        self,
+        *,
+        chat_id: int,
+        request_message_id: int,
+        participant_key: str,
+        participant_name: str,
+        created_at: datetime | None = None,
+    ) -> CasinoSpinResult:
+        if request_message_id <= 0:
+            raise ValueError("request_message_id must be positive")
+        created_at = created_at or datetime.now(timezone.utc)
+        if created_at.tzinfo is None:
+            created_at = created_at.replace(tzinfo=timezone.utc)
+        now = created_at.astimezone(timezone.utc).isoformat()
+        async with self._write_lock:
+            async with aiosqlite.connect(self.database_path) as db:
+                await self._prepare_connection(db)
+                db.row_factory = aiosqlite.Row
+                try:
+                    await db.execute("BEGIN IMMEDIATE")
+                    cursor = await db.execute(
+                        "SELECT * FROM chat_casino_spins WHERE chat_id = ? AND request_message_id = ?",
+                        (chat_id, request_message_id),
+                    )
+                    existing = await cursor.fetchone()
+                    await cursor.close()
+                    if existing:
+                        spin = _casino_spin_from_row(existing)
+                        await db.rollback()
+                        if spin.participant_key != participant_key:
+                            return CasinoSpinResult("identity_conflict", spin)
+                        return CasinoSpinResult(f"existing_{spin.status}", spin)
+
+                    cursor = await db.execute(
+                        """
+                        INSERT INTO chat_casino_spins (
+                            chat_id, request_message_id, participant_key, participant_name,
+                            rules_version, stake, status, created_at, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?)
+                        """,
+                        (
+                            chat_id,
+                            request_message_id,
+                            participant_key,
+                            participant_name,
+                            CASINO_RULES_VERSION,
+                            CASINO_STAKE,
+                            now,
+                            now,
+                        ),
+                    )
+                    spin_id = int(cursor.lastrowid)
+                    await cursor.close()
+                    cursor = await db.execute(
+                        """
+                        UPDATE chat_point_balances
+                        SET balance = balance - ?, participant_name = ?, updated_at = ?
+                        WHERE chat_id = ? AND participant_key = ? AND balance >= ?
+                        """,
+                        (CASINO_STAKE, participant_name, now, chat_id, participant_key, CASINO_STAKE),
+                    )
+                    debited = cursor.rowcount > 0
+                    await cursor.close()
+                    if not debited:
+                        await db.rollback()
+                        return CasinoSpinResult("insufficient_balance")
+                    await db.execute(
+                        """
+                        INSERT INTO chat_point_ledger (
+                            chat_id, participant_key, participant_name, delta, reason,
+                            source_message_id, casino_spin_id, created_at
+                        ) VALUES (?, ?, ?, ?, 'casino_bet', ?, ?, ?)
+                        """,
+                        (
+                            chat_id,
+                            participant_key,
+                            participant_name,
+                            -CASINO_STAKE,
+                            request_message_id,
+                            spin_id,
+                            now,
+                        ),
+                    )
+                    spin = await _get_casino_spin(db, spin_id)
+                    await db.commit()
+                    return CasinoSpinResult("created", spin)
+                except Exception:
+                    await db.rollback()
+                    raise
+
+    async def settle_casino_spin(
+        self,
+        *,
+        spin_id: int,
+        dice_message_id: int,
+        dice_value: int,
+        completed_at: datetime | None = None,
+    ) -> CasinoSpinResult:
+        if type(dice_message_id) is not int or dice_message_id <= 0:
+            return CasinoSpinResult("invalid_dice")
+        try:
+            outcome = slot_result(dice_value)
+        except ValueError:
+            return CasinoSpinResult("invalid_dice")
+        completed_at = completed_at or datetime.now(timezone.utc)
+        if completed_at.tzinfo is None:
+            completed_at = completed_at.replace(tzinfo=timezone.utc)
+        now = completed_at.astimezone(timezone.utc).isoformat()
+        async with self._write_lock:
+            async with aiosqlite.connect(self.database_path) as db:
+                await self._prepare_connection(db)
+                db.row_factory = aiosqlite.Row
+                try:
+                    await db.execute("BEGIN IMMEDIATE")
+                    spin = await _get_casino_spin(db, spin_id)
+                    if not spin:
+                        await db.rollback()
+                        return CasinoSpinResult("not_found")
+                    if spin.status == "completed":
+                        await db.rollback()
+                        return CasinoSpinResult("already_completed", spin)
+                    if spin.status == "refunded":
+                        await db.rollback()
+                        return CasinoSpinResult("refunded_conflict", spin)
+                    await db.execute(
+                        """
+                        INSERT INTO chat_point_ledger (
+                            chat_id, participant_key, participant_name, delta, reason,
+                            source_message_id, casino_spin_id, created_at
+                        ) VALUES (?, ?, ?, ?, 'casino_payout', ?, ?, ?)
+                        """,
+                        (
+                            spin.chat_id,
+                            spin.participant_key,
+                            spin.participant_name,
+                            outcome.payout,
+                            spin.request_message_id,
+                            spin.spin_id,
+                            now,
+                        ),
+                    )
+                    await db.execute(
+                        """
+                        UPDATE chat_point_balances
+                        SET balance = balance + ?, participant_name = ?, updated_at = ?
+                        WHERE chat_id = ? AND participant_key = ?
+                        """,
+                        (outcome.payout, spin.participant_name, now, spin.chat_id, spin.participant_key),
+                    )
+                    cursor = await db.execute(
+                        "SELECT balance FROM chat_point_balances WHERE chat_id = ? AND participant_key = ?",
+                        (spin.chat_id, spin.participant_key),
+                    )
+                    balance_row = await cursor.fetchone()
+                    await cursor.close()
+                    if not balance_row:
+                        raise RuntimeError("casino balance disappeared during settlement")
+                    cursor = await db.execute(
+                        """
+                        UPDATE chat_casino_spins
+                        SET dice_message_id = ?, dice_value = ?, category = ?, payout = ?,
+                            status = 'completed', terminal_balance = ?, updated_at = ?, completed_at = ?
+                        WHERE spin_id = ? AND status = 'pending'
+                        """,
+                        (
+                            dice_message_id,
+                            dice_value,
+                            outcome.category,
+                            outcome.payout,
+                            int(balance_row[0]),
+                            now,
+                            now,
+                            spin_id,
+                        ),
+                    )
+                    transitioned = cursor.rowcount > 0
+                    await cursor.close()
+                    if not transitioned:
+                        raise RuntimeError("casino settlement transition failed")
+                    settled = await _get_casino_spin(db, spin_id)
+                    await db.commit()
+                    return CasinoSpinResult("completed", settled)
+                except Exception:
+                    await db.rollback()
+                    raise
+
+    async def refund_casino_spin(
+        self,
+        *,
+        spin_id: int,
+        reason: str,
+        refunded_at: datetime | None = None,
+    ) -> CasinoSpinResult:
+        if not reason or len(reason) > 100:
+            raise ValueError("refund reason must be a short stable code")
+        refunded_at = refunded_at or datetime.now(timezone.utc)
+        if refunded_at.tzinfo is None:
+            refunded_at = refunded_at.replace(tzinfo=timezone.utc)
+        now = refunded_at.astimezone(timezone.utc).isoformat()
+        async with self._write_lock:
+            async with aiosqlite.connect(self.database_path) as db:
+                await self._prepare_connection(db)
+                db.row_factory = aiosqlite.Row
+                try:
+                    await db.execute("BEGIN IMMEDIATE")
+                    spin = await _get_casino_spin(db, spin_id)
+                    if not spin:
+                        await db.rollback()
+                        return CasinoSpinResult("not_found")
+                    if spin.status == "refunded":
+                        await db.rollback()
+                        return CasinoSpinResult("already_refunded", spin)
+                    if spin.status == "completed":
+                        await db.rollback()
+                        return CasinoSpinResult("completed_conflict", spin)
+                    await db.execute(
+                        """
+                        INSERT INTO chat_point_ledger (
+                            chat_id, participant_key, participant_name, delta, reason,
+                            source_message_id, casino_spin_id, created_at
+                        ) VALUES (?, ?, ?, ?, 'casino_refund', ?, ?, ?)
+                        """,
+                        (
+                            spin.chat_id,
+                            spin.participant_key,
+                            spin.participant_name,
+                            spin.stake,
+                            spin.request_message_id,
+                            spin.spin_id,
+                            now,
+                        ),
+                    )
+                    await db.execute(
+                        """
+                        UPDATE chat_point_balances
+                        SET balance = balance + ?, participant_name = ?, updated_at = ?
+                        WHERE chat_id = ? AND participant_key = ?
+                        """,
+                        (spin.stake, spin.participant_name, now, spin.chat_id, spin.participant_key),
+                    )
+                    cursor = await db.execute(
+                        "SELECT balance FROM chat_point_balances WHERE chat_id = ? AND participant_key = ?",
+                        (spin.chat_id, spin.participant_key),
+                    )
+                    balance_row = await cursor.fetchone()
+                    await cursor.close()
+                    if not balance_row:
+                        raise RuntimeError("casino balance disappeared during refund")
+                    cursor = await db.execute(
+                        """
+                        UPDATE chat_casino_spins
+                        SET status = 'refunded', terminal_balance = ?, terminal_reason = ?,
+                            updated_at = ?, refunded_at = ?
+                        WHERE spin_id = ? AND status = 'pending'
+                        """,
+                        (int(balance_row[0]), reason, now, now, spin_id),
+                    )
+                    transitioned = cursor.rowcount > 0
+                    await cursor.close()
+                    if not transitioned:
+                        raise RuntimeError("casino refund transition failed")
+                    refunded = await _get_casino_spin(db, spin_id)
+                    await db.commit()
+                    return CasinoSpinResult("refunded", refunded)
+                except Exception:
+                    await db.rollback()
+                    raise
+
+    async def refund_pending_casino_spins(
+        self,
+        *,
+        created_before: datetime,
+    ) -> CasinoRecoveryResult:
+        if created_before.tzinfo is None:
+            created_before = created_before.replace(tzinfo=timezone.utc)
+        cutoff = created_before.astimezone(timezone.utc).isoformat()
+        async with aiosqlite.connect(self.database_path) as db:
+            await self._prepare_connection(db)
+            cursor = await db.execute(
+                """
+                SELECT spin_id FROM chat_casino_spins
+                WHERE status = 'pending' AND created_at < ? ORDER BY spin_id ASC
+                """,
+                (cutoff,),
+            )
+            rows = await cursor.fetchall()
+            await cursor.close()
+        spin_ids: list[int] = []
+        chat_ids: set[int] = set()
+        for row in rows:
+            result = await self.refund_casino_spin(
+                spin_id=int(row[0]),
+                reason="startup_recovery",
+                refunded_at=created_before,
+            )
+            if result.status == "refunded" and result.spin:
+                spin_ids.append(result.spin.spin_id)
+                chat_ids.add(result.spin.chat_id)
+        return CasinoRecoveryResult(tuple(spin_ids), tuple(sorted(chat_ids)))
 
     async def get_point_balance(self, *, chat_id: int, participant_key: str) -> PointBalance | None:
         async with aiosqlite.connect(self.database_path) as db:
@@ -2132,6 +2519,36 @@ def _stored_message_from_row(row: aiosqlite.Row, *, text: str | None = None) -> 
         reply_to_message_id=row["reply_to_message_id"],
         origin=str(row["origin"]) if "origin" in row.keys() else "legacy",
         kind=str(row["kind"]) if "kind" in row.keys() else "legacy_unclassified",
+    )
+
+
+async def _get_casino_spin(db: aiosqlite.Connection, spin_id: int) -> CasinoSpin | None:
+    cursor = await db.execute("SELECT * FROM chat_casino_spins WHERE spin_id = ?", (spin_id,))
+    row = await cursor.fetchone()
+    await cursor.close()
+    return _casino_spin_from_row(row) if row else None
+
+
+def _casino_spin_from_row(row: aiosqlite.Row) -> CasinoSpin:
+    return CasinoSpin(
+        spin_id=int(row["spin_id"]),
+        chat_id=int(row["chat_id"]),
+        request_message_id=int(row["request_message_id"]),
+        participant_key=str(row["participant_key"]),
+        participant_name=str(row["participant_name"]),
+        rules_version=str(row["rules_version"]),
+        stake=int(row["stake"]),
+        dice_message_id=int(row["dice_message_id"]) if row["dice_message_id"] is not None else None,
+        dice_value=int(row["dice_value"]) if row["dice_value"] is not None else None,
+        category=str(row["category"]) if row["category"] is not None else None,
+        payout=int(row["payout"]) if row["payout"] is not None else None,
+        status=str(row["status"]),
+        terminal_balance=(int(row["terminal_balance"]) if row["terminal_balance"] is not None else None),
+        terminal_reason=(str(row["terminal_reason"]) if row["terminal_reason"] is not None else None),
+        created_at=str(row["created_at"]),
+        updated_at=str(row["updated_at"]),
+        completed_at=str(row["completed_at"]) if row["completed_at"] is not None else None,
+        refunded_at=str(row["refunded_at"]) if row["refunded_at"] is not None else None,
     )
 
 

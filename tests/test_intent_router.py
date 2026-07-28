@@ -7,6 +7,7 @@ from tg_summary_bot.intent_router import (
     IntentRoute,
     IntentRouter,
     infer_profile_query,
+    is_casino_request,
     is_joke_request,
     parse_route_response,
 )
@@ -82,6 +83,13 @@ class IntentRouteParserTests(unittest.TestCase):
         self.assertFalse(parse_route_response('{"action":"wiki","period":null,"query":"' + "a" * 501 + '"}').valid)
         self.assertFalse(parse_route_response('{"action":"summary","period":"' + "1" * 33 + 'h","query":null}').valid)
 
+    def test_casino_requires_null_model_fields(self) -> None:
+        self.assertFalse(parse_route_response('{"action":"casino","period":"1h","query":null}').valid)
+        self.assertFalse(parse_route_response('{"action":"casino","period":null,"query":"100"}').valid)
+        route = parse_route_response('{"action":"casino","period":null,"query":null}')
+        self.assertTrue(route.valid)
+        self.assertEqual(route.action, "casino")
+
 
 class IntentRouterTests(unittest.IsolatedAsyncioTestCase):
     async def test_routes_truncated_input_as_json(self) -> None:
@@ -122,6 +130,22 @@ class IntentRouterTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(route.valid)
         self.assertEqual(route.action, "profile_show")
         self.assertEqual(route.query, "Артёма")
+
+    async def test_casino_needs_action_verb_and_object(self) -> None:
+        router = IntentRouter(FakeLLM('{"action":"casino","period":null,"query":null}'))  # type: ignore[arg-type]
+        for text in (
+            "Реле, прокрути казино",
+            "Реле, крутань слот",
+            "Реле, сыграй в слоты",
+            "Реле, крутануть казик",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(is_casino_request(text))
+                self.assertEqual((await router.route(text)).action, "casino")
+        for text in ("что ты думаешь о казино?", "объясни правила слотов", "вчера было казино"):
+            with self.subTest(text=text):
+                self.assertFalse(is_casino_request(text))
+                self.assertEqual((await router.route(text)).reason, "casino_not_explicit")
 
     def test_production_router_constructor_is_imported(self) -> None:
         self.assertIs(bot_module.IntentRouter, IntentRouter)
