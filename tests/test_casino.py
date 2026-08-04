@@ -1,4 +1,5 @@
 import asyncio
+import sqlite3
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -9,7 +10,7 @@ from unittest.mock import AsyncMock
 import aiosqlite
 
 from tg_summary_bot.bot import spin_casino
-from tg_summary_bot.casino import CASINO_RULES_VERSION, CASINO_STAKE, slot_result
+from tg_summary_bot.casino import CASINO_RULES_VERSION, CASINO_STAKE, bot_request_casino_trigger, slot_result
 from tg_summary_bot.storage import MessageStore
 
 
@@ -95,6 +96,38 @@ class CasinoStorageTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(tuple(ledger), ("best_joke", None))
         self.assertIn("casino_spin_id", {row[1] for row in columns})
 
+    async def test_trigger_migration_preserves_feature04_spin(self) -> None:
+        legacy_path = Path(self.directory.name) / "feature04.sqlite3"
+        connection = sqlite3.connect(legacy_path)
+        connection.execute(
+            """CREATE TABLE chat_casino_spins (
+                spin_id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER NOT NULL,
+                request_message_id INTEGER NOT NULL CHECK(request_message_id > 0),
+                participant_key TEXT NOT NULL, participant_name TEXT NOT NULL,
+                rules_version TEXT NOT NULL, stake INTEGER NOT NULL CHECK(stake = 10),
+                dice_message_id INTEGER, dice_value INTEGER, category TEXT, payout INTEGER,
+                status TEXT NOT NULL, terminal_balance INTEGER, terminal_reason TEXT,
+                created_at TEXT NOT NULL, updated_at TEXT NOT NULL, completed_at TEXT, refunded_at TEXT,
+                UNIQUE(chat_id, request_message_id))"""
+        )
+        connection.execute(
+            """INSERT INTO chat_casino_spins
+               (spin_id, chat_id, request_message_id, participant_key, participant_name, rules_version,
+                stake, status, created_at, updated_at) VALUES (7, 1, 42, 'id:1', 'Alice', ?, 10,
+                'pending', ?, ?)""",
+            (CASINO_RULES_VERSION, NOW.isoformat(), NOW.isoformat()),
+        )
+        connection.commit()
+        connection.close()
+        migrated = MessageStore(legacy_path)
+        await migrated.init()
+        await migrated.init()
+        async with aiosqlite.connect(legacy_path) as db:
+            row = await (await db.execute(
+                "SELECT spin_id, trigger_kind, trigger_key, request_message_id FROM chat_casino_spins"
+            )).fetchone()
+        self.assertEqual(tuple(row), (7, "user_request", "user-message:42", 42))
+
     async def test_reserve_duplicate_identity_and_insufficient(self) -> None:
         self.assertEqual((await self.store.reserve_casino_spin(
             chat_id=1, request_message_id=1, participant_key="id:1", participant_name="Alice"
@@ -112,6 +145,17 @@ class CasinoStorageTests(unittest.IsolatedAsyncioTestCase):
             chat_id=1, request_message_id=1, participant_key="id:2", participant_name="Bob"
         )).status, "identity_conflict")
         self.assertEqual(await self.ledger_sum(), 0)
+
+    async def test_request_message_trigger_collision_is_an_identity_conflict(self) -> None:
+        await self.fund()
+        await self.store.reserve_casino_spin(
+            chat_id=1, request_message_id=8, participant_key="id:1", participant_name="Alice"
+        )
+        collision = await self.store.reserve_casino_spin(
+            chat_id=1, request_message_id=8, participant_key="id:99", participant_name="Bot",
+            trigger=bot_request_casino_trigger(8),
+        )
+        self.assertEqual(collision.status, "identity_conflict")
 
     async def test_concurrent_reserves_do_not_overdraw_across_store_instances(self) -> None:
         await self.fund()
@@ -258,6 +302,15 @@ class CasinoBotTests(unittest.IsolatedAsyncioTestCase):
         outcome = await spin_casino(self.settings, self.store, SimpleNamespace(), message)
         self.assertEqual(outcome.reason, "insufficient_balance")
         self.assertEqual(message.dice_calls, [])
+
+    async def test_disabled_chat_never_reserves_or_sends_dice(self) -> None:
+        message = self.message()
+        settings = SimpleNamespace(allowed_chat_ids=set(), casino_disabled_chat_ids={1})
+        outcome = await spin_casino(settings, self.store, SimpleNamespace(), message)
+        self.assertEqual(outcome.reason, "feature_disabled")
+        self.assertEqual(message.dice_calls, [])
+        balance = await self.store.get_point_balance(chat_id=1, participant_key="id:1")
+        self.assertEqual(balance.balance if balance else None, 10)
 
     async def test_unknown_send_outcome_refunds_once(self) -> None:
         message = self.message(dice_error=TimeoutError())

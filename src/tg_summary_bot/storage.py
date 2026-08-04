@@ -2,15 +2,17 @@ from __future__ import annotations
 
 import asyncio
 import json
+import random
 import re
 import unicodedata
+import uuid
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import aiosqlite
 
-from tg_summary_bot.casino import CASINO_RULES_VERSION, CASINO_STAKE, slot_result
+from tg_summary_bot.casino import CASINO_RULES_VERSION, CASINO_STAKE, CasinoTrigger, slot_result, user_casino_trigger
 
 
 @dataclass(frozen=True)
@@ -82,6 +84,43 @@ class JokeAwardResult:
 
 
 @dataclass(frozen=True)
+class JokeJob:
+    job_id: int
+    chat_id: int
+    first_queue_id: int
+    last_queue_id: int
+    message_count: int
+    policy_version: str
+    status: str
+    attempt_count: int
+    next_attempt_at: str | None
+    lease_token: str | None
+    lease_until: str | None
+    winner_source_message_id: int | None
+    winner_participant_key: str | None
+    winner_participant_name: str | None
+    winner_source_text: str | None
+    winner_source_created_at: str | None
+    award_ledger_entry_id: int | None
+
+
+@dataclass(frozen=True)
+class JokeJobResult:
+    status: str
+    job: JokeJob | None = None
+
+
+@dataclass(frozen=True)
+class JokeOutbox:
+    outbox_id: int
+    job_id: int
+    action: str
+    status: str
+    attempt_count: int
+    lease_token: str | None
+
+
+@dataclass(frozen=True)
 class PinnedLeaderboard:
     chat_id: int
     message_id: int
@@ -92,7 +131,9 @@ class PinnedLeaderboard:
 class CasinoSpin:
     spin_id: int
     chat_id: int
-    request_message_id: int
+    request_message_id: int | None
+    trigger_kind: str
+    trigger_key: str
     participant_key: str
     participant_name: str
     rules_version: str
@@ -226,7 +267,7 @@ class MessageStore:
             await self._prepare_connection(db)
             await db.execute("PRAGMA journal_mode=WAL")
             await db.execute(
-                """
+                f"""
                 CREATE TABLE IF NOT EXISTS messages (
                     chat_id INTEGER NOT NULL,
                     message_id INTEGER NOT NULL,
@@ -287,11 +328,24 @@ class MessageStore:
                 column="casino_spin_id",
                 definition="INTEGER",
             )
+            await self._ensure_column(
+                db,
+                table="chat_point_ledger",
+                column="joke_job_id",
+                definition="INTEGER",
+            )
             await db.execute(
                 """
                 CREATE UNIQUE INDEX IF NOT EXISTS uq_point_ledger_casino_spin_reason
                 ON chat_point_ledger(chat_id, reason, casino_spin_id)
                 WHERE casino_spin_id IS NOT NULL
+                """
+            )
+            await db.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS uq_point_ledger_joke_job
+                ON chat_point_ledger(joke_job_id)
+                WHERE joke_job_id IS NOT NULL
                 """
             )
             await db.execute(
@@ -331,6 +385,9 @@ class MessageStore:
                 )
                 """
             )
+            # The table-copy migration needs an exclusive transaction of its own.
+            await db.commit()
+            await self._ensure_casino_trigger_schema(db)
             await db.execute(
                 """
                 CREATE INDEX IF NOT EXISTS idx_chat_casino_spins_pending_created
@@ -350,6 +407,163 @@ class MessageStore:
                     message_id INTEGER NOT NULL,
                     updated_at TEXT NOT NULL
                 )
+                """
+            )
+            await db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS chat_joke_inbox (
+                    queue_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    chat_id INTEGER NOT NULL,
+                    source_message_id INTEGER NOT NULL,
+                    enqueued_at TEXT NOT NULL,
+                    UNIQUE(chat_id, source_message_id)
+                )
+                """
+            )
+            await db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS autonomous_joke_state (
+                    singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+                    started_at TEXT NOT NULL
+                )
+                """
+            )
+            await db.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_chat_joke_inbox_chat_queue
+                ON chat_joke_inbox(chat_id, queue_id)
+                """
+            )
+            await db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS chat_joke_jobs (
+                    job_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    chat_id INTEGER NOT NULL,
+                    first_queue_id INTEGER NOT NULL,
+                    last_queue_id INTEGER NOT NULL,
+                    message_count INTEGER NOT NULL CHECK(message_count > 0),
+                    policy_version TEXT NOT NULL,
+                    status TEXT NOT NULL CHECK(status IN (
+                        'pending', 'running', 'retry', 'shadow_selected', 'shadow_no_joke',
+                        'no_joke', 'awarded', 'already_awarded', 'source_invalid'
+                    )),
+                    attempt_count INTEGER NOT NULL DEFAULT 0 CHECK(attempt_count >= 0),
+                    next_attempt_at TEXT,
+                    lease_owner TEXT,
+                    lease_token TEXT,
+                    lease_until TEXT,
+                    selector_status TEXT,
+                    winner_source_message_id INTEGER,
+                    winner_participant_key TEXT,
+                    winner_participant_name TEXT,
+                    winner_source_text TEXT,
+                    winner_source_created_at TEXT,
+                    winner_source_hash TEXT,
+                    award_ledger_entry_id INTEGER,
+                    bot_spin_decision TEXT CHECK(bot_spin_decision IN (
+                        'skip', 'insufficient_balance', 'spin', 'completed', 'refunded'
+                    )),
+                    bot_spin_id INTEGER,
+                    last_error_code TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    completed_at TEXT,
+                    UNIQUE(chat_id, first_queue_id, last_queue_id),
+                    CHECK(first_queue_id <= last_queue_id)
+                )
+                """
+            )
+            await self._ensure_column(
+                db,
+                table="chat_joke_jobs",
+                column="winner_source_created_at",
+                definition="TEXT",
+            )
+            await self._ensure_column(
+                db,
+                table="chat_joke_jobs",
+                column="bot_spin_decision",
+                definition="TEXT",
+            )
+            await self._ensure_column(
+                db,
+                table="chat_joke_jobs",
+                column="bot_spin_id",
+                definition="INTEGER",
+            )
+            await db.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_chat_joke_jobs_due
+                ON chat_joke_jobs(status, next_attempt_at, lease_until)
+                """
+            )
+            await db.execute(
+                """CREATE TABLE IF NOT EXISTS schema_migrations (
+                    name TEXT PRIMARY KEY,
+                    applied_at TEXT NOT NULL
+                )"""
+            )
+            cursor = await db.execute(
+                "INSERT OR IGNORE INTO schema_migrations(name, applied_at) VALUES ('feature_05c_bot_decisions', ?)",
+                (datetime.now(timezone.utc).isoformat(),),
+            )
+            migrate_bot_decisions = cursor.rowcount > 0
+            await cursor.close()
+            if migrate_bot_decisions:
+                await db.execute(
+                    """UPDATE chat_joke_jobs SET bot_spin_decision = 'skip'
+                       WHERE status IN ('no_joke', 'awarded', 'already_awarded', 'source_invalid',
+                                        'shadow_selected', 'shadow_no_joke')
+                         AND bot_spin_decision IS NULL"""
+                )
+            await db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS chat_joke_job_items (
+                    job_id INTEGER NOT NULL,
+                    position INTEGER NOT NULL CHECK(position >= 0),
+                    queue_id INTEGER NOT NULL,
+                    source_message_id INTEGER NOT NULL,
+                    PRIMARY KEY(job_id, position),
+                    UNIQUE(queue_id),
+                    UNIQUE(job_id, source_message_id)
+                )
+                """
+            )
+            await db.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_chat_joke_job_items_job
+                ON chat_joke_job_items(job_id, position)
+                """
+            )
+            await db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS chat_joke_outbox (
+                    outbox_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    job_id INTEGER NOT NULL,
+                    action TEXT NOT NULL CHECK(action IN (
+                        'award_notification', 'award_leaderboard_refresh',
+                        'bot_casino', 'casino_leaderboard_refresh'
+                    )),
+                    status TEXT NOT NULL CHECK(status IN ('pending', 'running', 'retry', 'completed', 'skipped')),
+                    attempt_count INTEGER NOT NULL DEFAULT 0 CHECK(attempt_count >= 0),
+                    next_attempt_at TEXT,
+                    lease_owner TEXT,
+                    lease_token TEXT,
+                    lease_until TEXT,
+                    telegram_message_id INTEGER,
+                    casino_spin_id INTEGER,
+                    last_error_code TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    completed_at TEXT,
+                    UNIQUE(job_id, action)
+                )
+                """
+            )
+            await db.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_chat_joke_outbox_due
+                ON chat_joke_outbox(status, next_attempt_at, lease_until)
                 """
             )
             await db.execute(
@@ -539,6 +753,88 @@ class MessageStore:
         if column not in existing:
             await db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
+    async def _ensure_casino_trigger_schema(self, db: aiosqlite.Connection) -> None:
+        """Upgrade Feature 04's request-only table without changing historical spin ids."""
+        cursor = await db.execute("PRAGMA table_info(chat_casino_spins)")
+        columns = {str(row[1]) for row in await cursor.fetchall()}
+        await cursor.close()
+        if "trigger_key" in columns:
+            await db.execute(
+                """CREATE UNIQUE INDEX IF NOT EXISTS uq_chat_casino_spins_request_message
+                   ON chat_casino_spins(chat_id, request_message_id) WHERE request_message_id IS NOT NULL"""
+            )
+            return
+        try:
+            await db.execute("BEGIN IMMEDIATE")
+            cursor = await db.execute("SELECT COUNT(*) FROM chat_casino_spins")
+            legacy_count = int((await cursor.fetchone())[0])
+            await cursor.close()
+            await db.execute("ALTER TABLE chat_casino_spins RENAME TO chat_casino_spins_legacy")
+            await db.execute(
+                """
+                CREATE TABLE chat_casino_spins (
+                    spin_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    chat_id INTEGER NOT NULL,
+                    request_message_id INTEGER CHECK(request_message_id IS NULL OR request_message_id > 0),
+                    trigger_kind TEXT NOT NULL CHECK(trigger_kind IN ('user_request', 'bot_request', 'bot_automatic')),
+                    trigger_key TEXT NOT NULL,
+                    participant_key TEXT NOT NULL,
+                    participant_name TEXT NOT NULL,
+                    rules_version TEXT NOT NULL,
+                    stake INTEGER NOT NULL CHECK(stake = 10),
+                    dice_message_id INTEGER CHECK(dice_message_id > 0),
+                    dice_value INTEGER CHECK(dice_value BETWEEN 1 AND 64),
+                    category TEXT CHECK(category IN ('none', 'pair', 'triple', 'jackpot')),
+                    payout INTEGER CHECK(payout IN (0, 5, 50, 250)),
+                    status TEXT NOT NULL CHECK(status IN ('pending', 'completed', 'refunded')),
+                    terminal_balance INTEGER CHECK(terminal_balance >= 0),
+                    terminal_reason TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    completed_at TEXT,
+                    refunded_at TEXT,
+                    UNIQUE(chat_id, trigger_key),
+                    CHECK((trigger_kind IN ('user_request', 'bot_request') AND request_message_id IS NOT NULL)
+                          OR (trigger_kind = 'bot_automatic' AND request_message_id IS NULL))
+                )
+                """
+            )
+            await db.execute(
+                """INSERT INTO chat_casino_spins
+                   (spin_id, chat_id, request_message_id, trigger_kind, trigger_key, participant_key,
+                    participant_name, rules_version, stake, dice_message_id, dice_value, category, payout,
+                    status, terminal_balance, terminal_reason, created_at, updated_at, completed_at, refunded_at)
+                   SELECT spin_id, chat_id, request_message_id, 'user_request',
+                          'user-message:' || request_message_id, participant_key, participant_name,
+                          rules_version, stake, dice_message_id, dice_value, category, payout, status,
+                          terminal_balance, terminal_reason, created_at, updated_at, completed_at, refunded_at
+                    FROM chat_casino_spins_legacy"""
+            )
+            cursor = await db.execute("SELECT COUNT(*) FROM chat_casino_spins")
+            copied_count = int((await cursor.fetchone())[0])
+            await cursor.close()
+            if copied_count != legacy_count:
+                raise RuntimeError("casino migration row count mismatch")
+            cursor = await db.execute(
+                """SELECT COUNT(*) FROM chat_casino_spins
+                   WHERE trigger_kind != 'user_request'
+                      OR trigger_key != 'user-message:' || request_message_id
+                      OR request_message_id IS NULL"""
+            )
+            invalid_count = int((await cursor.fetchone())[0])
+            await cursor.close()
+            if invalid_count:
+                raise RuntimeError("casino migration trigger invariant failed")
+            await db.execute("DROP TABLE chat_casino_spins_legacy")
+            await db.execute(
+                """CREATE UNIQUE INDEX IF NOT EXISTS uq_chat_casino_spins_request_message
+                   ON chat_casino_spins(chat_id, request_message_id) WHERE request_message_id IS NOT NULL"""
+            )
+            await db.commit()
+        except Exception:
+            await db.rollback()
+            raise
+
     async def _init_fts_tables(self, db: aiosqlite.Connection) -> None:
         try:
             await self._drop_contentless_fts_table(db, "chat_memory_blocks_fts")
@@ -639,22 +935,42 @@ class MessageStore:
                         origin = excluded.origin,
                         kind = excluded.kind
                     """
-                await db.execute(
-                    sql,
-                    (
-                        chat_id,
-                        message_id,
-                        chat_type,
-                        sender_id,
-                        sender_name,
-                        text,
-                        created_at_iso,
-                        reply_to_message_id,
-                        origin,
-                        kind,
-                    ),
-                )
-                await db.commit()
+                try:
+                    await db.execute("BEGIN")
+                    await db.execute(
+                        sql,
+                        (
+                            chat_id,
+                            message_id,
+                            chat_type,
+                            sender_id,
+                            sender_name,
+                            text,
+                            created_at_iso,
+                            reply_to_message_id,
+                            origin,
+                            kind,
+                        ),
+                    )
+                    # Read the persisted row: a replace may alter eligibility.
+                    cursor = await db.execute(
+                        "SELECT origin, kind FROM messages WHERE chat_id = ? AND message_id = ?",
+                        (chat_id, message_id),
+                    )
+                    row = await cursor.fetchone()
+                    await cursor.close()
+                    if row and is_eligible_message_provenance(str(row[0]), str(row[1])):
+                        await db.execute(
+                            """
+                            INSERT OR IGNORE INTO chat_joke_inbox
+                            (chat_id, source_message_id, enqueued_at) VALUES (?, ?, ?)
+                            """,
+                            (chat_id, message_id, datetime.now(timezone.utc).isoformat()),
+                        )
+                    await db.commit()
+                except Exception:
+                    await db.rollback()
+                    raise
 
     async def add_chat_bot_alias(
         self,
@@ -711,7 +1027,7 @@ class MessageStore:
                 SELECT chat_id, alias, normalized_alias, created_by_user_id, created_at
                 FROM chat_bot_aliases
                 WHERE chat_id = ?
-                ORDER BY created_at ASC, normalized_alias ASC
+                ORDER BY created_at ASC, rowid ASC
                 """,
                 (chat_id,),
             )
@@ -1075,17 +1391,693 @@ class MessageStore:
                     await db.rollback()
                     raise
 
+    async def backfill_autonomous_joke_inbox(
+        self,
+        *,
+        allowed_chat_ids: set[int],
+        disabled_chat_ids: set[int] | None = None,
+        lookback: timedelta,
+        start_after: datetime | None = None,
+        now: datetime | None = None,
+    ) -> int:
+        now = now or datetime.now(timezone.utc)
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=timezone.utc)
+        since_at = now - lookback
+        if start_after is not None:
+            if start_after.tzinfo is None:
+                start_after = start_after.replace(tzinfo=timezone.utc)
+            since_at = max(since_at, start_after)
+        since = since_at.astimezone(timezone.utc).isoformat()
+        async with self._write_lock:
+            async with aiosqlite.connect(self.database_path) as db:
+                await self._prepare_connection(db)
+                await db.execute("BEGIN IMMEDIATE")
+                chat_clause = ""
+                params: list[object] = [since]
+                if allowed_chat_ids:
+                    placeholders = ",".join("?" for _ in allowed_chat_ids)
+                    chat_clause = f"AND chat_id IN ({placeholders})"
+                    params.extend(sorted(allowed_chat_ids))
+                if disabled_chat_ids:
+                    placeholders = ",".join("?" for _ in disabled_chat_ids)
+                    chat_clause += f" AND chat_id NOT IN ({placeholders})"
+                    params.extend(sorted(disabled_chat_ids))
+                cursor = await db.execute(
+                    f"""
+                    SELECT chat_id, message_id, created_at FROM messages
+                    WHERE created_at >= ? {chat_clause}
+                      AND ({eligible_message_provenance_sql()})
+                    ORDER BY created_at ASC, message_id ASC
+                    """,
+                    params,
+                )
+                rows = await cursor.fetchall()
+                await cursor.close()
+                inserted = 0
+                for row in rows:
+                    cursor = await db.execute(
+                        """INSERT OR IGNORE INTO chat_joke_inbox
+                        (chat_id, source_message_id, enqueued_at) VALUES (?, ?, ?)""",
+                        (int(row[0]), int(row[1]), str(row[2])),
+                    )
+                    inserted += max(cursor.rowcount, 0)
+                    await cursor.close()
+                await db.commit()
+        return inserted
+
+    async def get_or_create_autonomous_joke_start_at(self, *, now: datetime | None = None) -> datetime:
+        now = now or datetime.now(timezone.utc)
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=timezone.utc)
+        now_iso = now.astimezone(timezone.utc).isoformat()
+        async with self._write_lock:
+            async with aiosqlite.connect(self.database_path) as db:
+                await self._prepare_connection(db)
+                await db.execute("BEGIN IMMEDIATE")
+                await db.execute(
+                    "INSERT OR IGNORE INTO autonomous_joke_state(singleton, started_at) VALUES (1, ?)",
+                    (now_iso,),
+                )
+                cursor = await db.execute("SELECT started_at FROM autonomous_joke_state WHERE singleton = 1")
+                row = await cursor.fetchone()
+                await cursor.close()
+                await db.commit()
+        started_at = datetime.fromisoformat(str(row[0]))
+        return started_at if started_at.tzinfo is not None else started_at.replace(tzinfo=timezone.utc)
+
+    async def plan_autonomous_joke_jobs(
+        self,
+        *,
+        allowed_chat_ids: set[int],
+        disabled_chat_ids: set[int] | None = None,
+        start_after: datetime | None = None,
+        block_messages: int,
+        partial_min_messages: int,
+        max_block_age: timedelta,
+        now: datetime | None = None,
+    ) -> list[JokeJob]:
+        if block_messages <= 0 or not 1 <= partial_min_messages <= block_messages:
+            raise ValueError("invalid autonomous joke block settings")
+        now = now or datetime.now(timezone.utc)
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=timezone.utc)
+        age_cutoff = (now - max_block_age).astimezone(timezone.utc).isoformat()
+        start_after_iso = None
+        if start_after is not None:
+            if start_after.tzinfo is None:
+                start_after = start_after.replace(tzinfo=timezone.utc)
+            start_after_iso = start_after.astimezone(timezone.utc).isoformat()
+        policy_version = (
+            "message_blocks_20_or_24h_v1"
+            if block_messages == 20 and max_block_age == timedelta(hours=24)
+            else f"message_blocks_{block_messages}_or_{int(max_block_age.total_seconds())}s_v1"
+        )
+        created: list[JokeJob] = []
+        async with self._write_lock:
+            async with aiosqlite.connect(self.database_path) as db:
+                await self._prepare_connection(db)
+                await db.execute("BEGIN IMMEDIATE")
+                chat_clauses: list[str] = []
+                chat_params: list[object] = []
+                if allowed_chat_ids:
+                    placeholders = ",".join("?" for _ in allowed_chat_ids)
+                    chat_clauses.append(f"i.chat_id IN ({placeholders})")
+                    chat_params.extend(sorted(allowed_chat_ids))
+                if disabled_chat_ids:
+                    placeholders = ",".join("?" for _ in disabled_chat_ids)
+                    chat_clauses.append(f"i.chat_id NOT IN ({placeholders})")
+                    chat_params.extend(sorted(disabled_chat_ids))
+                chat_clause = f"WHERE {' AND '.join(chat_clauses)}" if chat_clauses else ""
+                start_after_clause = (
+                    f"{' AND' if chat_clause else ' WHERE'} m.created_at >= ?" if start_after_iso else ""
+                )
+                cursor = await db.execute(
+                    f"""SELECT DISTINCT i.chat_id FROM chat_joke_inbox i
+                        JOIN messages m ON m.chat_id = i.chat_id AND m.message_id = i.source_message_id
+                        {chat_clause}{start_after_clause}
+                        ORDER BY i.chat_id""",
+                    [*chat_params, start_after_iso] if start_after_iso else chat_params,
+                )
+                chat_ids = [int(row[0]) for row in await cursor.fetchall()]
+                await cursor.close()
+                for chat_id in chat_ids:
+                    while True:
+                        cursor = await db.execute(
+                            f"""
+                            SELECT i.queue_id, i.source_message_id, i.enqueued_at
+                            FROM chat_joke_inbox i
+                            JOIN messages m ON m.chat_id = i.chat_id
+                                           AND m.message_id = i.source_message_id
+                            LEFT JOIN chat_joke_job_items ji ON ji.queue_id = i.queue_id
+                            WHERE i.chat_id = ? AND ji.queue_id IS NULL
+                              AND ({eligible_message_provenance_sql(table_alias='m')})
+                              {"AND m.created_at >= ?" if start_after_iso else ""}
+                            ORDER BY i.queue_id ASC LIMIT ?
+                            """,
+                            (chat_id, start_after_iso, block_messages)
+                            if start_after_iso else (chat_id, block_messages),
+                        )
+                        rows = await cursor.fetchall()
+                        await cursor.close()
+                        if len(rows) >= block_messages:
+                            chosen = rows
+                        elif (
+                            len(rows) >= partial_min_messages
+                            and str(rows[0][2]) <= age_cutoff
+                        ):
+                            chosen = rows
+                        else:
+                            break
+                        now_iso = now.astimezone(timezone.utc).isoformat()
+                        cursor = await db.execute(
+                            """
+                            INSERT INTO chat_joke_jobs (
+                                chat_id, first_queue_id, last_queue_id, message_count,
+                                policy_version, status, created_at, updated_at
+                            ) VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)
+                            """,
+                            (chat_id, int(chosen[0][0]), int(chosen[-1][0]), len(chosen), policy_version, now_iso, now_iso),
+                        )
+                        job_id = int(cursor.lastrowid)
+                        await cursor.close()
+                        await db.executemany(
+                            """INSERT INTO chat_joke_job_items
+                            (job_id, position, queue_id, source_message_id) VALUES (?, ?, ?, ?)""",
+                            [(job_id, index, int(row[0]), int(row[1])) for index, row in enumerate(chosen)],
+                        )
+                        created.append(
+                            JokeJob(job_id, chat_id, int(chosen[0][0]), int(chosen[-1][0]), len(chosen),
+                                    policy_version, "pending", 0, None, None, None,
+                                    None, None, None, None, None, None)
+                        )
+                await db.commit()
+        return created
+
+    async def get_joke_job_messages(self, job_id: int) -> list[StoredMessage]:
+        async with aiosqlite.connect(self.database_path) as db:
+            await self._prepare_connection(db)
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                f"""
+                SELECT m.message_id, m.chat_id, m.chat_type, m.sender_id, m.sender_name,
+                       m.text, m.created_at, m.reply_to_message_id, m.origin, m.kind
+                FROM chat_joke_job_items ji
+                JOIN messages m ON m.chat_id = (SELECT chat_id FROM chat_joke_jobs WHERE job_id = ji.job_id)
+                           AND m.message_id = ji.source_message_id
+                WHERE ji.job_id = ? AND ({eligible_message_provenance_sql(table_alias='m')})
+                ORDER BY ji.position ASC
+                """,
+                (job_id,),
+            )
+            rows = await cursor.fetchall()
+            await cursor.close()
+        return [_stored_message_from_row(row) for row in rows]
+
+    async def claim_due_joke_job(
+        self, *, worker_id: str, now: datetime, lease_seconds: int, disabled_chat_ids: set[int] | None = None,
+        start_after: datetime | None = None,
+    ) -> JokeJob | None:
+        if lease_seconds <= 0:
+            raise ValueError("lease_seconds must be positive")
+        now_iso = now.astimezone(timezone.utc).isoformat()
+        lease_until = (now + timedelta(seconds=lease_seconds)).astimezone(timezone.utc).isoformat()
+        async with self._write_lock:
+            async with aiosqlite.connect(self.database_path) as db:
+                await self._prepare_connection(db)
+                db.row_factory = aiosqlite.Row
+                await db.execute("BEGIN IMMEDIATE")
+                excluded_clause = ""
+                params: list[object] = [now_iso, now_iso]
+                if disabled_chat_ids:
+                    placeholders = ",".join("?" for _ in disabled_chat_ids)
+                    excluded_clause = f"AND chat_id NOT IN ({placeholders})"
+                    params.extend(sorted(disabled_chat_ids))
+                if start_after is not None:
+                    if start_after.tzinfo is None:
+                        start_after = start_after.replace(tzinfo=timezone.utc)
+                    excluded_clause += " AND created_at >= ?"
+                    params.append(start_after.astimezone(timezone.utc).isoformat())
+                cursor = await db.execute(
+                    """
+                    SELECT * FROM chat_joke_jobs
+                    WHERE ((status IN ('pending', 'retry') AND (next_attempt_at IS NULL OR next_attempt_at <= ?))
+                       OR (status = 'running' AND (lease_until IS NULL OR lease_until <= ?)))
+                    """ + excluded_clause + """
+                    ORDER BY job_id ASC LIMIT 1
+                    """,
+                    params,
+                )
+                row = await cursor.fetchone()
+                await cursor.close()
+                if not row:
+                    await db.rollback()
+                    return None
+                token = uuid.uuid4().hex
+                await db.execute(
+                    """UPDATE chat_joke_jobs SET status='running', attempt_count=attempt_count+1,
+                       lease_owner=?, lease_token=?, lease_until=?, updated_at=? WHERE job_id=?""",
+                    (worker_id, token, lease_until, now_iso, int(row["job_id"])),
+                )
+                cursor = await db.execute("SELECT * FROM chat_joke_jobs WHERE job_id = ?", (int(row["job_id"]),))
+                claimed = await cursor.fetchone()
+                await cursor.close()
+                await db.commit()
+        return _joke_job_from_row(claimed)
+
+    async def renew_joke_job_lease(self, *, job_id: int, lease_token: str, now: datetime, lease_seconds: int) -> bool:
+        now_iso = now.astimezone(timezone.utc).isoformat()
+        until = (now + timedelta(seconds=lease_seconds)).astimezone(timezone.utc).isoformat()
+        async with self._write_lock:
+            async with aiosqlite.connect(self.database_path) as db:
+                await self._prepare_connection(db)
+                cursor = await db.execute(
+                    """UPDATE chat_joke_jobs SET lease_until=?, updated_at=?
+                       WHERE job_id=? AND status='running' AND lease_token=? AND lease_until >= ?""",
+                    (until, now_iso, job_id, lease_token, now_iso),
+                )
+                renewed = cursor.rowcount > 0
+                await cursor.close()
+                await db.commit()
+        return renewed
+
+    async def retry_joke_job(self, *, job_id: int, lease_token: str, error_code: str, next_attempt_at: datetime) -> bool:
+        now_iso = datetime.now(timezone.utc).isoformat()
+        async with self._write_lock:
+            async with aiosqlite.connect(self.database_path) as db:
+                await self._prepare_connection(db)
+                cursor = await db.execute(
+                    """UPDATE chat_joke_jobs SET status='retry', next_attempt_at=?, last_error_code=?,
+                       lease_owner=NULL, lease_token=NULL, lease_until=NULL, updated_at=?
+                       WHERE job_id=? AND status='running' AND lease_token=?""",
+                    (next_attempt_at.astimezone(timezone.utc).isoformat(), error_code[:100], now_iso, job_id, lease_token),
+                )
+                changed = cursor.rowcount > 0
+                await cursor.close()
+                await db.commit()
+        return changed
+
+    async def finalize_autonomous_joke_job(
+        self,
+        *,
+        job_id: int,
+        lease_token: str,
+        source_message_id: int | None,
+        awarded_at: datetime | None = None,
+        shadow: bool = False,
+        announce: bool = True,
+        bot_spin_decision: str | None = None,
+        bot_spin_chance: float | None = None,
+    ) -> JokeJobResult:
+        awarded_at = awarded_at or datetime.now(timezone.utc)
+        now = awarded_at.astimezone(timezone.utc).isoformat()
+        async with self._write_lock:
+            async with aiosqlite.connect(self.database_path) as db:
+                await self._prepare_connection(db)
+                db.row_factory = aiosqlite.Row
+                try:
+                    await db.execute("BEGIN IMMEDIATE")
+                    cursor = await db.execute("SELECT * FROM chat_joke_jobs WHERE job_id = ?", (job_id,))
+                    job_row = await cursor.fetchone()
+                    await cursor.close()
+                    if not job_row:
+                        await db.rollback()
+                        return JokeJobResult("not_found")
+                    job = _joke_job_from_row(job_row)
+                    if job.status in {
+                        "shadow_selected", "shadow_no_joke", "no_joke", "awarded",
+                        "already_awarded", "source_invalid",
+                    }:
+                        await db.rollback()
+                        return JokeJobResult(job.status, job)
+                    if job.status != "running" or job.lease_token != lease_token:
+                        await db.rollback()
+                        return JokeJobResult("lost_lease", job)
+                    if source_message_id is None:
+                        status = "shadow_no_joke" if shadow else "no_joke"
+                        await db.execute(
+                            """UPDATE chat_joke_jobs SET status=?, selector_status='none', completed_at=?,
+                               updated_at=?, lease_owner=NULL, lease_token=NULL, lease_until=NULL WHERE job_id=?""",
+                            (status, now, now, job_id),
+                        )
+                    else:
+                        cursor = await db.execute(
+                            """
+                            SELECT m.* FROM chat_joke_job_items ji
+                            JOIN chat_joke_jobs j ON j.job_id = ji.job_id
+                            JOIN messages m ON m.chat_id = j.chat_id AND m.message_id = ji.source_message_id
+                            WHERE ji.job_id = ? AND ji.source_message_id = ?
+                            """,
+                            (job_id, source_message_id),
+                        )
+                        source = await cursor.fetchone()
+                        await cursor.close()
+                        if not source or not is_eligible_message_provenance(str(source["origin"]), str(source["kind"])):
+                            await db.execute(
+                                """UPDATE chat_joke_jobs SET status='source_invalid', selector_status='source_invalid',
+                                   completed_at=?, updated_at=?, lease_owner=NULL, lease_token=NULL, lease_until=NULL
+                                   WHERE job_id=?""",
+                                (now, now, job_id),
+                            )
+                        else:
+                            name = str(source["sender_name"])
+                            sender_id = source["sender_id"]
+                            key = _participant_key(int(sender_id) if sender_id is not None else None, name)
+                            full_text = str(source["text"])
+                            text = full_text[:4000]
+                            source_created_at = str(source["created_at"])
+                            source_hash = _source_hash(full_text)
+                            if shadow:
+                                await db.execute(
+                                    """UPDATE chat_joke_jobs SET status='shadow_selected', selector_status='selected',
+                                       winner_source_message_id=?, winner_participant_key=?, winner_participant_name=?,
+                                       winner_source_text=?, winner_source_created_at=?, winner_source_hash=?,
+                                       completed_at=?, updated_at=?, lease_owner=NULL,
+                                       lease_token=NULL, lease_until=NULL WHERE job_id=?""",
+                                    (source_message_id, key, name, text, source_created_at, source_hash, now, now, job_id),
+                                )
+                            else:
+                                cursor = await db.execute(
+                                    """INSERT INTO chat_point_ledger (chat_id, participant_key, participant_name,
+                                       delta, reason, source_message_id, joke_job_id, created_at)
+                                       VALUES (?, ?, ?, 10, 'best_joke', ?, ?, ?)
+                                       ON CONFLICT(chat_id, reason, source_message_id) DO NOTHING""",
+                                    (int(source["chat_id"]), key, name, source_message_id, job_id, now),
+                                )
+                                inserted = cursor.rowcount > 0
+                                entry_id = int(cursor.lastrowid) if inserted else None
+                                await cursor.close()
+                                status = "awarded" if inserted else "already_awarded"
+                                if inserted:
+                                    await db.execute(
+                                        """INSERT INTO chat_point_balances
+                                           (chat_id, participant_key, participant_name, balance, updated_at)
+                                           VALUES (?, ?, ?, 10, ?)
+                                           ON CONFLICT(chat_id, participant_key) DO UPDATE SET
+                                             participant_name=excluded.participant_name,
+                                             balance=chat_point_balances.balance + 10, updated_at=excluded.updated_at""",
+                                        (int(source["chat_id"]), key, name, now),
+                                    )
+                                if bot_spin_chance is not None and not 0 <= bot_spin_chance <= 1:
+                                    raise ValueError("invalid bot spin chance")
+                                decision = (
+                                    ("spin" if random.random() < bot_spin_chance else "skip")
+                                    if inserted and bot_spin_chance is not None
+                                    else (bot_spin_decision or "skip") if inserted else None
+                                )
+                                if decision not in {None, "skip", "spin"}:
+                                    raise ValueError("invalid bot spin decision")
+                                await db.execute(
+                                    """UPDATE chat_joke_jobs SET status=?, selector_status='selected',
+                                       winner_source_message_id=?, winner_participant_key=?, winner_participant_name=?,
+                                       winner_source_text=?, winner_source_created_at=?, winner_source_hash=?, award_ledger_entry_id=?, completed_at=?,
+                                       updated_at=?, bot_spin_decision=?, lease_owner=NULL, lease_token=NULL,
+                                       lease_until=NULL WHERE job_id=?""",
+                                    (status, source_message_id, key, name, text, source_created_at, source_hash, entry_id, now, now,
+                                     decision, job_id),
+                                )
+                                if inserted:
+                                    actions = ["award_leaderboard_refresh"]
+                                    if announce:
+                                        actions.insert(0, "award_notification")
+                                    await db.executemany(
+                                        """INSERT OR IGNORE INTO chat_joke_outbox
+                                           (job_id, action, status, created_at, updated_at) VALUES (?, ?, 'pending', ?, ?)""",
+                                        [(job_id, action, now, now) for action in actions],
+                                    )
+                                    if decision == "spin":
+                                        await db.execute(
+                                            """INSERT OR IGNORE INTO chat_joke_outbox
+                                               (job_id, action, status, created_at, updated_at)
+                                               VALUES (?, 'bot_casino', 'pending', ?, ?)""",
+                                            (job_id, now, now),
+                                        )
+                    cursor = await db.execute("SELECT * FROM chat_joke_jobs WHERE job_id = ?", (job_id,))
+                    completed = await cursor.fetchone()
+                    await cursor.close()
+                    await db.commit()
+                    return JokeJobResult(str(completed["status"]), _joke_job_from_row(completed))
+                except Exception:
+                    await db.rollback()
+                    raise
+
+    async def get_latest_autonomous_award(self, *, chat_id: int, since: datetime) -> JokeJob | None:
+        since_iso = since.astimezone(timezone.utc).isoformat()
+        async with aiosqlite.connect(self.database_path) as db:
+            await self._prepare_connection(db)
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                """SELECT j.* FROM chat_joke_jobs j
+                   WHERE j.chat_id=? AND j.status='awarded' AND j.winner_source_created_at >= ?
+                   ORDER BY j.winner_source_created_at DESC, j.job_id DESC LIMIT 1""",
+                (chat_id, since_iso),
+            )
+            row = await cursor.fetchone()
+            await cursor.close()
+        return _joke_job_from_row(row) if row else None
+
+    async def get_joke_job(self, job_id: int) -> JokeJob | None:
+        async with aiosqlite.connect(self.database_path) as db:
+            await self._prepare_connection(db)
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute("SELECT * FROM chat_joke_jobs WHERE job_id = ?", (job_id,))
+            row = await cursor.fetchone()
+            await cursor.close()
+        return _joke_job_from_row(row) if row else None
+
+    async def claim_due_joke_outbox(
+        self, *, worker_id: str, now: datetime, lease_seconds: int, disabled_chat_ids: set[int] | None = None,
+        start_after: datetime | None = None,
+    ) -> JokeOutbox | None:
+        now_iso = now.astimezone(timezone.utc).isoformat()
+        until = (now + timedelta(seconds=lease_seconds)).astimezone(timezone.utc).isoformat()
+        async with self._write_lock:
+            async with aiosqlite.connect(self.database_path) as db:
+                await self._prepare_connection(db)
+                db.row_factory = aiosqlite.Row
+                await db.execute("BEGIN IMMEDIATE")
+                excluded_clause = ""
+                params: list[object] = [now_iso, now_iso]
+                if disabled_chat_ids:
+                    placeholders = ",".join("?" for _ in disabled_chat_ids)
+                    excluded_clause = f"AND j.chat_id NOT IN ({placeholders})"
+                    params.extend(sorted(disabled_chat_ids))
+                if start_after is not None:
+                    if start_after.tzinfo is None:
+                        start_after = start_after.replace(tzinfo=timezone.utc)
+                    excluded_clause += " AND j.created_at >= ?"
+                    params.append(start_after.astimezone(timezone.utc).isoformat())
+                cursor = await db.execute(
+                    """SELECT o.* FROM chat_joke_outbox o
+                       JOIN chat_joke_jobs j ON j.job_id=o.job_id
+                       WHERE ((o.status IN ('pending','retry') AND (o.next_attempt_at IS NULL OR o.next_attempt_at <= ?))
+                          OR (o.status='running' AND (o.lease_until IS NULL OR o.lease_until <= ?)))
+                    """ + excluded_clause + " ORDER BY o.outbox_id ASC LIMIT 1",
+                    params,
+                )
+                row = await cursor.fetchone()
+                await cursor.close()
+                if not row:
+                    await db.rollback()
+                    return None
+                token = uuid.uuid4().hex
+                await db.execute(
+                    """UPDATE chat_joke_outbox SET status='running', attempt_count=attempt_count+1,
+                       lease_owner=?, lease_token=?, lease_until=?, updated_at=? WHERE outbox_id=?""",
+                    (worker_id, token, until, now_iso, int(row["outbox_id"])),
+                )
+                cursor = await db.execute("SELECT * FROM chat_joke_outbox WHERE outbox_id=?", (int(row["outbox_id"]),))
+                claimed = await cursor.fetchone()
+                await cursor.close()
+                await db.commit()
+        return _joke_outbox_from_row(claimed)
+
+    async def complete_joke_outbox(
+        self, *, outbox_id: int, lease_token: str, status: str = "completed", telegram_message_id: int | None = None
+    ) -> bool:
+        if status not in {"completed", "skipped"}:
+            raise ValueError("invalid terminal outbox status")
+        now = datetime.now(timezone.utc).isoformat()
+        async with self._write_lock:
+            async with aiosqlite.connect(self.database_path) as db:
+                await self._prepare_connection(db)
+                cursor = await db.execute(
+                    """UPDATE chat_joke_outbox SET status=?, telegram_message_id=COALESCE(?, telegram_message_id),
+                       completed_at=?, updated_at=?, lease_owner=NULL, lease_token=NULL, lease_until=NULL
+                       WHERE outbox_id=? AND status='running' AND lease_token=?""",
+                    (status, telegram_message_id, now, now, outbox_id, lease_token),
+                )
+                changed = cursor.rowcount > 0
+                await cursor.close()
+                await db.commit()
+        return changed
+
+    async def complete_automatic_casino_outbox(
+        self,
+        *,
+        outbox_id: int,
+        lease_token: str,
+        job_id: int,
+        spin_id: int | None,
+        decision: str,
+    ) -> bool:
+        """Fence bot-spin terminal state and durable leaderboard refresh as one commit."""
+        if decision not in {"skip", "insufficient_balance", "completed", "refunded"}:
+            raise ValueError("invalid bot spin terminal decision")
+        now = datetime.now(timezone.utc).isoformat()
+        status = "skipped" if decision in {"skip", "insufficient_balance"} else "completed"
+        async with self._write_lock:
+            async with aiosqlite.connect(self.database_path) as db:
+                await self._prepare_connection(db)
+                try:
+                    await db.execute("BEGIN IMMEDIATE")
+                    cursor = await db.execute(
+                        """SELECT 1 FROM chat_joke_outbox
+                           WHERE outbox_id=? AND job_id=? AND action='bot_casino'
+                             AND status='running' AND lease_token=?""",
+                        (outbox_id, job_id, lease_token),
+                    )
+                    owned = await cursor.fetchone()
+                    await cursor.close()
+                    if not owned:
+                        await db.rollback()
+                        return False
+                    await db.execute(
+                        """UPDATE chat_joke_jobs SET bot_spin_id=?, bot_spin_decision=?, updated_at=?
+                           WHERE job_id=? AND bot_spin_decision='spin'""",
+                        (spin_id, decision, now, job_id),
+                    )
+                    cursor = await db.execute(
+                        """UPDATE chat_joke_outbox SET status=?, casino_spin_id=?, completed_at=?, updated_at=?,
+                           lease_owner=NULL, lease_token=NULL, lease_until=NULL
+                           WHERE outbox_id=? AND status='running' AND lease_token=?""",
+                        (status, spin_id, now, now, outbox_id, lease_token),
+                    )
+                    if cursor.rowcount != 1:
+                        raise RuntimeError("automatic casino outbox lease lost")
+                    await cursor.close()
+                    if decision not in {"skip", "insufficient_balance"}:
+                        await db.execute(
+                            """INSERT OR IGNORE INTO chat_joke_outbox
+                               (job_id, action, status, created_at, updated_at)
+                               VALUES (?, 'casino_leaderboard_refresh', 'pending', ?, ?)""",
+                            (job_id, now, now),
+                        )
+                    await db.commit()
+                    return True
+                except Exception:
+                    await db.rollback()
+                    raise
+
+    async def finalize_automatic_casino_spin(
+        self,
+        *,
+        outbox_id: int,
+        lease_token: str,
+        job_id: int,
+        spin_id: int,
+        dice_message_id: int | None = None,
+        dice_value: int | None = None,
+        refund_reason: str | None = None,
+    ) -> CasinoSpinResult:
+        """Settle/refund an automatic spin and enqueue its refresh in one SQLite transaction."""
+        if (dice_message_id is None) == (refund_reason is None):
+            raise ValueError("provide either trusted dice or a refund reason")
+        now = datetime.now(timezone.utc).isoformat()
+        async with self._write_lock:
+            async with aiosqlite.connect(self.database_path) as db:
+                await self._prepare_connection(db)
+                db.row_factory = aiosqlite.Row
+                try:
+                    await db.execute("BEGIN IMMEDIATE")
+                    cursor = await db.execute(
+                        """SELECT 1 FROM chat_joke_outbox WHERE outbox_id=? AND job_id=?
+                           AND action='bot_casino' AND status='running' AND lease_token=?""",
+                        (outbox_id, job_id, lease_token),
+                    )
+                    owned = await cursor.fetchone()
+                    await cursor.close()
+                    if not owned:
+                        await db.rollback()
+                        return CasinoSpinResult("lost_lease")
+                    candidate = await _get_casino_spin(db, spin_id)
+                    job_chat_id = await _joke_job_chat_id(db, job_id)
+                    if not candidate:
+                        await db.rollback()
+                        return CasinoSpinResult("not_found")
+                    if (
+                        candidate.chat_id != job_chat_id
+                        or candidate.trigger_kind != "bot_automatic"
+                        or candidate.trigger_key != f"joke-job:{job_id}"
+                    ):
+                        await db.rollback()
+                        return CasinoSpinResult("identity_conflict", candidate)
+                    if refund_reason is not None:
+                        result = await _refund_casino_spin_in_transaction(db, spin_id, refund_reason, now)
+                    else:
+                        result = await _settle_casino_spin_in_transaction(
+                            db, spin_id, dice_message_id, dice_value, now  # type: ignore[arg-type]
+                        )
+                    spin = result.spin
+                    if not spin:
+                        await db.rollback()
+                        return result
+                    if spin.status == "pending":
+                        await db.rollback()
+                        return result
+                    decision = "completed" if spin.status == "completed" else "refunded"
+                    await db.execute(
+                        """UPDATE chat_joke_jobs SET bot_spin_id=?, bot_spin_decision=?, updated_at=?
+                           WHERE job_id=? AND bot_spin_decision='spin'""",
+                        (spin.spin_id, decision, now, job_id),
+                    )
+                    await db.execute(
+                        """UPDATE chat_joke_outbox SET status='completed', casino_spin_id=?, completed_at=?,
+                           updated_at=?, lease_owner=NULL, lease_token=NULL, lease_until=NULL
+                           WHERE outbox_id=? AND status='running' AND lease_token=?""",
+                        (spin.spin_id, now, now, outbox_id, lease_token),
+                    )
+                    await db.execute(
+                        """INSERT OR IGNORE INTO chat_joke_outbox
+                           (job_id, action, status, created_at, updated_at)
+                           VALUES (?, 'casino_leaderboard_refresh', 'pending', ?, ?)""",
+                        (job_id, now, now),
+                    )
+                    await db.commit()
+                    return result
+                except Exception:
+                    await db.rollback()
+                    raise
+
+    async def retry_joke_outbox(self, *, outbox_id: int, lease_token: str, error_code: str, next_attempt_at: datetime) -> bool:
+        now = datetime.now(timezone.utc).isoformat()
+        async with self._write_lock:
+            async with aiosqlite.connect(self.database_path) as db:
+                await self._prepare_connection(db)
+                cursor = await db.execute(
+                    """UPDATE chat_joke_outbox SET status='retry', next_attempt_at=?, last_error_code=?,
+                       lease_owner=NULL, lease_token=NULL, lease_until=NULL, updated_at=?
+                       WHERE outbox_id=? AND status='running' AND lease_token=?""",
+                    (next_attempt_at.astimezone(timezone.utc).isoformat(), error_code[:100], now, outbox_id, lease_token),
+                )
+                changed = cursor.rowcount > 0
+                await cursor.close()
+                await db.commit()
+        return changed
+
     async def reserve_casino_spin(
         self,
         *,
         chat_id: int,
-        request_message_id: int,
+        request_message_id: int | None,
         participant_key: str,
         participant_name: str,
+        trigger: CasinoTrigger | None = None,
         created_at: datetime | None = None,
     ) -> CasinoSpinResult:
-        if request_message_id <= 0:
-            raise ValueError("request_message_id must be positive")
+        trigger = trigger or user_casino_trigger(request_message_id)  # type: ignore[arg-type]
+        if trigger.request_message_id != request_message_id:
+            raise ValueError("request message id does not match trigger")
         created_at = created_at or datetime.now(timezone.utc)
         if created_at.tzinfo is None:
             created_at = created_at.replace(tzinfo=timezone.utc)
@@ -1096,29 +2088,38 @@ class MessageStore:
                 db.row_factory = aiosqlite.Row
                 try:
                     await db.execute("BEGIN IMMEDIATE")
-                    cursor = await db.execute(
-                        "SELECT * FROM chat_casino_spins WHERE chat_id = ? AND request_message_id = ?",
-                        (chat_id, request_message_id),
-                    )
+                    if trigger.request_message_id is not None:
+                        cursor = await db.execute(
+                            "SELECT * FROM chat_casino_spins WHERE chat_id = ? AND request_message_id = ?",
+                            (chat_id, trigger.request_message_id),
+                        )
+                    else:
+                        cursor = await db.execute(
+                            "SELECT * FROM chat_casino_spins WHERE chat_id = ? AND trigger_key = ?",
+                            (chat_id, trigger.key),
+                        )
                     existing = await cursor.fetchone()
                     await cursor.close()
                     if existing:
                         spin = _casino_spin_from_row(existing)
                         await db.rollback()
-                        if spin.participant_key != participant_key:
+                        if (spin.participant_key != participant_key or spin.trigger_kind != trigger.kind
+                                or spin.request_message_id != trigger.request_message_id):
                             return CasinoSpinResult("identity_conflict", spin)
                         return CasinoSpinResult(f"existing_{spin.status}", spin)
 
                     cursor = await db.execute(
                         """
                         INSERT INTO chat_casino_spins (
-                            chat_id, request_message_id, participant_key, participant_name,
+                            chat_id, request_message_id, trigger_kind, trigger_key, participant_key, participant_name,
                             rules_version, stake, status, created_at, updated_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?)
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
                         """,
                         (
                             chat_id,
-                            request_message_id,
+                            trigger.request_message_id,
+                            trigger.kind,
+                            trigger.key,
                             participant_key,
                             participant_name,
                             CASINO_RULES_VERSION,
@@ -1154,10 +2155,111 @@ class MessageStore:
                             participant_key,
                             participant_name,
                             -CASINO_STAKE,
-                            request_message_id,
+                            _casino_ledger_source_id(spin_id, trigger.request_message_id),
                             spin_id,
                             now,
                         ),
+                    )
+                    spin = await _get_casino_spin(db, spin_id)
+                    await db.commit()
+                    return CasinoSpinResult("created", spin)
+                except Exception:
+                    await db.rollback()
+                    raise
+
+    async def reserve_automatic_casino_spin(
+        self,
+        *,
+        job_id: int,
+        outbox_id: int,
+        lease_token: str,
+        chat_id: int,
+        participant_key: str,
+        participant_name: str,
+        trigger: CasinoTrigger,
+    ) -> CasinoSpinResult:
+        """Reserve one automatic spin, or terminally skip it, under the outbox fence."""
+        if trigger.kind != "bot_automatic" or trigger.domain_id != job_id or trigger.request_message_id is not None:
+            raise ValueError("automatic trigger must belong to the joke job")
+        now = datetime.now(timezone.utc).isoformat()
+        async with self._write_lock:
+            async with aiosqlite.connect(self.database_path) as db:
+                await self._prepare_connection(db)
+                db.row_factory = aiosqlite.Row
+                try:
+                    await db.execute("BEGIN IMMEDIATE")
+                    cursor = await db.execute(
+                        """SELECT 1 FROM chat_joke_outbox WHERE outbox_id=? AND job_id=?
+                           AND action='bot_casino' AND status='running' AND lease_token=?""",
+                        (outbox_id, job_id, lease_token),
+                    )
+                    owned = await cursor.fetchone()
+                    await cursor.close()
+                    if not owned:
+                        await db.rollback()
+                        return CasinoSpinResult("lost_lease")
+                    cursor = await db.execute(
+                        """SELECT chat_id, status, bot_spin_decision FROM chat_joke_jobs
+                           WHERE job_id = ?""",
+                        (job_id,),
+                    )
+                    job_row = await cursor.fetchone()
+                    await cursor.close()
+                    if (
+                        not job_row
+                        or int(job_row["chat_id"]) != chat_id
+                        or str(job_row["status"]) != "awarded"
+                        or str(job_row["bot_spin_decision"] or "") != "spin"
+                    ):
+                        await db.rollback()
+                        return CasinoSpinResult("identity_conflict")
+                    cursor = await db.execute(
+                        "SELECT * FROM chat_casino_spins WHERE chat_id=? AND trigger_key=?",
+                        (chat_id, trigger.key),
+                    )
+                    existing = await cursor.fetchone()
+                    await cursor.close()
+                    if existing:
+                        spin = _casino_spin_from_row(existing)
+                        await db.rollback()
+                        if spin.participant_key != participant_key or spin.trigger_kind != trigger.kind:
+                            return CasinoSpinResult("identity_conflict", spin)
+                        return CasinoSpinResult(f"existing_{spin.status}", spin)
+                    cursor = await db.execute(
+                        """UPDATE chat_point_balances SET balance=balance-?, participant_name=?, updated_at=?
+                           WHERE chat_id=? AND participant_key=? AND balance >= ?""",
+                        (CASINO_STAKE, participant_name, now, chat_id, participant_key, CASINO_STAKE),
+                    )
+                    debited = cursor.rowcount > 0
+                    await cursor.close()
+                    if not debited:
+                        await db.execute(
+                            """UPDATE chat_joke_jobs SET bot_spin_decision='insufficient_balance',
+                               bot_spin_id=NULL, updated_at=? WHERE job_id=? AND bot_spin_decision='spin'""",
+                            (now, job_id),
+                        )
+                        await db.execute(
+                            """UPDATE chat_joke_outbox SET status='skipped', completed_at=?, updated_at=?,
+                               lease_owner=NULL, lease_token=NULL, lease_until=NULL
+                               WHERE outbox_id=? AND status='running' AND lease_token=?""",
+                            (now, now, outbox_id, lease_token),
+                        )
+                        await db.commit()
+                        return CasinoSpinResult("insufficient_balance")
+                    cursor = await db.execute(
+                        """INSERT INTO chat_casino_spins (chat_id, request_message_id, trigger_kind, trigger_key,
+                           participant_key, participant_name, rules_version, stake, status, created_at, updated_at)
+                           VALUES (?, NULL, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)""",
+                        (chat_id, trigger.kind, trigger.key, participant_key, participant_name,
+                         CASINO_RULES_VERSION, CASINO_STAKE, now, now),
+                    )
+                    spin_id = int(cursor.lastrowid)
+                    await cursor.close()
+                    await db.execute(
+                        """INSERT INTO chat_point_ledger (chat_id, participant_key, participant_name, delta, reason,
+                           source_message_id, casino_spin_id, created_at)
+                           VALUES (?, ?, ?, ?, 'casino_bet', ?, ?, ?)""",
+                        (chat_id, participant_key, participant_name, -CASINO_STAKE, -spin_id, spin_id, now),
                     )
                     spin = await _get_casino_spin(db, spin_id)
                     await db.commit()
@@ -1212,7 +2314,7 @@ class MessageStore:
                             spin.participant_key,
                             spin.participant_name,
                             outcome.payout,
-                            spin.request_message_id,
+                            _casino_ledger_source_id(spin.spin_id, spin.request_message_id),
                             spin.spin_id,
                             now,
                         ),
@@ -1303,7 +2405,7 @@ class MessageStore:
                             spin.participant_key,
                             spin.participant_name,
                             spin.stake,
-                            spin.request_message_id,
+                            _casino_ledger_source_id(spin.spin_id, spin.request_message_id),
                             spin.spin_id,
                             now,
                         ),
@@ -1357,7 +2459,8 @@ class MessageStore:
             cursor = await db.execute(
                 """
                 SELECT spin_id FROM chat_casino_spins
-                WHERE status = 'pending' AND created_at < ? ORDER BY spin_id ASC
+                WHERE status = 'pending' AND created_at < ? AND trigger_kind != 'bot_automatic'
+                ORDER BY spin_id ASC
                 """,
                 (cutoff,),
             )
@@ -1376,6 +2479,68 @@ class MessageStore:
                 chat_ids.add(result.spin.chat_id)
         return CasinoRecoveryResult(tuple(spin_ids), tuple(sorted(chat_ids)))
 
+    async def recover_pending_automatic_casino_spins(
+        self,
+        *,
+        created_before: datetime,
+    ) -> CasinoRecoveryResult:
+        """Void pre-start automatic spins with their job/outbox refresh atomically."""
+        cutoff = created_before.astimezone(timezone.utc).isoformat()
+        async with aiosqlite.connect(self.database_path) as db:
+            await self._prepare_connection(db)
+            cursor = await db.execute(
+                """SELECT spin_id FROM chat_casino_spins WHERE status='pending'
+                   AND trigger_kind='bot_automatic' AND created_at < ? ORDER BY spin_id ASC""",
+                (cutoff,),
+            )
+            spin_ids = [int(row[0]) for row in await cursor.fetchall()]
+            await cursor.close()
+        recovered: list[int] = []
+        chats: set[int] = set()
+        now = created_before.astimezone(timezone.utc).isoformat()
+        for spin_id in spin_ids:
+            async with self._write_lock:
+                async with aiosqlite.connect(self.database_path) as db:
+                    await self._prepare_connection(db)
+                    db.row_factory = aiosqlite.Row
+                    try:
+                        await db.execute("BEGIN IMMEDIATE")
+                        spin = await _get_casino_spin(db, spin_id)
+                        if not spin or spin.status != "pending" or spin.trigger_kind != "bot_automatic":
+                            await db.rollback()
+                            continue
+                        job_id = _automatic_job_id(spin.trigger_key)
+                        if job_id is None:
+                            raise RuntimeError("invalid automatic casino trigger")
+                        result = await _refund_casino_spin_in_transaction(db, spin_id, "startup_recovery", now)
+                        if result.status != "refunded" or not result.spin:
+                            await db.rollback()
+                            continue
+                        await db.execute(
+                            """UPDATE chat_joke_jobs SET bot_spin_id=?, bot_spin_decision='refunded', updated_at=?
+                               WHERE job_id=? AND bot_spin_decision='spin'""",
+                            (spin_id, now, job_id),
+                        )
+                        await db.execute(
+                            """UPDATE chat_joke_outbox SET status='completed', casino_spin_id=?, completed_at=?,
+                               updated_at=?, lease_owner=NULL, lease_token=NULL, lease_until=NULL
+                               WHERE job_id=? AND action='bot_casino' AND status IN ('pending', 'running', 'retry')""",
+                            (spin_id, now, now, job_id),
+                        )
+                        await db.execute(
+                            """INSERT OR IGNORE INTO chat_joke_outbox
+                               (job_id, action, status, created_at, updated_at)
+                               VALUES (?, 'casino_leaderboard_refresh', 'pending', ?, ?)""",
+                            (job_id, now, now),
+                        )
+                        await db.commit()
+                        recovered.append(spin_id)
+                        chats.add(spin.chat_id)
+                    except Exception:
+                        await db.rollback()
+                        raise
+        return CasinoRecoveryResult(tuple(recovered), tuple(sorted(chats)))
+
     async def get_point_balance(self, *, chat_id: int, participant_key: str) -> PointBalance | None:
         async with aiosqlite.connect(self.database_path) as db:
             await self._prepare_connection(db)
@@ -1391,7 +2556,9 @@ class MessageStore:
             await cursor.close()
         return _point_balance_from_row(row) if row else None
 
-    async def get_top_point_balances(self, *, chat_id: int, limit: int = 10) -> list[PointBalance]:
+    async def get_top_point_balances(
+        self, *, chat_id: int, limit: int = 10, display_names: dict[str, str] | None = None
+    ) -> list[PointBalance]:
         async with aiosqlite.connect(self.database_path) as db:
             await self._prepare_connection(db)
             db.row_factory = aiosqlite.Row
@@ -1407,6 +2574,12 @@ class MessageStore:
             rows = await cursor.fetchall()
             await cursor.close()
         balances = [_point_balance_from_row(row) for row in rows]
+        if display_names:
+            balances = [
+                PointBalance(item.chat_id, item.participant_key, display_names.get(item.participant_key, item.participant_name),
+                             item.balance, item.updated_at)
+                for item in balances
+            ]
         balances.sort(
             key=lambda item: (
                 -item.balance,
@@ -2522,6 +3695,60 @@ def _stored_message_from_row(row: aiosqlite.Row, *, text: str | None = None) -> 
     )
 
 
+def _source_hash(text: str) -> str:
+    # A deterministic audit fingerprint avoids retaining an unbounded duplicate payload.
+    import hashlib
+
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _joke_job_from_row(row: aiosqlite.Row) -> JokeJob:
+    return JokeJob(
+        job_id=int(row["job_id"]), chat_id=int(row["chat_id"]),
+        first_queue_id=int(row["first_queue_id"]), last_queue_id=int(row["last_queue_id"]),
+        message_count=int(row["message_count"]), policy_version=str(row["policy_version"]),
+        status=str(row["status"]), attempt_count=int(row["attempt_count"]),
+        next_attempt_at=str(row["next_attempt_at"]) if row["next_attempt_at"] is not None else None,
+        lease_token=str(row["lease_token"]) if row["lease_token"] is not None else None,
+        lease_until=str(row["lease_until"]) if row["lease_until"] is not None else None,
+        winner_source_message_id=(int(row["winner_source_message_id"])
+                                  if row["winner_source_message_id"] is not None else None),
+        winner_participant_key=(str(row["winner_participant_key"])
+                                if row["winner_participant_key"] is not None else None),
+        winner_participant_name=(str(row["winner_participant_name"])
+                                 if row["winner_participant_name"] is not None else None),
+        winner_source_text=(str(row["winner_source_text"])
+                            if row["winner_source_text"] is not None else None),
+        winner_source_created_at=(str(row["winner_source_created_at"])
+                                  if row["winner_source_created_at"] is not None else None),
+        award_ledger_entry_id=(int(row["award_ledger_entry_id"])
+                               if row["award_ledger_entry_id"] is not None else None),
+    )
+
+
+def _joke_outbox_from_row(row: aiosqlite.Row) -> JokeOutbox:
+    return JokeOutbox(
+        outbox_id=int(row["outbox_id"]), job_id=int(row["job_id"]), action=str(row["action"]),
+        status=str(row["status"]), attempt_count=int(row["attempt_count"]),
+        lease_token=str(row["lease_token"]) if row["lease_token"] is not None else None,
+    )
+
+
+def _casino_ledger_source_id(spin_id: int, request_message_id: int | None) -> int:
+    return request_message_id if request_message_id is not None else -spin_id
+
+
+def _automatic_job_id(trigger_key: str) -> int | None:
+    prefix = "joke-job:"
+    if not trigger_key.startswith(prefix):
+        return None
+    try:
+        job_id = int(trigger_key.removeprefix(prefix))
+    except ValueError:
+        return None
+    return job_id if job_id > 0 else None
+
+
 async def _get_casino_spin(db: aiosqlite.Connection, spin_id: int) -> CasinoSpin | None:
     cursor = await db.execute("SELECT * FROM chat_casino_spins WHERE spin_id = ?", (spin_id,))
     row = await cursor.fetchone()
@@ -2529,11 +3756,114 @@ async def _get_casino_spin(db: aiosqlite.Connection, spin_id: int) -> CasinoSpin
     return _casino_spin_from_row(row) if row else None
 
 
+async def _joke_job_chat_id(db: aiosqlite.Connection, job_id: int) -> int | None:
+    cursor = await db.execute("SELECT chat_id FROM chat_joke_jobs WHERE job_id = ?", (job_id,))
+    row = await cursor.fetchone()
+    await cursor.close()
+    return int(row[0]) if row else None
+
+
+async def _settle_casino_spin_in_transaction(
+    db: aiosqlite.Connection,
+    spin_id: int,
+    dice_message_id: int,
+    dice_value: int,
+    now: str,
+) -> CasinoSpinResult:
+    if type(dice_message_id) is not int or dice_message_id <= 0:
+        return CasinoSpinResult("invalid_dice")
+    try:
+        outcome = slot_result(dice_value)
+    except ValueError:
+        return CasinoSpinResult("invalid_dice")
+    spin = await _get_casino_spin(db, spin_id)
+    if not spin:
+        return CasinoSpinResult("not_found")
+    if spin.status == "completed":
+        return CasinoSpinResult("already_completed", spin)
+    if spin.status == "refunded":
+        return CasinoSpinResult("refunded_conflict", spin)
+    await db.execute(
+        """INSERT INTO chat_point_ledger (chat_id, participant_key, participant_name, delta, reason,
+           source_message_id, casino_spin_id, created_at) VALUES (?, ?, ?, ?, 'casino_payout', ?, ?, ?)""",
+        (spin.chat_id, spin.participant_key, spin.participant_name, outcome.payout,
+         _casino_ledger_source_id(spin.spin_id, spin.request_message_id), spin.spin_id, now),
+    )
+    await db.execute(
+        """UPDATE chat_point_balances SET balance=balance+?, participant_name=?, updated_at=?
+           WHERE chat_id=? AND participant_key=?""",
+        (outcome.payout, spin.participant_name, now, spin.chat_id, spin.participant_key),
+    )
+    cursor = await db.execute(
+        "SELECT balance FROM chat_point_balances WHERE chat_id=? AND participant_key=?",
+        (spin.chat_id, spin.participant_key),
+    )
+    balance = await cursor.fetchone()
+    await cursor.close()
+    if not balance:
+        raise RuntimeError("casino balance disappeared during settlement")
+    cursor = await db.execute(
+        """UPDATE chat_casino_spins SET dice_message_id=?, dice_value=?, category=?, payout=?,
+           status='completed', terminal_balance=?, updated_at=?, completed_at=?
+           WHERE spin_id=? AND status='pending'""",
+        (dice_message_id, dice_value, outcome.category, outcome.payout, int(balance[0]), now, now, spin_id),
+    )
+    changed = cursor.rowcount > 0
+    await cursor.close()
+    if not changed:
+        raise RuntimeError("casino settlement transition failed")
+    return CasinoSpinResult("completed", await _get_casino_spin(db, spin_id))
+
+
+async def _refund_casino_spin_in_transaction(
+    db: aiosqlite.Connection, spin_id: int, reason: str, now: str
+) -> CasinoSpinResult:
+    spin = await _get_casino_spin(db, spin_id)
+    if not spin:
+        return CasinoSpinResult("not_found")
+    if spin.status == "refunded":
+        return CasinoSpinResult("already_refunded", spin)
+    if spin.status == "completed":
+        return CasinoSpinResult("completed_conflict", spin)
+    await db.execute(
+        """INSERT INTO chat_point_ledger (chat_id, participant_key, participant_name, delta, reason,
+           source_message_id, casino_spin_id, created_at) VALUES (?, ?, ?, ?, 'casino_refund', ?, ?, ?)""",
+        (spin.chat_id, spin.participant_key, spin.participant_name, spin.stake,
+         _casino_ledger_source_id(spin.spin_id, spin.request_message_id), spin.spin_id, now),
+    )
+    await db.execute(
+        """UPDATE chat_point_balances SET balance=balance+?, participant_name=?, updated_at=?
+           WHERE chat_id=? AND participant_key=?""",
+        (spin.stake, spin.participant_name, now, spin.chat_id, spin.participant_key),
+    )
+    cursor = await db.execute(
+        "SELECT balance FROM chat_point_balances WHERE chat_id=? AND participant_key=?",
+        (spin.chat_id, spin.participant_key),
+    )
+    balance = await cursor.fetchone()
+    await cursor.close()
+    if not balance:
+        raise RuntimeError("casino balance disappeared during refund")
+    cursor = await db.execute(
+        """UPDATE chat_casino_spins SET status='refunded', terminal_balance=?, terminal_reason=?,
+           updated_at=?, refunded_at=? WHERE spin_id=? AND status='pending'""",
+        (int(balance[0]), reason, now, now, spin_id),
+    )
+    changed = cursor.rowcount > 0
+    await cursor.close()
+    if not changed:
+        raise RuntimeError("casino refund transition failed")
+    return CasinoSpinResult("refunded", await _get_casino_spin(db, spin_id))
+
+
 def _casino_spin_from_row(row: aiosqlite.Row) -> CasinoSpin:
     return CasinoSpin(
         spin_id=int(row["spin_id"]),
         chat_id=int(row["chat_id"]),
-        request_message_id=int(row["request_message_id"]),
+        request_message_id=(int(row["request_message_id"]) if row["request_message_id"] is not None else None),
+        trigger_kind=str(row["trigger_kind"]) if "trigger_kind" in row.keys() else "user_request",
+        trigger_key=(str(row["trigger_key"]) if "trigger_key" in row.keys()
+                     else f"user-message:{row['request_message_id']}"),
         participant_key=str(row["participant_key"]),
         participant_name=str(row["participant_name"]),
         rules_version=str(row["rules_version"]),

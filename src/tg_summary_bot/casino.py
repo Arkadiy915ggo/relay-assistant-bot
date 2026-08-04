@@ -9,6 +9,40 @@ CASINO_STAKE = 10
 CASINO_SYMBOLS = ("bar", "grape", "lemon", "seven")
 
 CasinoCategory = Literal["none", "pair", "triple", "jackpot"]
+CasinoTriggerKind = Literal["user_request", "bot_request", "bot_automatic"]
+
+
+@dataclass(frozen=True)
+class CasinoTrigger:
+    kind: CasinoTriggerKind
+    request_message_id: int | None
+    domain_id: int
+
+    @property
+    def key(self) -> str:
+        if self.kind == "user_request":
+            return f"user-message:{self.domain_id}"
+        if self.kind == "bot_request":
+            return f"bot-request:{self.domain_id}"
+        return f"joke-job:{self.domain_id}"
+
+
+def user_casino_trigger(message_id: int) -> CasinoTrigger:
+    if type(message_id) is not int or message_id <= 0:
+        raise ValueError("request message id must be positive")
+    return CasinoTrigger("user_request", message_id, message_id)
+
+
+def bot_request_casino_trigger(message_id: int) -> CasinoTrigger:
+    if type(message_id) is not int or message_id <= 0:
+        raise ValueError("request message id must be positive")
+    return CasinoTrigger("bot_request", message_id, message_id)
+
+
+def automatic_casino_trigger(job_id: int) -> CasinoTrigger:
+    if type(job_id) is not int or job_id <= 0:
+        raise ValueError("job id must be positive")
+    return CasinoTrigger("bot_automatic", None, job_id)
 
 
 @dataclass(frozen=True)

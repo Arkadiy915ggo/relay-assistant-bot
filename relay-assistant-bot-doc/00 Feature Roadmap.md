@@ -11,8 +11,9 @@
 | 2.5, реализовано | [[Features/02.5 Pre-Feature 03 Stabilization]] | Фичи 1-2 | Terminal outcomes, честная persistence policy и стабилизация спорных intent-ов перед очками. |
 | 3, реализовано в worktree | [[Features/03 Joke Points and Leaderboard]] | Завершённый этап 2.5 | Уникальная validated шутка получает очки; есть spendable balance и top-10. |
 | 4, реализовано | [[Features/04 Casino Slots]] | Проверенная и отдельно зафиксированная Фича 3 | Виртуальные очки можно поставить в versioned Telegram-слоте с atomic reserve/settle/refund. |
+| 5, реализовано | [[Features/05 Autonomous Joke Awards and Bot Casino]] | Завершённые Фичи 3-4 | Durable worker начисляет очки без `/summary`; бот становится alias-участником leaderboard и казино. |
 
-Фичи 1-4 реализованы. Feature 04 прошла Domain/Storage, Slash Lifecycle/Recovery и Addressed Intent; `casino` добавлен в router только после стабильного slash lifecycle.
+Фичи 1-5 реализованы. Feature 05 включает durable inbox/jobs/outbox, shadow rollout, read-only `/summary` при enabled worker и bot casino; PR 5D prefilter остаётся отложенным до shadow-метрик.
 
 ## Зафиксированные продуктовые решения
 
@@ -30,6 +31,9 @@
 - Неизвестный/не committed Telegram Dice outcome считается void, stake возвращается.
 - `/top`, `/stats` leader и pinned `Топ балансов` показывают текущие spendable balances, включая casino changes.
 - Feature 04 поддерживает один активный процесс; multi-instance recovery не входит в v1.
+- Feature 05 отвязывает awards от `/summary`: блок из 20 eligible сообщений либо aged partial block из 5-19 сообщений даёт 0/1 награду `+10`.
+- Assistant answers остаются eligible; бот использует stable `id:<bot_id>`, отображается первым chat alias и может играть в казино автоматически или по явной просьбе.
+- Safety/toxicity фильтрация шуток не входит в Feature 05.
 
 ## Общие инженерные ограничения
 

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import os
+import math
 from dataclasses import dataclass
+from datetime import timedelta
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -30,10 +32,26 @@ def _bool(value: str, *, default: bool = False) -> bool:
     return normalized in {"1", "true", "yes", "on"}
 
 
+def _duration(value: str, *, name: str) -> timedelta:
+    raw = value.strip().lower()
+    units = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+    if len(raw) < 2 or raw[-1] not in units:
+        raise RuntimeError(f"{name} must be a positive duration such as 24h")
+    try:
+        amount = int(raw[:-1])
+    except ValueError as exc:
+        raise RuntimeError(f"{name} must be a positive duration such as 24h") from exc
+    if amount <= 0:
+        raise RuntimeError(f"{name} must be positive")
+    return timedelta(seconds=amount * units[raw[-1]])
+
+
 @dataclass(frozen=True)
 class Settings:
     telegram_bot_token: str
     allowed_chat_ids: set[int]
+    joke_awards_disabled_chat_ids: set[int]
+    casino_disabled_chat_ids: set[int]
     llm_provider: str
     openai_api_key: str
     openai_base_url: str
@@ -103,6 +121,19 @@ class Settings:
     opik_enabled: bool
     opik_project_name: str
     opik_capture_content: bool
+    autonomous_jokes_enabled: bool
+    autonomous_jokes_shadow_mode: bool
+    autonomous_jokes_block_messages: int
+    autonomous_jokes_partial_min_messages: int
+    autonomous_jokes_max_block_age: timedelta
+    autonomous_jokes_initial_lookback: timedelta
+    autonomous_jokes_startup_grace_seconds: int
+    autonomous_jokes_poll_seconds: int
+    autonomous_jokes_lease_seconds: int
+    autonomous_joke_judge_model: str
+    autonomous_joke_announce: bool
+    bot_auto_casino_enabled: bool
+    bot_auto_casino_chance: float
 
     @property
     def resolved_llm_provider(self) -> str:
@@ -125,9 +156,26 @@ def load_settings() -> Settings:
     if transcription_format_provider not in {"openai", "ollama"}:
         raise RuntimeError("TRANSCRIPTION_FORMAT_PROVIDER must be one of: openai, ollama")
 
+    block_messages = int(os.getenv("AUTONOMOUS_JOKES_BLOCK_MESSAGES", "20"))
+    partial_min = int(os.getenv("AUTONOMOUS_JOKES_PARTIAL_MIN_MESSAGES", "5"))
+    lease_seconds = int(os.getenv("AUTONOMOUS_JOKES_LEASE_SECONDS", "900"))
+    if block_messages <= 0 or not 1 <= partial_min <= block_messages:
+        raise RuntimeError("autonomous joke block settings are invalid")
+    if lease_seconds <= 180:
+        raise RuntimeError("AUTONOMOUS_JOKES_LEASE_SECONDS must exceed selector timeout plus 60 seconds")
+    startup_grace_seconds = int(os.getenv("AUTONOMOUS_JOKES_STARTUP_GRACE_SECONDS", "60"))
+    poll_seconds = int(os.getenv("AUTONOMOUS_JOKES_POLL_SECONDS", "30"))
+    if startup_grace_seconds <= 0 or poll_seconds <= 0:
+        raise RuntimeError("autonomous joke startup grace and poll interval must be positive")
+    chance = float(os.getenv("BOT_AUTO_CASINO_CHANCE", "0.25"))
+    if not math.isfinite(chance) or not 0 <= chance <= 1:
+        raise RuntimeError("BOT_AUTO_CASINO_CHANCE must be a finite number from 0 through 1")
+
     return Settings(
         telegram_bot_token=token,
         allowed_chat_ids=_csv_ints(os.getenv("ALLOWED_CHAT_IDS", "")),
+        joke_awards_disabled_chat_ids=_csv_ints(os.getenv("JOKE_AWARDS_DISABLED_CHAT_IDS", "")),
+        casino_disabled_chat_ids=_csv_ints(os.getenv("CASINO_DISABLED_CHAT_IDS", "")),
         llm_provider=provider,
         openai_api_key=os.getenv("OPENAI_API_KEY", "").strip(),
         openai_base_url=os.getenv("OPENAI_BASE_URL", "").strip().rstrip("/"),
@@ -209,4 +257,21 @@ def load_settings() -> Settings:
         opik_enabled=_bool(os.getenv("OPIK_ENABLED", "false")),
         opik_project_name=os.getenv("OPIK_PROJECT_NAME", "telegram-summary-bot").strip(),
         opik_capture_content=_bool(os.getenv("OPIK_CAPTURE_CONTENT", "true"), default=True),
+        autonomous_jokes_enabled=_bool(os.getenv("AUTONOMOUS_JOKES_ENABLED", "false")),
+        autonomous_jokes_shadow_mode=_bool(os.getenv("AUTONOMOUS_JOKES_SHADOW_MODE", "true"), default=True),
+        autonomous_jokes_block_messages=block_messages,
+        autonomous_jokes_partial_min_messages=partial_min,
+        autonomous_jokes_max_block_age=_duration(
+            os.getenv("AUTONOMOUS_JOKES_MAX_BLOCK_AGE", "24h"), name="AUTONOMOUS_JOKES_MAX_BLOCK_AGE"
+        ),
+        autonomous_jokes_initial_lookback=_duration(
+            os.getenv("AUTONOMOUS_JOKES_INITIAL_LOOKBACK", "7d"), name="AUTONOMOUS_JOKES_INITIAL_LOOKBACK"
+        ),
+        autonomous_jokes_startup_grace_seconds=startup_grace_seconds,
+        autonomous_jokes_poll_seconds=poll_seconds,
+        autonomous_jokes_lease_seconds=lease_seconds,
+        autonomous_joke_judge_model=os.getenv("AUTONOMOUS_JOKE_JUDGE_MODEL", "").strip(),
+        autonomous_joke_announce=_bool(os.getenv("AUTONOMOUS_JOKE_ANNOUNCE", "true"), default=True),
+        bot_auto_casino_enabled=_bool(os.getenv("BOT_AUTO_CASINO_ENABLED", "true"), default=True),
+        bot_auto_casino_chance=chance,
     )

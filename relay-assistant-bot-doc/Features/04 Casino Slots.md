@@ -2,7 +2,7 @@
 
 ## Статус
 
-План готов к реализации. Feature 04 ещё не реализована.
+Реализована. Domain/Storage, Slash Lifecycle/Recovery и Addressed Intent находятся в текущем коде и покрыты casino tests.
 
 Перед началом casino migration Feature 03 должна быть проверена полным test suite и зафиксирована отдельным коммитом. В casino-коммиты нельзя смешивать незавершённые изменения joke selector, provenance, award transaction или summary integration.
 

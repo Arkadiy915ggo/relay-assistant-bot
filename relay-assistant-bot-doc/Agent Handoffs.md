@@ -2,7 +2,7 @@
 
 Каждый блок ниже можно отдать отдельному агенту. Перед началом агент должен прочитать `AGENTS.md`, нужную спецификацию и проверить `git status --short`. Не читать `.env` и `data/`.
 
-Текущий статус: Feature 01-04 реализованы. Feature 04 использует только виртуальные chat-scoped points: нет денег, платежей, transfers или withdrawals; unknown Telegram Dice outcome void/refund-ится.
+Текущий статус: Feature 01-05 реализованы; Feature 05D prefilter отложен до shadow-метрик. Feature 04 использует только виртуальные chat-scoped points: нет денег, платежей, transfers или withdrawals; unknown Telegram Dice outcome void/refund-ится.
 
 ## Фича 1: алиасы (реализовано)
 
@@ -68,4 +68,20 @@ Selector failure не должен ломать summary, /compare не начи�
 Сначала проверь и отдельно зафиксируй Feature 03; не смешивай casino с её незавершёнными изменениями. Выполни три PR-ready этапа: Domain/Storage, Slash Lifecycle/Recovery, Addressed Intent.
 Используй stake 10, mapping telegram_slots_base4_v1, payouts 0/5/50/250, RTP 90.625%, void/refund для неизвестного Telegram outcome и текущие balances для Топ балансов.
 Не читай .env и data/. Не добавляй деньги, платежи, transfers, arbitrary delta API или второй GPU lock. Покрой все 64 Dice values, transaction races, startup recovery и mocked Telegram lifecycle.
+```
+
+## Фича 5: автономные шутки и казино бота
+
+Документ: [[Features/05 Autonomous Joke Awards and Bot Casino]]
+
+Файл: [05 Autonomous Joke Awards and Bot Casino.md](Features/05%20Autonomous%20Joke%20Awards%20and%20Bot%20Casino.md)
+
+Готовый standalone prompt: [05 Autonomous Joke Awards Implementation Prompt.md](Prompts/05%20Autonomous%20Joke%20Awards%20Implementation%20Prompt.md)
+
+```text
+Реализуй Feature 05 только по standalone prompt relay-assistant-bot-doc/Prompts/05 Autonomous Joke Awards Implementation Prompt.md.
+Сначала проверь Feature 03-04 и baseline tests. Выполни PR-ready этапы Durable Foundation, Shadow Worker/Summary Decoupling и Bot Identity/Casino; small-model prefilter отложи до shadow-метрик.
+Используй непересекающиеся блоки 20 сообщений или aged partial 5-19, 0/1 winner и fixed +10. Assistant answers eligible; safety/toxicity filtering out of scope. При enabled worker /summary больше не начисляет points.
+Бот использует id:<bot_id>, отображается первым chat alias и играет через /casino bot, addressed self-intent и durable automatic 25% decision. Не ослабляй human casino admission, не создавай synthetic Message и не меняй slot mapping/RTP.
+Не читай .env и data/. Добавь migrations, restart/race/rollback/GPU/lifecycle/bot-casino tests и выполни full verification.
 ```

@@ -12,10 +12,10 @@ from tg_summary_bot.periods import parse_period
 
 
 Action = Literal[
-    "question", "summary", "wiki", "image", "meme", "video", "transcribe", "profile_show", "casino", "none"
+    "question", "summary", "wiki", "image", "meme", "video", "transcribe", "profile_show", "casino", "casino_bot", "none"
 ]
 ALLOWED_ACTIONS: frozenset[str] = frozenset(
-    {"question", "summary", "wiki", "image", "meme", "video", "transcribe", "profile_show", "casino", "none"}
+    {"question", "summary", "wiki", "image", "meme", "video", "transcribe", "profile_show", "casino", "casino_bot", "none"}
 )
 MAX_ROUTER_INPUT_CHARS = 2000
 MAX_QUERY_CHARS = 500
@@ -35,9 +35,10 @@ CASINO_VERB_RE = re.compile(
     re.IGNORECASE,
 )
 CASINO_OBJECT_RE = re.compile(r"\b(?:казино\w*|казик\w*|слот\w*)\b", re.IGNORECASE)
+CASINO_SELF_RE = re.compile(r"\b(?:себе|сам|сама|свой|своя|своё|свое)\b", re.IGNORECASE)
 
 ROUTER_SYSTEM_PROMPT = """Ты маршрутизатор действий Telegram-бота. Верни только один JSON object без Markdown и текста.
-Схема: {"action":"question|summary|wiki|image|meme|video|transcribe|profile_show|casino|none","period":string|null,"query":string|null}.
+    Схема: {"action":"question|summary|wiki|image|meme|video|transcribe|profile_show|casino|casino_bot|none","period":string|null,"query":string|null}.
 Выбирай summary для просьб о саммари, wiki для поиска в Wikipedia, image для OCR/описания картинки,
 meme для мема из картинки, video для анализа видео, transcribe для расшифровки replied voice/audio,
 profile_show для просмотра профиля участника; имя участника верни в query, а для профиля автора оставь query=null.
@@ -120,7 +121,7 @@ def parse_route_response(response: str) -> IntentRoute:
             return fallback_route("invalid_period")
     if action == "wiki" and not (query and query.strip()):
         return fallback_route("missing_wiki_query")
-    if action == "casino" and (period is not None or query is not None):
+    if action in {"casino", "casino_bot"} and (period is not None or query is not None):
         return fallback_route("invalid_casino_fields")
     return IntentRoute(action=action, period=period, query=query)
 
@@ -146,8 +147,11 @@ class IntentRouter:
             return fallback_route("meme_not_explicit")
         if route.action == "profile_show" and not PROFILE_REQUEST_RE.search(text):
             return fallback_route("profile_not_explicit")
-        if route.action == "casino" and not is_casino_request(text):
+        if route.action in {"casino", "casino_bot"} and not is_casino_request(text):
             return fallback_route("casino_not_explicit")
+        if route.action in {"casino", "casino_bot"}:
+            # Wallet selection is lexical policy, never a model decision.
+            route = replace(route, action="casino_bot" if CASINO_SELF_RE.search(text) else "casino")
         if route.action == "profile_show" and not (route.query and route.query.strip()):
             inferred_query = infer_profile_query(text)
             if inferred_query:

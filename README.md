@@ -7,7 +7,7 @@ A safe Telegram bot that stores new chat messages and produces short AI summarie
 - stores new text messages and media captions in SQLite;
 - creates summaries with `/summary 24h`, `/summary 7d`, `/summary today`;
 - compares summaries from multiple Ollama models with `/compare 10m`;
-- validates one best joke from eligible source messages after a successful summary and awards `+10` chat-scoped virtual points;
+- optionally awards `+10` chat-scoped virtual points from durable autonomous joke blocks;
 - shows personal joke points with `/balance` and a deterministic top-10 with `/top`;
 - spins one virtual Telegram slot with `/casino` for a fixed 10-point stake;
 - works in direct chats, groups, supergroups, and channels;
@@ -143,6 +143,15 @@ You may keep the normal allowlist configured while discovering another chat. An 
 ALLOWED_CHAT_IDS=
 ```
 
+To keep the bot available but disable economics in selected chats, use separate comma-separated lists:
+
+```env
+JOKE_AWARDS_DISABLED_CHAT_IDS=-1001111111111,-1002222222222
+CASINO_DISABLED_CHAT_IDS=-1001111111111,-1002222222222
+```
+
+Joke-disabled chats do not run manual or autonomous joke selection, awards, announcements, or bot casino outbox work. Casino-disabled chats reject `/casino`, `/casino bot`, and addressed casino requests without changing balances.
+
 Send this command in the target chat:
 
 ```text
@@ -176,6 +185,7 @@ Restart the bot.
 /balance
 /top
 /casino
+/casino bot
 /summary
 /summary 30m
 /summary 6h
@@ -206,10 +216,17 @@ Restart the bot.
 
 ## Joke Points
 
-After a successful `/summary`, the bot independently selects at most one real funny reply from the
-eligible raw-message snapshot and renders a verified quote. A newly selected source message earns its
-author `+10` virtual points in that chat. Repeating a summary cannot award the same source message
-twice. `/compare` never selects jokes or changes balances.
+With `AUTONOMOUS_JOKES_ENABLED=false` (the default), a successful `/summary` keeps the legacy manual
+selector and can award one verified joke. When enabled, a durable worker creates non-overlapping blocks
+of 20 eligible messages, or aged 5-19-message blocks after 24 hours. Each block has zero or one winner
+worth `+10`; shadow mode records selections without changing balances or Telegram messages. Enabled
+`/summary` is read-only and renders an already committed autonomous result when available. `/compare`
+never selects jokes or changes balances.
+
+Configure rollout with `AUTONOMOUS_JOKES_SHADOW_MODE`, block/partial/age settings,
+startup grace, poll and lease intervals, optional `AUTONOMOUS_JOKE_JUDGE_MODEL`, and
+`AUTONOMOUS_JOKE_ANNOUNCE`. Bot casino uses `BOT_AUTO_CASINO_ENABLED` and
+`BOT_AUTO_CASINO_CHANCE`; `.env.example` documents all defaults and validation.
 
 Only new rows with explicit provenance can be candidates: incoming text, incoming captions, incoming
 voice transcripts, and final contextual assistant answers. Existing rows are migrated as
@@ -235,6 +252,12 @@ document it, so every spin stores that rules version; jackpot is only `Dice.valu
 have shown Dice but the bot has no committed SQLite settlement, the spin is void and the stake is
 refunded. This intentionally does not promise exactly-once Telegram Dice delivery. The casino has no
 real money, payments, purchases, transfers, arbitrary stakes, or withdrawals.
+
+`/casino bot` and an explicitly addressed request with a self-marker such as `Реле, крути себе слот`
+use the bot's own chat balance. The bot identity is always `id:<Telegram bot id>`; its current display
+name in leaderboards is the first configured chat alias, then its Telegram name. After a non-shadow
+autonomous award, the bot records one durable automatic casino decision with the configured 25% chance;
+retries never resample it. A missing balance skips that decision.
 
 ## Bot Aliases
 

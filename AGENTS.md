@@ -103,10 +103,12 @@ SQLite tables are initialized in `MessageStore.init()`:
 - `chat_point_balances`: chat-scoped balance projection used by `/balance`, `/top`, and `/stats` leader.
 - `chat_pinned_leaderboards`: the chat-scoped Telegram `message_id` used for best-effort leaderboard edits and pinning.
 - `chat_casino_spins`: idempotent virtual slot reserve/settle/refund records linked to ledger rows by `casino_spin_id`.
+- `chat_joke_inbox`, `chat_joke_jobs`, `chat_joke_job_items`, `chat_joke_outbox`: durable autonomous joke queue, immutable blocks, fenced leases, and post-award delivery.
 
 ## Important Behavior
 
 - Access control is enforced by `ALLOWED_CHAT_IDS`; an empty set allows all chats.
+- `JOKE_AWARDS_DISABLED_CHAT_IDS` disables manual/autonomous joke awards for listed chats; `CASINO_DISABLED_CHAT_IDS` independently disables all casino flows there.
 - `/stats` intentionally bypasses `ALLOWED_CHAT_IDS` for chat-id discovery and reports `access_allowed`; this exception does not apply to storage, routing, or other commands.
 - Any participant in an allowed chat may manage chat aliases. An optional admin-only toggle is a future possibility and is not implemented.
 - Multi-token aliases allow one typo in total when their normalized length is at least five characters; short aliases require exact matching.
@@ -116,6 +118,9 @@ SQLite tables are initialized in `MessageStore.init()`:
 - Video recognition can include audio transcription when `VIDEO_TRANSCRIBE_AUDIO=true` and a transcriber is configured.
 - Long summaries/questions are chunked before model calls; final summaries merge partials.
 - `/summary` takes an eligible raw snapshot, then runs a strict joke selector in a second acquisition of the existing shared `gpu_lock`; awards are committed atomically only after that lock is released. `/compare` never selects or awards jokes.
+- With `AUTONOMOUS_JOKES_ENABLED=true`, a background worker creates 20-message or aged 5-19-message blocks; `/summary` becomes read-only for awards. Shadow mode persists results without points or Telegram notifications.
+- The autonomous worker shares `gpu_lock`, acquires it for one selector batch at a time, and uses SQLite leases for restart recovery. It cannot recover Telegram history unavailable to the Bot API.
+- Bot balances use stable `id:<bot_id>` keys; aliases are display-only. `/casino bot` and explicit self-addressed casino requests debit that bot balance.
 - `/top` and the pinned `Топ балансов` reflect current spendable balances after awards, bets, payouts, and refunds. Only a confirmed Telegram not-found error recreates the pinned message.
 - Mentioning the bot in a message triggers the same contextual answer flow as `/question` using the default period.
 - Wiki/image/video/YouTube context persistence is best effort: a completed result is still sent with a safe partial-success warning if SQLite persistence fails.

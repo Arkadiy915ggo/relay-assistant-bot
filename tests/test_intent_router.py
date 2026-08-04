@@ -147,6 +147,12 @@ class IntentRouterTests(unittest.IsolatedAsyncioTestCase):
                 self.assertFalse(is_casino_request(text))
                 self.assertEqual((await router.route(text)).reason, "casino_not_explicit")
 
+    async def test_casino_self_marker_selects_bot_wallet_without_model_trust(self) -> None:
+        bot_route = IntentRouter(FakeLLM('{"action":"casino","period":null,"query":null}'))  # type: ignore[arg-type]
+        self.assertEqual((await bot_route.route("крути себе слот")).action, "casino_bot")
+        user_route = IntentRouter(FakeLLM('{"action":"casino_bot","period":null,"query":null}'))  # type: ignore[arg-type]
+        self.assertEqual((await user_route.route("крути слот")).action, "casino")
+
     def test_production_router_constructor_is_imported(self) -> None:
         self.assertIs(bot_module.IntentRouter, IntentRouter)
 

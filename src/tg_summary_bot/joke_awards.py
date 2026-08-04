@@ -4,6 +4,7 @@ import asyncio
 import json
 from dataclasses import dataclass
 from datetime import datetime
+from collections.abc import Awaitable, Callable
 from typing import Literal
 
 from tg_summary_bot.llm import LLMClient
@@ -85,7 +86,11 @@ def parse_joke_selection(response: str, candidate_ids: set[int]) -> JokeSelectio
 
 
 def _candidate_line(message: StoredMessage) -> str:
-    return f"id={message.message_id}\nauthor={message.sender_name}\ntext={message.text}"
+    return json.dumps(
+        {"target_message_id": message.message_id, "author": message.sender_name, "text": message.text},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
 
 
 def _candidate_batches(
@@ -194,6 +199,38 @@ class JokeSelector:
             tournament_rounds=rounds,
         )
 
+    async def choose_messages(
+        self,
+        candidates: list[StoredMessage],
+        *,
+        select_batch: Callable[[list[StoredMessage]], Awaitable[JokeSelection]] | None = None,
+    ) -> JokeSelectionResult:
+        """Select from immutable canonical job rows without querying a time snapshot."""
+        if not candidates:
+            return JokeSelectionResult("none")
+        pages = 0
+        winners: list[StoredMessage] = []
+        batch_selector = select_batch or self._select_from
+        for batch in _candidate_batches(candidates, row_limit=self.row_limit, char_budget=self.char_budget):
+            pages += 1
+            selection = await batch_selector(batch)
+            if not selection.valid:
+                return JokeSelectionResult("invalid", reason=selection.error, pages=pages)
+            if selection.has_joke:
+                winners.append(next(item for item in batch if item.message_id == selection.source_message_id))
+        if not winners:
+            return JokeSelectionResult("none", pages=pages)
+        # A callback is used by the worker so every model batch can have its own GPU admission.
+        if select_batch is None:
+            winner, reason, rounds, error = await self._run_tournament(winners)
+        else:
+            winner, reason, rounds, error = await self._run_tournament_with(winners, batch_selector)
+        if error:
+            return JokeSelectionResult("invalid", reason=error, pages=pages, tournament_rounds=rounds)
+        if not winner:
+            return JokeSelectionResult("none", pages=pages, tournament_rounds=rounds)
+        return JokeSelectionResult("selected", winner=winner, reason=reason, pages=pages, tournament_rounds=rounds)
+
     async def _run_tournament(
         self,
         candidates: list[StoredMessage],
@@ -229,9 +266,38 @@ class JokeSelector:
                 return None, None, rounds, None
         return current[0], last_reason, rounds, None
 
+    async def _run_tournament_with(
+        self,
+        candidates: list[StoredMessage],
+        select_batch: Callable[[list[StoredMessage]], Awaitable[JokeSelection]],
+    ) -> tuple[StoredMessage | None, str | None, int, str | None]:
+        current = candidates
+        rounds = 0
+        reason: str | None = None
+        while len(current) > 1:
+            rounds += 1
+            next_round: list[StoredMessage] = []
+            for batch in _candidate_batches(current, row_limit=self.row_limit, char_budget=self.char_budget):
+                selection = await select_batch(batch)
+                if not selection.valid:
+                    return None, None, rounds, selection.error
+                if selection.has_joke:
+                    next_round.append(next(item for item in batch if item.message_id == selection.source_message_id))
+                    reason = selection.reason
+            if len(next_round) >= len(current):
+                return None, None, rounds, "tournament_no_progress"
+            current = next_round
+            if not current:
+                return None, None, rounds, None
+        return current[0], reason, rounds, None
+
     async def _select_from(self, candidates: list[StoredMessage]) -> JokeSelection:
         candidate_ids = {candidate.message_id for candidate in candidates}
-        prompt = "Кандидаты:\n\n" + "\n\n".join(_candidate_line(item) for item in candidates)
+        prompt = json.dumps(
+            {"candidates": [json.loads(_candidate_line(item)) for item in candidates]},
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
         try:
             async with asyncio.timeout(JOKE_SELECTOR_TIMEOUT_SECONDS):
                 response = await self.llm.complete(
