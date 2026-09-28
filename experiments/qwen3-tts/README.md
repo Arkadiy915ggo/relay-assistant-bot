@@ -50,7 +50,7 @@ curl -fL https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen3-TTS-Repo/clone.wa
 
 ## Пример с нарезкой Артаса
 
-Если записи лежат в `$HOME/Downloads/Альянс/Артас`, три файла с подписанными **полными** фразами можно собрать в моно-WAV (4,8 секунды). Нужен `ffmpeg`; исходные `.m4a` изменять не требуется:
+Если записи лежат в `$HOME/Downloads/Альянс/Артас`, три коротких файла можно собрать в моно-WAV (5,6 секунды). Вместо яркого «За Лордерон!» в этой версии используется «Теперь я действительно зол.» — окончание подтверждено распознаванием полной минутной сборки. Нужен `ffmpeg`; исходные `.m4a` изменять не требуется:
 
 ```bash
 SOURCE="$HOME/Downloads/Альянс/Артас"
@@ -58,15 +58,15 @@ mkdir -p experiments/qwen3-tts/outputs
 ffmpeg -y \
   -i "$SOURCE/[Я служу свету] Артас, Альянс. Warcraft 3.m4a" \
   -i "$SOURCE/[Во Имя правосудия] Артас, Альянс. Warcraft 3.m4a" \
-  -i "$SOURCE/[За Лордерон] Артас, Альянс. Warcraft 3.m4a" \
+  -i "$SOURCE/[Теперь я действител...]Артас, Альянс. Warcraft 3.m4a" \
   -filter_complex '[0:a]aformat=sample_rates=24000:channel_layouts=mono[a0];[1:a]aformat=sample_rates=24000:channel_layouts=mono[a1];[2:a]aformat=sample_rates=24000:channel_layouts=mono[a2];[a0][a1][a2]concat=n=3:v=0:a=1[a]' \
-  -map '[a]' -c:a pcm_s16le experiments/qwen3-tts/outputs/reference-arthas.wav
+  -map '[a]' -c:a pcm_s16le experiments/qwen3-tts/outputs/reference-arthas-v2.wav
 
 .venv-tts/bin/python experiments/qwen3-tts/clone.py \
-  --ref-audio experiments/qwen3-tts/outputs/reference-arthas.wav \
-  --ref-text 'Я служу свету. Во имя правосудия. За Лордерон!' \
+  --ref-audio experiments/qwen3-tts/outputs/reference-arthas-v2.wav \
+  --ref-text 'Я служу свету. Во имя правосудия. Теперь я действительно зол.' \
   --text 'Привет я чат бот Алёша, я служу свету!' \
-  --output experiments/qwen3-tts/outputs/arthas-alyosha.wav
+  --output experiments/qwen3-tts/outputs/arthas-alyosha-v2.wav
 ```
 
-Итог: `experiments/qwen3-tts/outputs/arthas-alyosha.wav`. Референс составлен по подписям файлов; если на слух обнаружится несовпадение слов, поправьте `--ref-text` и повторите генерацию. Аудиофайлы в Git не попадают.
+Итог: `experiments/qwen3-tts/outputs/arthas-alyosha-v2.wav`. Старый вариант остаётся в `arthas-alyosha.wav` для сравнения. Аудиофайлы в Git не попадают.
