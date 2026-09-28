@@ -10,6 +10,7 @@ dependencies = [
     "openai>=1.40,<2",
     "Pillow>=10,<12",
     "python-dotenv>=1.0,<2",
+    "yt-dlp>=2025.1.15,<2027",
 ]
 
 [project.optional-dependencies]

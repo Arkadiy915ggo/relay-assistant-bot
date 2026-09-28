@@ -60,15 +60,17 @@ def _within_one_edit(left: str, right: str) -> bool:
 def _matches_alias(tokens: list[tuple[str, int, int]], index: int, alias_tokens: list[str]) -> bool:
     if index + len(alias_tokens) > len(tokens):
         return False
-    if len(alias_tokens) > 1:
-        return all(
-            tokens[index + offset][0] == alias_token
-            for offset, alias_token in enumerate(alias_tokens)
-        )
-
-    token = tokens[index][0]
-    alias = alias_tokens[0]
-    return token == alias or (len(alias) >= 5 and _within_one_edit(token, alias))
+    candidate_tokens = [tokens[index + offset][0] for offset in range(len(alias_tokens))]
+    if candidate_tokens == alias_tokens:
+        return True
+    if sum(len(token) for token in alias_tokens) < 5:
+        return False
+    differences = [
+        (candidate, alias)
+        for candidate, alias in zip(candidate_tokens, alias_tokens, strict=True)
+        if candidate != alias
+    ]
+    return len(differences) == 1 and _within_one_edit(*differences[0])
 
 
 def remove_aliases_from_text(text: str, normalized_aliases: Iterable[str]) -> str | None:

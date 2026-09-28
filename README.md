@@ -7,7 +7,9 @@ A safe Telegram bot that stores new chat messages and produces short AI summarie
 - stores new text messages and media captions in SQLite;
 - creates summaries with `/summary 24h`, `/summary 7d`, `/summary today`;
 - compares summaries from multiple Ollama models with `/compare 10m`;
-- includes a `Best joke` section in the generated report;
+- optionally awards `+10` chat-scoped virtual points from durable autonomous joke blocks;
+- shows personal joke points with `/balance` and a deterministic top-10 with `/top`;
+- spins one virtual Telegram slot with `/casino` for a fixed 10-point stake;
 - works in direct chats, groups, supergroups, and channels;
 - supports OpenAI API or a local Ollama model;
 - splits long discussions into chunks and merges the final summary;
@@ -16,8 +18,8 @@ A safe Telegram bot that stores new chat messages and produces short AI summarie
 - manually recognizes text from images with an Ollama vision model;
 - makes simple image memes with `/meme` from a replied/latest image;
 - manually recognizes videos through sampled key frames and auto-recognizes Telegram video notes;
-- answers contextual questions when the bot is mentioned in a message;
-- lets chat administrators add aliases for addressing the bot in regular messages and media captions;
+- routes addressed messages to contextual answers, summaries, Wikipedia, media recognition, transcription, memes, or profiles;
+- lets chat participants add aliases for addressing the bot in regular messages and media captions;
 - searches Wikipedia with `/wiki` and saves found excerpts for future context;
 - compresses old chat history into structured SQLite memory blocks for long `/question` and `/summary` periods;
 - keeps source-backed participant profile facts that can be used in answers;
@@ -133,11 +135,22 @@ Then add the bot to the target chat.
 
 ## Access Control
 
-The first run can use an empty `ALLOWED_CHAT_IDS` to discover the target `chat_id`:
+`/stats` intentionally bypasses `ALLOWED_CHAT_IDS` so it can be used to discover a target `chat_id`. Its response includes `access_allowed: true|false`; this exception does not allow message storage, routed actions, or other commands in a denied chat.
+
+You may keep the normal allowlist configured while discovering another chat. An empty value still allows all chats and can be used for an unrestricted first run:
 
 ```env
 ALLOWED_CHAT_IDS=
 ```
+
+To keep the bot available but disable economics in selected chats, use separate comma-separated lists:
+
+```env
+JOKE_AWARDS_DISABLED_CHAT_IDS=-1001111111111,-1002222222222
+CASINO_DISABLED_CHAT_IDS=-1001111111111,-1002222222222
+```
+
+Joke-disabled chats do not run manual or autonomous joke selection, awards, announcements, or bot casino outbox work. Casino-disabled chats reject `/casino`, `/casino bot`, and addressed casino requests without changing balances.
 
 Send this command in the target chat:
 
@@ -152,6 +165,7 @@ chat_id: -1001234567890
 chat_type: supergroup
 saved_messages: 42
 llm_provider: openai
+access_allowed: false
 ```
 
 After that, restrict access:
@@ -168,6 +182,10 @@ Restart the bot.
 /start
 /help
 /stats
+/balance
+/top
+/casino
+/casino bot
 /summary
 /summary 30m
 /summary 6h
@@ -191,13 +209,59 @@ Restart the bot.
 /ocr
 /meme
 /video
+/video https://youtu.be/example
 /vocr
 /compare 10m
 ```
 
+## Joke Points
+
+With `AUTONOMOUS_JOKES_ENABLED=false` (the default), a successful `/summary` keeps the legacy manual
+selector and can award one verified joke. When enabled, a durable worker creates non-overlapping blocks
+of 50 eligible messages, or aged 5-49-message blocks after 3 days. Each block has zero or one winner
+worth `+10`; shadow mode records selections without changing balances or Telegram messages. Enabled
+`/summary` is read-only and renders an already committed autonomous result when available. `/compare`
+never selects jokes or changes balances.
+
+Configure rollout with `AUTONOMOUS_JOKES_SHADOW_MODE`, block/partial/age settings,
+startup grace, poll and lease intervals, optional `AUTONOMOUS_JOKE_JUDGE_MODEL`, and
+`AUTONOMOUS_JOKE_ANNOUNCE`. Bot casino uses `BOT_AUTO_CASINO_ENABLED` and
+`BOT_AUTO_CASINO_CHANCE`; `.env.example` documents all defaults and validation.
+
+Only new rows with explicit provenance can be candidates: incoming text, incoming captions, incoming
+voice transcripts, and final contextual assistant answers. Existing rows are migrated as
+`legacy/legacy_unclassified` and intentionally never become eligible. Recognition results, summaries,
+profiles, status messages, memory blocks, memes, errors, and generated context remain ineligible.
+
+Points are chat-scoped and have no monetary value. They cannot be bought, transferred, withdrawn, or
+exchanged for money or any real-world value.
+
+After the first new award, the bot creates a `Топ балансов` message and tries to pin it. Each later
+award, slot settlement, or slot refund edits that same message and re-pins it. If it was deleted, the bot creates a replacement. The bot
+needs Telegram permission to pin messages; without it, it still keeps and updates the leaderboard message.
+
+## Virtual Casino Slot
+
+`/casino` and an explicitly addressed request such as `Реле, прокрути слот` use one Telegram `🎰`
+Dice animation. The fixed stake is 10 virtual points. Gross payouts are 0 for no match, 5 for one pair,
+50 for three equal non-seven symbols, and 250 for `seven/seven/seven`; the corresponding net outcomes
+after stake are -10, -5, +40, and +240. The v1 return-to-player is 90.625%.
+
+The mapping is the versioned community contract `telegram_slots_base4_v1`. Telegram does not formally
+document it, so every spin stores that rules version; jackpot is only `Dice.value=64`. If Telegram may
+have shown Dice but the bot has no committed SQLite settlement, the spin is void and the stake is
+refunded. This intentionally does not promise exactly-once Telegram Dice delivery. The casino has no
+real money, payments, purchases, transfers, arbitrary stakes, or withdrawals.
+
+`/casino bot` and an explicitly addressed request with a self-marker such as `Реле, крути себе слот`
+use the bot's own chat balance. The bot identity is always `id:<Telegram bot id>`; its current display
+name in leaderboards is the first configured chat alias, then its Telegram name. After a non-shadow
+autonomous award, the bot records one durable automatic casino decision with the configured 25% chance;
+retries never resample it. A missing balance skips that decision.
+
 ## Bot Aliases
 
-Chat administrators can configure names that address the bot without using its Telegram username:
+Any chat participant can configure names that address the bot without using its Telegram username:
 
 ```text
 /alias add Реле, Релейка
@@ -206,8 +270,48 @@ Chat administrators can configure names that address the bot without using its T
 ```
 
 Aliases are local to a chat. The bot recognizes them in ordinary text and image/video captions,
-including a single typo for names with five or more characters. In direct chats, either participant
-can manage aliases.
+including a single insertion, deletion, or replacement for names whose normalized token length is at
+least five characters. A multi-token alias allows one typo in total, not one typo per word. Short
+aliases require an exact match.
+
+Allowing every participant in an allowed chat to manage aliases is the accepted current policy. An
+optional admin-only toggle may be added in the future, but no such setting or restriction exists now.
+
+## Addressed Actions
+
+After a confirmed `@username`, Telegram text mention, or configured alias, the bot routes the
+cleaned request to one safe built-in action. For example:
+
+```text
+Реле, сделай саммари за 6 часов
+Релейка, найди в Википедии Ada Lovelace
+@relay_bot распознай эту картинку
+```
+
+The router accepts only a fixed action set: contextual question, summary, Wikipedia search, image
+recognition, meme, video recognition, replied voice/audio transcription, profile display, and the
+explicit virtual casino slot request.
+Slash commands and channel posts are not routed. For image/video/meme actions, a matching reply has
+priority, then media in the addressed message, and only then the latest indexed media.
+
+If a routed Wikipedia intent has no search query, the bot asks what to search instead of silently
+falling back to a contextual question. Requests to joke remain normal questions, not meme commands.
+A surprise meme has an explicit 2% chance only after a valid `question` route, an explicit joke
+request, and an image in the current or replied message; router failures and the latest unrelated
+chat image cannot trigger it.
+
+## Operation Results And Persistence
+
+Summary, question, Wikipedia, image, video, and profile operations produce structured terminal
+outcomes for logs: `succeeded`, `rejected`, `partial`, or `failed`, with a stable reason and no raw
+query or transcript in the operation event. Slash and naturally routed calls use the same operation
+logic.
+
+Wikipedia, image, Telegram video, and YouTube results use best-effort context persistence. The bot
+shows `Saved for summaries.` only after the SQLite write succeeds. If generation succeeded but the
+write fails, the useful result is still sent with a safe warning and the operation is recorded as
+partial; private database error details are not shown. A video cache write failure is handled the
+same way and does not discard an already generated recognition result.
 
 ## Wikipedia Search
 
@@ -227,7 +331,7 @@ WIKI_MAX_RESULTS=3
 WIKI_USER_AGENT=telegram-summary-bot/0.1 (https://github.com/Arkadiy915ggo/relay-assistant-bot)
 ```
 
-`/wiki` returns short article extracts with source links and saves successful results as normal stored messages, so future `/summary` and `/question` calls can use them as chat context. This is not a full web search engine; it only uses the selected Wikipedia language edition.
+`/wiki` returns short article extracts with source links and attempts to save successful results as normal stored messages, so future `/summary` and `/question` calls can use them as chat context when the write succeeds. This is not a full web search engine; it only uses the selected Wikipedia language edition.
 
 ## Chat Memory
 
@@ -428,7 +532,7 @@ Behavior:
 - If `/image` is sent without a reply, the bot recognizes the latest indexed image in the chat.
 - `/ocr` is an alias for `/image`.
 - `/meme` uses the replied image or the latest indexed image, asks the vision model for a short safe Russian joke, renders classic top/bottom meme text with Pillow, sends the resulting image, and deletes temporary files.
-- `/image` and `/ocr` results are saved as normal stored messages, so future `/summary` and `/question` calls can use them. `/meme` does not save generated images in SQLite.
+- `/image` and `/ocr` results are saved as normal stored messages when the SQLite write succeeds, so future `/summary` and `/question` calls can use them. `/meme` does not save generated images in SQLite.
 
 The image response format is:
 
@@ -484,11 +588,13 @@ Behavior:
 
 - If `/video` is sent as a reply to a video or Telegram video note, the bot recognizes only the replied video.
 - If `/video` is sent without a reply, the bot recognizes the latest indexed video in the chat.
+- `/video <YouTube URL>` downloads one on-demand YouTube video with `yt-dlp` and runs the same frame and optional audio analysis. Playlists, channels, live/upcoming streams, and videos with unknown duration are rejected. YouTube videos use `MAX_VIDEO_SIZE_MB` and `MAX_VIDEO_SECONDS` and are deleted after processing.
+- You can also reply to a YouTube link with `/video`.
 - `/vocr` is an alias for `/video`.
 - Videos over `MAX_VIDEO_SIZE_MB` are rejected before recognition. If `TELEGRAM_DOWNLOAD_LIMIT_MB` is positive, it is also used as an early cutoff; otherwise the bot attempts the download and reports Telegram's real `file is too big` response if it happens.
 - The bot downloads the video, extracts key frames with `ffmpeg`, sends those frames to `VIDEO_RECOGNITION_MODEL`, optionally extracts/transcribes the audio track when `VIDEO_TRANSCRIBE_AUDIO=true`, unloads the model after the task, and deletes temporary files.
-- Repeated `/video` calls for the same message and same video settings use a SQLite cache instead of rerunning `ffmpeg` and Ollama.
-- The result is saved as a normal stored message, so future `/summary` and `/question` calls can use it.
+- Repeated `/video` calls for the same Telegram message and settings use a SQLite cache instead of rerunning `ffmpeg` and Ollama. YouTube downloads are not cached in v1.
+- The result is saved as a normal stored message when the SQLite write succeeds, so future `/summary` and `/question` calls can use it.
 
 The video response format is:
 
@@ -580,12 +686,20 @@ OLLAMA_TIMEOUT_SECONDS=1800
 OLLAMA_KEEP_ALIVE=30m
 OLLAMA_NUM_CTX=4096
 OLLAMA_NUM_PREDICT=800
+# Keep Gemma for questions, but use a small model for addressed-action routing.
+QUESTION_MODEL=gemma3:12b
+INTENT_ROUTER_MODEL=qwen2.5:1.5b
 COMPARE_MODELS=
 ```
 
 The recommended `.env.ollama.example` documents the maintainer's stable local model choices:
 
 - `llama3.1:8b` for the safest text summaries/questions baseline.
+
+`INTENT_ROUTER_MODEL` is only used to classify explicitly addressed natural-language requests. It defaults to
+`QUESTION_MODEL`, then `OLLAMA_MODEL`; set it to a smaller installed text model to avoid loading Gemma before
+every routed action. A vision model such as the configured OCR model can also route text if it supports ordinary
+text chat, but a small text-only model usually starts faster and uses less VRAM.
 - `qwen2.5vl:7b` for stable `/image`, `/ocr`, `/meme`, and `/video` frame recognition.
 - `qwen3:14b`, `gemma3:27b`, and `qwen3-coder:30b` for `/compare` on stronger local machines.
 

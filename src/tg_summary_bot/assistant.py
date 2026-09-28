@@ -49,9 +49,16 @@ class ChatAssistant:
         self.chunk_chars = chunk_chars
 
     @opik_track(name="question.ask")
-    async def ask(self, messages: list[StoredMessage], period_label: str, question: str) -> str:
+    async def ask(
+        self,
+        messages: list[StoredMessage],
+        period_label: str,
+        question: str,
+        *,
+        bot_names: list[str] | None = None,
+    ) -> str:
         if not messages:
-            return await self._answer_from_context("", period_label, question)
+            return await self._answer_from_context("", period_label, question, bot_names=bot_names)
 
         rendered = _render_messages(messages)
         chunks = _split_text(rendered, self.chunk_chars)
@@ -66,7 +73,7 @@ class ChatAssistant:
         )
 
         if len(chunks) == 1:
-            return await self._answer_from_context(chunks[0], period_label, question)
+            return await self._answer_from_context(chunks[0], period_label, question, bot_names=bot_names)
 
         notes: list[str] = []
         for index, chunk in enumerate(chunks, start=1):
@@ -83,6 +90,7 @@ class ChatAssistant:
             "\n\n---\n\n".join(notes),
             period_label,
             question,
+            bot_names=bot_names,
         )
 
     async def unload(self) -> None:
@@ -122,7 +130,14 @@ class ChatAssistant:
         return await self.llm.complete(system=CHAT_SYSTEM_PROMPT, user=user)
 
     @opik_track(name="question.answer")
-    async def _answer_from_context(self, context: str, period_label: str, question: str) -> str:
+    async def _answer_from_context(
+        self,
+        context: str,
+        period_label: str,
+        question: str,
+        *,
+        bot_names: list[str] | None,
+    ) -> str:
         update_opik_span_metadata(
             {
                 "period_label": period_label,
@@ -131,10 +146,19 @@ class ChatAssistant:
             }
         )
         context_block = context or "История чата за выбранный период пуста."
+        names = ", ".join(f"«{name}»" for name in bot_names or [])
+        identity_block = (
+            f"В этом чате тебя называют: {names}. Это твои имена/алиасы в этом чате; "
+            "если спрашивают, как тебя зовут, назови их естественно.\n"
+            if names
+            else ""
+        )
         user = f"""
-Пользователь задал вопрос в Telegram-чате.
+        Пользователь задал вопрос в Telegram-чате.
 
-Вопрос:
+        {identity_block}
+
+        Вопрос:
 {question}
 
 Правила:

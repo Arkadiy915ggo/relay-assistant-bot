@@ -6,3 +6,4 @@ data/
 *.sqlite3
 *.db
 *.egg-info/
+relay-assistant-bot-doc/.obsidian/
