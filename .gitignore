@@ -1,8 +1,11 @@
 .env
 .venv/
+.venv-tts/
 __pycache__/
 *.pyc
 data/
+experiments/qwen3-tts/models/
+experiments/qwen3-tts/outputs/
 *.sqlite3
 *.db
 *.egg-info/
