@@ -1,6 +1,8 @@
 """Standalone voice cloning experiment with Qwen3-TTS Base."""
 
 import argparse
+import subprocess
+import tempfile
 import time
 from pathlib import Path
 
@@ -17,12 +19,16 @@ def main() -> None:
     parser.add_argument("--model", default=str(MODEL_DIR), help="Local model directory or HF ID")
     parser.add_argument("--device", choices=("cuda", "cpu"), default="cuda")
     parser.add_argument("--profile", action="store_true", help="Print loading and synthesis timings")
+    parser.add_argument("--non-streaming", action="store_true", help="Pass full text to the model at once")
+    parser.add_argument("--speed", type=float, default=1.0, help="Output tempo, e.g. 0.85 is 15%% slower")
     args = parser.parse_args()
 
     if not args.ref_audio.is_file():
         parser.error(f"Reference audio does not exist: {args.ref_audio}")
     if not args.ref_text.strip() or not args.text.strip():
         parser.error("--ref-text and --text must not be empty")
+    if not 0.5 <= args.speed <= 2.0:
+        parser.error("--speed must be between 0.5 and 2.0")
     if args.model == str(MODEL_DIR) and not MODEL_DIR.is_dir():
         parser.error(f"Model not found at {MODEL_DIR}; download it first (see README.md)")
 
@@ -50,6 +56,7 @@ def main() -> None:
         language=args.language,
         ref_audio=str(args.ref_audio),
         ref_text=args.ref_text,
+        non_streaming_mode=args.non_streaming,
     )
     if args.device == "cuda":
         torch.cuda.synchronize()
@@ -57,7 +64,22 @@ def main() -> None:
         peak_reserved = torch.cuda.max_memory_reserved()
     generated = time.perf_counter()
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    sf.write(args.output, wavs[0], sample_rate)
+    if args.speed == 1.0:
+        sf.write(args.output, wavs[0], sample_rate)
+    else:
+        with tempfile.NamedTemporaryFile(suffix=".wav", dir=args.output.parent, delete=False) as tmp:
+            raw_path = Path(tmp.name)
+        try:
+            sf.write(raw_path, wavs[0], sample_rate)
+            subprocess.run(
+                [
+                    "ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(raw_path),
+                    "-filter:a", f"atempo={args.speed}", "-c:a", "pcm_s16le", str(args.output),
+                ],
+                check=True,
+            )
+        finally:
+            raw_path.unlink(missing_ok=True)
     print(f"Saved: {args.output} ({sample_rate} Hz)")
     if args.profile:
         print(f"Imports: {loaded_libraries - started:.2f}s")
