@@ -218,7 +218,7 @@ Restart the bot.
 
 With `AUTONOMOUS_JOKES_ENABLED=false` (the default), a successful `/summary` keeps the legacy manual
 selector and can award one verified joke. When enabled, a durable worker creates non-overlapping blocks
-of 20 eligible messages, or aged 5-19-message blocks after 24 hours. Each block has zero or one winner
+of 50 eligible messages, or aged 5-49-message blocks after 3 days. Each block has zero or one winner
 worth `+10`; shadow mode records selections without changing balances or Telegram messages. Enabled
 `/summary` is read-only and renders an already committed autonomous result when available. `/compare`
 never selects jokes or changes balances.

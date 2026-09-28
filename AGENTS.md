@@ -118,7 +118,7 @@ SQLite tables are initialized in `MessageStore.init()`:
 - Video recognition can include audio transcription when `VIDEO_TRANSCRIBE_AUDIO=true` and a transcriber is configured.
 - Long summaries/questions are chunked before model calls; final summaries merge partials.
 - `/summary` takes an eligible raw snapshot, then runs a strict joke selector in a second acquisition of the existing shared `gpu_lock`; awards are committed atomically only after that lock is released. `/compare` never selects or awards jokes.
-- With `AUTONOMOUS_JOKES_ENABLED=true`, a background worker creates 20-message or aged 5-19-message blocks; `/summary` becomes read-only for awards. Shadow mode persists results without points or Telegram notifications.
+- With `AUTONOMOUS_JOKES_ENABLED=true`, a background worker creates 50-message or aged 5-49-message blocks after 3 days; `/summary` becomes read-only for awards. Shadow mode persists results without points or Telegram notifications.
 - The autonomous worker shares `gpu_lock`, acquires it for one selector batch at a time, and uses SQLite leases for restart recovery. It cannot recover Telegram history unavailable to the Bot API.
 - Bot balances use stable `id:<bot_id>` keys; aliases are display-only. `/casino bot` and explicit self-addressed casino requests debit that bot balance.
 - `/top` and the pinned `Топ балансов` reflect current spendable balances after awards, bets, payouts, and refunds. Only a confirmed Telegram not-found error recreates the pinned message.

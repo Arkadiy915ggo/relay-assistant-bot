@@ -156,7 +156,7 @@ def load_settings() -> Settings:
     if transcription_format_provider not in {"openai", "ollama"}:
         raise RuntimeError("TRANSCRIPTION_FORMAT_PROVIDER must be one of: openai, ollama")
 
-    block_messages = int(os.getenv("AUTONOMOUS_JOKES_BLOCK_MESSAGES", "20"))
+    block_messages = int(os.getenv("AUTONOMOUS_JOKES_BLOCK_MESSAGES", "50"))
     partial_min = int(os.getenv("AUTONOMOUS_JOKES_PARTIAL_MIN_MESSAGES", "5"))
     lease_seconds = int(os.getenv("AUTONOMOUS_JOKES_LEASE_SECONDS", "900"))
     if block_messages <= 0 or not 1 <= partial_min <= block_messages:
@@ -262,7 +262,7 @@ def load_settings() -> Settings:
         autonomous_jokes_block_messages=block_messages,
         autonomous_jokes_partial_min_messages=partial_min,
         autonomous_jokes_max_block_age=_duration(
-            os.getenv("AUTONOMOUS_JOKES_MAX_BLOCK_AGE", "24h"), name="AUTONOMOUS_JOKES_MAX_BLOCK_AGE"
+            os.getenv("AUTONOMOUS_JOKES_MAX_BLOCK_AGE", "3d"), name="AUTONOMOUS_JOKES_MAX_BLOCK_AGE"
         ),
         autonomous_jokes_initial_lookback=_duration(
             os.getenv("AUTONOMOUS_JOKES_INITIAL_LOOKBACK", "7d"), name="AUTONOMOUS_JOKES_INITIAL_LOOKBACK"
