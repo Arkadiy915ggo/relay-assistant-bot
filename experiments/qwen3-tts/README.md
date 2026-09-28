@@ -47,3 +47,26 @@ curl -fL https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen3-TTS-Repo/clone.wa
 ```
 
 Официальные [примеры voice clone](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-Base#voice-clone) используют `generate_voice_clone` с `ref_audio` и `ref_text`; FlashAttention для первого запуска не требуется.
+
+## Пример с нарезкой Артаса
+
+Если записи лежат в `$HOME/Downloads/Альянс/Артас`, три файла с подписанными **полными** фразами можно собрать в моно-WAV (4,8 секунды). Нужен `ffmpeg`; исходные `.m4a` изменять не требуется:
+
+```bash
+SOURCE="$HOME/Downloads/Альянс/Артас"
+mkdir -p experiments/qwen3-tts/outputs
+ffmpeg -y \
+  -i "$SOURCE/[Я служу свету] Артас, Альянс. Warcraft 3.m4a" \
+  -i "$SOURCE/[Во Имя правосудия] Артас, Альянс. Warcraft 3.m4a" \
+  -i "$SOURCE/[За Лордерон] Артас, Альянс. Warcraft 3.m4a" \
+  -filter_complex '[0:a]aformat=sample_rates=24000:channel_layouts=mono[a0];[1:a]aformat=sample_rates=24000:channel_layouts=mono[a1];[2:a]aformat=sample_rates=24000:channel_layouts=mono[a2];[a0][a1][a2]concat=n=3:v=0:a=1[a]' \
+  -map '[a]' -c:a pcm_s16le experiments/qwen3-tts/outputs/reference-arthas.wav
+
+.venv-tts/bin/python experiments/qwen3-tts/clone.py \
+  --ref-audio experiments/qwen3-tts/outputs/reference-arthas.wav \
+  --ref-text 'Я служу свету. Во имя правосудия. За Лордерон!' \
+  --text 'Привет я чат бот Алёша, я служу свету!' \
+  --output experiments/qwen3-tts/outputs/arthas-alyosha.wav
+```
+
+Итог: `experiments/qwen3-tts/outputs/arthas-alyosha.wav`. Референс составлен по подписям файлов; если на слух обнаружится несовпадение слов, поправьте `--ref-text` и повторите генерацию. Аудиофайлы в Git не попадают.
