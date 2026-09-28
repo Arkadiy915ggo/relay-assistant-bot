@@ -118,3 +118,30 @@ ffmpeg -y -i "$HOME/Downloads/Анубарак/nerubiancryptlordpissed6.ogg" \
 ```
 
 Полученный файл — `experiments/qwen3-tts/outputs/anubarak-alyosha.wav` (11,28 с, 24 кГц). В одном измерении на RTX 4070 SUPER синтез занял 6,67 с, пиковая память процесса PyTorch — 4642 МиБ выделено / 5032 МиБ зарезервировано; пик занятой памяти всей видеокарты — 8010 МиБ (до запуска было 2768 МиБ).
+
+### Сравнение референсов на длинной фразе
+
+Вариант A: целиком `nerubiancryptlordpissed3.ogg` («Мы, нежить, народ работящий. Такая уж наша тяжкая доля»). Вариант B: первые предложения `nerubiancryptlordpissed2.ogg` и `nerubiancryptlordpissed3.ogg` — два фрагмента одного персонажа, обрезанные в паузах между предложениями. Оба референса около 9 секунд; для сравнения используйте **одинаковый** текст:
+
+```bash
+SOURCE="$HOME/Downloads/Анубарак"
+mkdir -p experiments/qwen3-tts/outputs
+ffmpeg -y -i "$SOURCE/nerubiancryptlordpissed3.ogg" \
+  -ar 24000 -ac 1 -c:a pcm_s16le experiments/qwen3-tts/outputs/reference-anubarak-worker.wav
+ffmpeg -y -i "$SOURCE/nerubiancryptlordpissed2.ogg" \
+  -i "$SOURCE/nerubiancryptlordpissed3.ogg" \
+  -filter_complex '[0:a]atrim=duration=4.1,asetpts=PTS-STARTPTS,aformat=sample_rates=24000:channel_layouts=mono[a0];[1:a]atrim=duration=4.9,asetpts=PTS-STARTPTS,aformat=sample_rates=24000:channel_layouts=mono[a1];[a0][a1]concat=n=2:v=0:a=1[a]' \
+  -map '[a]' -c:a pcm_s16le experiments/qwen3-tts/outputs/reference-anubarak-mix.wav
+
+TEXT='Я чат-бот Алёша. Готов служить Плети. Ну, я могу подготовить презентацию. Будет готово к среде в два часа.'
+.venv-tts/bin/python experiments/qwen3-tts/benchmark.py \
+  --ref-audio experiments/qwen3-tts/outputs/reference-anubarak-worker.wav \
+  --ref-text 'Мы, нежить, народ работящий. Такая уж наша тяжкая доля.' \
+  --text "$TEXT" --output experiments/qwen3-tts/outputs/anubarak-presentation-worker.wav
+.venv-tts/bin/python experiments/qwen3-tts/benchmark.py \
+  --ref-audio experiments/qwen3-tts/outputs/reference-anubarak-mix.wav \
+  --ref-text 'Всё не так плохо, как вы думаете. Мы, нежить, народ работящий.' \
+  --text "$TEXT" --output experiments/qwen3-tts/outputs/anubarak-presentation-mix.wav
+```
+
+На RTX 4070 SUPER синтез занял 6,86/6,87 с; файлы для A/B сравнения — 12,24/12,56 с. Whisper распознал основную часть текста, но ошибался на «чат-бот Алёша» в обоих вариантах: качество произношения и сходство голоса лучше оценивать прослушиванием.
