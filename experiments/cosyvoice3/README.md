@@ -86,3 +86,35 @@ ffmpeg -y -i experiments/cosyvoice3/outputs/anubarak-worker-zero-shot.wav \
 ```
 
 `preserved` сохраняет резонансы (тембр обычно естественнее), `shifted` сдвигает и резонансы (эффект может быть заметнее). Все три получившихся WAV имеют одинаковую длительность ~17,6 с; исходная запись — ~15 с. Для более тонкой правки подойдёт `--semitones -0.5`; положительное значение повысит голос. Скрипт применим и к WAV из тестов Qwen. Нужен `ffmpeg` с фильтром `rubberband` (`ffmpeg -h filter=rubberband`). Это обработка готовой записи, а не повторный синтез, поэтому повторно загружать модель не нужно.
+
+### Ещё две реплики тем же голосом
+
+Тот же zero-shot референс «Мы, нежить, народ работящий…», что и у `anubarak-worker-zero-shot.wav`. Синтезируем каждую фразу отдельно, затем получаем замедленный до 85% и пониженный на полтона вариант (форманты сохраняются):
+
+```bash
+REF=experiments/qwen3-tts/outputs/reference-anubarak-worker.wav
+REF_TEXT='Мы, нежить, народ работящий. Такая уж наша тяжкая доля.'
+OUT=experiments/cosyvoice3/outputs
+
+.venv-cosyvoice3/bin/python experiments/cosyvoice3/clone.py \
+  --ref-audio "$REF" --ref-text "$REF_TEXT" \
+  --text 'Не бойся когда ты один. Бойся когда ты два.' \
+  --output "$OUT/anubarak-dont-fear-raw.wav"
+.venv-cosyvoice3/bin/python experiments/cosyvoice3/clone.py \
+  --ref-audio "$REF" --ref-text "$REF_TEXT" \
+  --text 'Соседка снизу, может быть сверху.' \
+  --output "$OUT/anubarak-neighbor-raw.wav"
+
+ffmpeg -y -i "$OUT/anubarak-dont-fear-raw.wav" -af atempo=0.85 \
+  -c:a pcm_s16le "$OUT/anubarak-dont-fear-slow.wav"
+.venv-cosyvoice3/bin/python experiments/cosyvoice3/pitch_shift.py \
+  --input "$OUT/anubarak-dont-fear-slow.wav" \
+  --output "$OUT/anubarak-dont-fear-slow-minus1.wav" --semitones -1 --formant preserved
+ffmpeg -y -i "$OUT/anubarak-neighbor-raw.wav" -af atempo=0.85 \
+  -c:a pcm_s16le "$OUT/anubarak-neighbor-slow.wav"
+.venv-cosyvoice3/bin/python experiments/cosyvoice3/pitch_shift.py \
+  --input "$OUT/anubarak-neighbor-slow.wav" \
+  --output "$OUT/anubarak-neighbor-slow-minus1.wav" --semitones -1 --formant preserved
+```
+
+Итоговые файлы для прослушивания: `anubarak-dont-fear-slow-minus1.wav` (7,37 с) и `anubarak-neighbor-slow-minus1.wav` (6,01 с). Автоматическое распознавание подтверждает слова обеих фраз после обработки. CosyVoice предупреждает, что короткий текст относительно референса может снижать качество: сходство голоса и интонацию оценивайте на слух.
