@@ -65,3 +65,24 @@ TEXT='Я чат-бот Алёша. Готов служить Плети. Ну, �
 Первые два вызова — обычный zero-shot с текстом референса. Третий использует `inference_instruct2`: этот режим принимает **аудио**, но по API не принимает текст референса. `speed` задаётся самой CosyVoice; это не постобработка `ffmpeg`, как у Qwen-скрипта. Инструкция — просьба к модели, а не гарантия ударения, пауз или интонации.
 
 На RTX 4070 SUPER (12 ГБ) после прогрева загрузка модели заняла ~3,6–3,7 с, синтез — 4,4–4,7 с, резерв PyTorch в пике ~5,2–5,3 ГиБ. Получились WAV 24 кГц длительностью 14,96 / 9,96 / 9,96 с соответственно. Первая загрузка дольше; измерение PyTorch не включает память ONNX Runtime и других процессов. Автоматическое распознавание по-разному искажало «чат-бот Алёша» и зачастую заменяло «готово» на «готова»; сходство с референсом и ударение в «Плети» оценивайте прослушиванием.
+
+## Сдвиг высоты и замедление готового голоса
+
+Для сравнения возьмите **одну и ту же генерацию** `anubarak-worker-zero-shot.wav`. Сперва замедлите её до 85% исходного темпа, не меняя высоту. Затем дважды понизьте высоту **на один полутон** (по-русски «на полтона», −1 semitone, частотный множитель `2^(-1/12) ≈ 0.943874`) без изменения темпа:
+
+```bash
+ffmpeg -y -i experiments/cosyvoice3/outputs/anubarak-worker-zero-shot.wav \
+  -af atempo=0.85 -c:a pcm_s16le \
+  experiments/cosyvoice3/outputs/anubarak-worker-zero-shot-slow.wav
+
+.venv-cosyvoice3/bin/python experiments/cosyvoice3/pitch_shift.py \
+  --input experiments/cosyvoice3/outputs/anubarak-worker-zero-shot-slow.wav \
+  --output experiments/cosyvoice3/outputs/anubarak-worker-zero-shot-slow-minus1-preserved.wav \
+  --semitones -1 --formant preserved
+.venv-cosyvoice3/bin/python experiments/cosyvoice3/pitch_shift.py \
+  --input experiments/cosyvoice3/outputs/anubarak-worker-zero-shot-slow.wav \
+  --output experiments/cosyvoice3/outputs/anubarak-worker-zero-shot-slow-minus1-shifted.wav \
+  --semitones -1 --formant shifted
+```
+
+`preserved` сохраняет резонансы (тембр обычно естественнее), `shifted` сдвигает и резонансы (эффект может быть заметнее). Все три получившихся WAV имеют одинаковую длительность ~17,6 с; исходная запись — ~15 с. Для более тонкой правки подойдёт `--semitones -0.5`; положительное значение повысит голос. Скрипт применим и к WAV из тестов Qwen. Нужен `ffmpeg` с фильтром `rubberband` (`ffmpeg -h filter=rubberband`). Это обработка готовой записи, а не повторный синтез, поэтому повторно загружать модель не нужно.
