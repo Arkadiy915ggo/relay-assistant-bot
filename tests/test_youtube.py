@@ -121,6 +121,36 @@ class YouTubeDownloaderTests(unittest.TestCase):
             self.assertEqual(result.title, "Test video")
             self.assertEqual([path.name for path in directory.iterdir()], ["youtube_test.mp4"])
 
+    def test_real_ytdlp_single_video_success_is_returned(self) -> None:
+        # Exercise the real library control flow (including MaxDownloadsReached),
+        # replacing only extraction and download I/O; no network or ffmpeg needed.
+        import yt_dlp
+        from yt_dlp.extractor.common import InfoExtractor
+
+        class OfflineReviewIE(InfoExtractor):
+            _VALID_URL = r"https://youtu\.be/(?P<id>[a-z]+)"
+
+            def _real_extract(self, url):
+                return dict(id="test", title="Test", duration=1, ext="mp4",
+                            url="https://example.invalid/test.mp4", vcodec="h264", acodec="aac")
+
+        class OfflineYoutubeDL(yt_dlp.YoutubeDL):
+            def __init__(self, options):
+                super().__init__(dict(options, noprogress=True), auto_init=False)
+                self.add_info_extractor(OfflineReviewIE())
+
+            def dl(self, name, info, **kwargs):
+                Path(name).write_bytes(b"downloaded video")
+                return True, True
+
+        with tempfile.TemporaryDirectory() as tmp, patch.object(yt_dlp, "YoutubeDL", OfflineYoutubeDL):
+            result = _download_youtube_video(
+                url="https://youtu.be/test", directory=Path(tmp), max_size_mb=1,
+                max_seconds=120, prefix="youtube_test", stop_event=threading.Event(),
+            )
+            self.assertEqual(result.path.read_bytes(), b"downloaded video")
+            self.assertEqual(result.duration, 1)
+
     def test_rejects_playlist_live_and_unknown_duration(self) -> None:
         invalid_metadata = (
             {"_type": "playlist", "entries": [{"id": "abc"}], "duration": 60},

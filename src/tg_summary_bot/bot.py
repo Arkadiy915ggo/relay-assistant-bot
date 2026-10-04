@@ -12,6 +12,7 @@ from collections.abc import Awaitable, Callable
 from datetime import datetime, timezone
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
+from weakref import WeakValueDictionary
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.exceptions import TelegramBadRequest
@@ -58,6 +59,9 @@ RESPONSE_LOGGER_NAME = "tg_summary_bot.responses"
 SURPRISE_MEME_CHANCE = 0.02
 CASINO_SETTLEMENT_RETRY_DELAYS = (0.25, 0.5)
 _BOT_IDENTITIES: dict[int, tuple[int, str | None, str]] = {}
+_LEADERBOARD_LOCKS: WeakValueDictionary[
+    tuple[asyncio.AbstractEventLoop, int], asyncio.Lock
+] = WeakValueDictionary()
 
 
 class TelegramDownloadTooLargeError(RuntimeError):
@@ -620,6 +624,19 @@ async def refresh_pinned_leaderboard_for_chat(
     store: MessageStore,
     chat_id: int,
     source_message: Message | None = None,
+) -> bool:
+    # Hold a strong reference across waiters. Idle locks disappear automatically;
+    # the loop key keeps separate bot lifecycles from reusing an old bound lock.
+    key = (asyncio.get_running_loop(), chat_id)
+    lock = _LEADERBOARD_LOCKS.setdefault(key, asyncio.Lock())
+    async with lock:
+        return await _refresh_pinned_leaderboard_for_chat(
+            bot=bot, store=store, chat_id=chat_id, source_message=source_message,
+        )
+
+
+async def _refresh_pinned_leaderboard_for_chat(
+    *, bot: Bot, store: MessageStore, chat_id: int, source_message: Message | None = None,
 ) -> bool:
     """Refresh current wallets; recreate only a confirmed deleted Telegram message."""
     text = render_leaderboard(
@@ -1224,6 +1241,8 @@ async def create_dispatcher(
 
     @dp.message(Command("casino"))
     async def casino_command(message: Message, bot: Bot) -> None:
+        if not is_allowed(settings, message.chat.id):
+            return
         args = (message.text or "").split()
         if len(args) > 2 or (len(args) == 2 and args[1].lower() != "bot"):
             await answer_logged(message, "Использование: `/casino` или `/casino bot`.")

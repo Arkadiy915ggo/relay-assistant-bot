@@ -654,9 +654,10 @@ Validation:
 - chance в `0..1` и не принимает NaN/Infinity;
 - judge model fallback: основная summary model;
 - feature disabled не создаёт worker task и не меняет `/summary` behavior;
-- shadow mode создаёт jobs/results, но не ledger/balance/Telegram award announcement/automatic casino.
-- `AUTONOMOUS_JOKE_ANNOUNCE=false` не создаёт `award_notification`; award leaderboard refresh всё равно создаётся;
-- `BOT_AUTO_CASINO_ENABLED=false` не вызывает RNG и не создаёт `bot_casino` action;
+- shadow mode создаёт jobs/results, но не ledger/balance/Telegram award announcement/automatic casino. Outbox от предыдущего live run целиком приостанавливается до выключения shadow mode, без claim и увеличения attempts. Startup recovery незавершённых ставок сохраняет собственный void/refund contract;
+- `AUTONOMOUS_JOKE_ANNOUNCE=false` не создаёт `award_notification` и приостанавливает уже queued notifications; award leaderboard refresh всё равно создаётся и может выполняться;
+- `BOT_AUTO_CASINO_ENABLED=false` не вызывает RNG, не создаёт `bot_casino` action и приостанавливает уже queued automatic spins. При включении обработка продолжается с сохранённым decision, без нового RNG;
+- disabled actions исключаются при SQL claim, поэтому не блокируют разрешённые outbox actions. Pending/retry/expired-running records сохраняют состояние до возвращения доступа; текущие chat allowlist/disabled checks также продолжают действовать;
 
 Обновить `Settings`, `load_settings()`, `.env.example`, README `/stats` и doctor model checks при отдельной model.
 

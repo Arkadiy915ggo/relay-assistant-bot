@@ -182,6 +182,14 @@ class AutonomousJokeWorker:
             )
 
     async def _run_outbox(self) -> None:
+        # Rollback to shadow mode also pauses work committed by an earlier live run.
+        if self.settings.autonomous_jokes_shadow_mode:
+            return
+        allowed_actions = {"award_leaderboard_refresh", "casino_leaderboard_refresh"}
+        if self.settings.autonomous_joke_announce:
+            allowed_actions.add("award_notification")
+        if self.settings.bot_auto_casino_enabled:
+            allowed_actions.add("bot_casino")
         outbox = await self.store.claim_due_joke_outbox(
             worker_id=self.worker_id,
             now=datetime.now(timezone.utc),
@@ -189,6 +197,7 @@ class AutonomousJokeWorker:
             allowed_chat_ids=self.settings.allowed_chat_ids,
             disabled_chat_ids=self.settings.joke_awards_disabled_chat_ids,
             start_after=self.start_after,
+            allowed_actions=allowed_actions,
         )
         if not outbox or not outbox.lease_token:
             return

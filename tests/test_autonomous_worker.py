@@ -5,7 +5,7 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import aiosqlite
 
@@ -137,6 +137,72 @@ class AutonomousJokeWorkerTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(backfill.await_count, 2 if failing_step == "backfill" else 1)
                 self.assertEqual(backfill.await_args.kwargs["start_after"], self.start)
                 self.worker.tick.assert_awaited_once()
+
+    async def commit_live_job(self):
+        job = await self.plan_chat(2)
+        claimed = await self.store.claim_due_joke_job(worker_id="old", now=self.now, lease_seconds=900)
+        await self.store.finalize_autonomous_joke_job(
+            job_id=job.job_id, lease_token=claimed.lease_token, source_message_id=1,
+            bot_spin_decision="spin", announce=True,
+        )
+        # Fund the bot with one real ledger award, separately from the human winner.
+        await self.store.save_message(
+            chat_id=2, message_id=2, chat_type="group", sender_id=99,
+            sender_name="Bot", text="bot joke", created_at=self.now,
+            reply_to_message_id=None, origin="assistant", kind="assistant_answer",
+        )
+        await self.store.award_unique_joke(chat_id=2, source_message_id=2)
+        self.bot.send_dice = AsyncMock(return_value=SimpleNamespace(
+            chat=SimpleNamespace(id=2), message_id=55, dice=SimpleNamespace(emoji="🎰", value=64),
+        ))
+        return job
+
+    async def test_shadow_pauses_all_old_outbox_actions_without_claiming(self) -> None:
+        await self.commit_live_job()
+        self.settings.autonomous_jokes_shadow_mode = True
+        self.settings.bot_auto_casino_enabled = True
+        with patch("tg_summary_bot.bot.refresh_pinned_leaderboard_for_chat", new_callable=AsyncMock) as refresh:
+            for _ in range(4):
+                await self.worker._run_outbox()
+            refresh.assert_not_awaited()
+        self.bot.send_message.assert_not_awaited()
+        self.bot.send_dice.assert_not_awaited()
+        self.assertEqual((await self.store.get_point_balance(chat_id=2, participant_key="id:99")).balance, 10)
+        async with aiosqlite.connect(self.store.database_path) as db:
+            rows = await (await db.execute("SELECT status, attempt_count FROM chat_joke_outbox")).fetchall()
+        self.assertEqual([tuple(row) for row in rows], [("pending", 0)] * 3)
+        self.settings.autonomous_jokes_shadow_mode = False
+        await self.worker._run_outbox()
+        self.bot.send_message.assert_awaited_once()
+
+    async def test_disabled_actions_pause_without_blocking_refresh_and_resume_once(self) -> None:
+        await self.commit_live_job()
+        self.settings.autonomous_joke_announce = False
+        self.settings.bot_auto_casino_enabled = False
+        with patch("tg_summary_bot.bot.refresh_pinned_leaderboard_for_chat", new_callable=AsyncMock) as refresh:
+            await self.worker._run_outbox()
+            await self.worker._run_outbox()
+            refresh.assert_awaited_once()
+        self.bot.send_message.assert_not_awaited()
+        self.bot.send_dice.assert_not_awaited()
+        async with aiosqlite.connect(self.store.database_path) as db:
+            rows = await (await db.execute(
+                "SELECT action, status, attempt_count FROM chat_joke_outbox ORDER BY outbox_id"
+            )).fetchall()
+        self.assertEqual([tuple(row) for row in rows], [
+            ("award_notification", "pending", 0),
+            ("award_leaderboard_refresh", "completed", 1),
+            ("bot_casino", "pending", 0),
+        ])
+        self.settings.bot_auto_casino_enabled = True
+        with patch("tg_summary_bot.bot.cached_bot_identity", AsyncMock(return_value=(99, "bot", "Bot"))):
+            await self.worker._run_outbox()
+        self.bot.send_dice.assert_awaited_once()
+        self.assertEqual((await self.store.get_point_balance(chat_id=2, participant_key="id:99")).balance, 250)
+        self.settings.autonomous_joke_announce = True
+        await self.worker._run_outbox()
+        self.bot.send_message.assert_awaited_once()
+        self.bot.send_dice.assert_awaited_once()
 
     async def test_task_failure_is_reported_and_cancellation_is_expected(self) -> None:
         async def fail() -> None:

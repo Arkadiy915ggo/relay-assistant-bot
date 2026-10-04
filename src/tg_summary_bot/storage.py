@@ -1854,7 +1854,10 @@ class MessageStore:
         self, *, worker_id: str, now: datetime, lease_seconds: int,
         allowed_chat_ids: set[int] | None = None, disabled_chat_ids: set[int] | None = None,
         start_after: datetime | None = None,
+        allowed_actions: set[str] | None = None,
     ) -> JokeOutbox | None:
+        if allowed_actions is not None and not allowed_actions:
+            return None
         now_iso = now.astimezone(timezone.utc).isoformat()
         until = (now + timedelta(seconds=lease_seconds)).astimezone(timezone.utc).isoformat()
         async with self._write_lock:
@@ -1864,9 +1867,13 @@ class MessageStore:
                 await db.execute("BEGIN IMMEDIATE")
                 excluded_clause = ""
                 params: list[object] = [now_iso, now_iso]
+                if allowed_actions is not None:
+                    placeholders = ",".join("?" for _ in allowed_actions)
+                    excluded_clause = f"AND o.action IN ({placeholders})"
+                    params.extend(sorted(allowed_actions))
                 if allowed_chat_ids:
                     placeholders = ",".join("?" for _ in allowed_chat_ids)
-                    excluded_clause = f"AND j.chat_id IN ({placeholders})"
+                    excluded_clause += f" AND j.chat_id IN ({placeholders})"
                     params.extend(sorted(allowed_chat_ids))
                 if disabled_chat_ids:
                     placeholders = ",".join("?" for _ in disabled_chat_ids)

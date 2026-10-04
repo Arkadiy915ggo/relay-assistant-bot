@@ -200,7 +200,8 @@ def _download_youtube_video(
         "outtmpl": output_template,
         "merge_output_format": "mp4",
         "noplaylist": True,
-        "max_downloads": 1,
+        # Single-video admission is enforced by URL/metadata validation. In the
+        # library API max_downloads=1 raises even after a successful download.
         "max_filesize": limit_bytes,
         "socket_timeout": YOUTUBE_SOCKET_TIMEOUT_SECONDS,
         "retries": 1,
