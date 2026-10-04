@@ -1595,7 +1595,8 @@ class MessageStore:
         return [_stored_message_from_row(row) for row in rows]
 
     async def claim_due_joke_job(
-        self, *, worker_id: str, now: datetime, lease_seconds: int, disabled_chat_ids: set[int] | None = None,
+        self, *, worker_id: str, now: datetime, lease_seconds: int,
+        allowed_chat_ids: set[int] | None = None, disabled_chat_ids: set[int] | None = None,
         start_after: datetime | None = None,
     ) -> JokeJob | None:
         if lease_seconds <= 0:
@@ -1609,9 +1610,13 @@ class MessageStore:
                 await db.execute("BEGIN IMMEDIATE")
                 excluded_clause = ""
                 params: list[object] = [now_iso, now_iso]
+                if allowed_chat_ids:
+                    placeholders = ",".join("?" for _ in allowed_chat_ids)
+                    excluded_clause = f"AND chat_id IN ({placeholders})"
+                    params.extend(sorted(allowed_chat_ids))
                 if disabled_chat_ids:
                     placeholders = ",".join("?" for _ in disabled_chat_ids)
-                    excluded_clause = f"AND chat_id NOT IN ({placeholders})"
+                    excluded_clause += f" AND chat_id NOT IN ({placeholders})"
                     params.extend(sorted(disabled_chat_ids))
                 if start_after is not None:
                     if start_after.tzinfo is None:
@@ -1846,7 +1851,8 @@ class MessageStore:
         return _joke_job_from_row(row) if row else None
 
     async def claim_due_joke_outbox(
-        self, *, worker_id: str, now: datetime, lease_seconds: int, disabled_chat_ids: set[int] | None = None,
+        self, *, worker_id: str, now: datetime, lease_seconds: int,
+        allowed_chat_ids: set[int] | None = None, disabled_chat_ids: set[int] | None = None,
         start_after: datetime | None = None,
     ) -> JokeOutbox | None:
         now_iso = now.astimezone(timezone.utc).isoformat()
@@ -1858,9 +1864,13 @@ class MessageStore:
                 await db.execute("BEGIN IMMEDIATE")
                 excluded_clause = ""
                 params: list[object] = [now_iso, now_iso]
+                if allowed_chat_ids:
+                    placeholders = ",".join("?" for _ in allowed_chat_ids)
+                    excluded_clause = f"AND j.chat_id IN ({placeholders})"
+                    params.extend(sorted(allowed_chat_ids))
                 if disabled_chat_ids:
                     placeholders = ",".join("?" for _ in disabled_chat_ids)
-                    excluded_clause = f"AND j.chat_id NOT IN ({placeholders})"
+                    excluded_clause += f" AND j.chat_id NOT IN ({placeholders})"
                     params.extend(sorted(disabled_chat_ids))
                 if start_after is not None:
                     if start_after.tzinfo is None:

@@ -319,7 +319,7 @@ Telegram API и SQLite не образуют распределённую тра
 - send timeout/connection loss: uncertain outcome, refund как `telegram_outcome_unknown`;
 - process cancellation: попытаться `asyncio.shield(refund)`, затем пробросить cancellation;
 - hard kill после reserve: startup recovery;
-- Dice response получен, settlement временно failed: bounded retry; если commit не подтверждён, оставить pending для startup void/refund;
+- Dice response получен, settlement временно failed: максимум 3 попытки с backoff 0.25/0.5 секунды, всегда с тем же Dice; committed `already_completed` считается успешным replay. Если commit не подтверждён, отправить безопасное предупреждение и оставить pending для startup void/refund;
 - final text send failed после completed commit: payout остаётся completed, refund запрещён.
 
 Документация и UI не должны обещать exactly-once Dice delivery. Экономическая exactly-once обеспечивается только для committed storage transitions.
@@ -335,7 +335,7 @@ V1 поддерживает один активный процесс.
 3. До dispatcher/polling вызвать `refund_pending_casino_spins(created_before=startup_cutoff)`.
 4. В одной или нескольких idempotent transactions перевести pre-start pending spins в `refunded` с reason `startup_recovery`.
 5. Получить affected chat ids.
-6. Best-effort обновить pinned `Топ балансов` для affected chats.
+6. Best-effort обновить pinned `Топ балансов` для affected chats, прошедших актуальный `ALLOWED_CHAT_IDS`. Storage refunds выполняются и для исключённых чатов, чтобы не оставить ставки зарезервированными; Telegram side effects для них не запускаются.
 7. Только после успешного storage recovery начать polling.
 
 Если recovery storage transaction не выполняется, startup должен fail closed и не принимать новые bets. Ошибка Telegram leaderboard refresh не блокирует polling и не откатывает refunds.

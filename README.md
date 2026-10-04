@@ -176,6 +176,11 @@ ALLOWED_CHAT_IDS=-1001234567890,123456789
 
 Restart the bot.
 
+The current allowlist also applies when the autonomous worker claims existing jobs and outbox
+actions. Removing a chat pauses its queued work; it does not delete it. Re-allowing the chat can
+resume that work. Startup casino refunds still repair reserved balances in SQLite, but Telegram
+leaderboard refreshes are sent only to currently allowed chats.
+
 ## Commands
 
 ```text
@@ -228,6 +233,10 @@ startup grace, poll and lease intervals, optional `AUTONOMOUS_JOKE_JUDGE_MODEL`,
 `AUTONOMOUS_JOKE_ANNOUNCE`. Bot casino uses `BOT_AUTO_CASINO_ENABLED` and
 `BOT_AUTO_CASINO_CHANCE`; `.env.example` documents all defaults and validation.
 
+Both `.env.example` and `.env.ollama.example` use 50-message blocks, a 5-message partial minimum,
+and a 3-day maximum age. Activation-point initialization and initial backfill are retried after
+transient storage errors; an unexpected worker task failure is reported in the bot log.
+
 Only new rows with explicit provenance can be candidates: incoming text, incoming captions, incoming
 voice transcripts, and final contextual assistant answers. Existing rows are migrated as
 `legacy/legacy_unclassified` and intentionally never become eligible. Recognition results, summaries,
@@ -258,6 +267,12 @@ use the bot's own chat balance. The bot identity is always `id:<Telegram bot id>
 name in leaderboards is the first configured chat alias, then its Telegram name. After a non-shadow
 autonomous award, the bot records one durable automatic casino decision with the configured 25% chance;
 retries never resample it. A missing balance skips that decision.
+
+After a trusted Dice response, settlement is attempted up to three times with 0.25/0.5-second
+delays; retries reuse that response and never send another Dice. An already committed payout is
+replayed without a second award. If manual settlement remains unconfirmed, the bot sends a warning;
+any stake still reserved in a pending spin is refunded at the next bot startup. Cancellation
+during settlement also attempts an idempotent refund.
 
 ## Bot Aliases
 
@@ -595,6 +610,14 @@ Behavior:
 - The bot downloads the video, extracts key frames with `ffmpeg`, sends those frames to `VIDEO_RECOGNITION_MODEL`, optionally extracts/transcribes the audio track when `VIDEO_TRANSCRIBE_AUDIO=true`, unloads the model after the task, and deletes temporary files.
 - Repeated `/video` calls for the same Telegram message and settings use a SQLite cache instead of rerunning `ffmpeg` and Ollama. YouTube downloads are not cached in v1.
 - The result is saved as a normal stored message when the SQLite write succeeds, so future `/summary` and `/question` calls can use it.
+
+YouTube availability depends on the hosting network and upstream access requirements. The current
+downloader does not configure cookies or authenticated browser sessions. A sign-in/anti-bot error
+can prevent downloads even when the URL is valid; IP blocking is not established just from that
+error. Cookie/session support is not implemented.
+On timeout or cancellation, the downloader requests a stop and removes abandoned files after the
+download thread finishes, including a late successful download; it does not remove files while
+that thread is still writing.
 
 The video response format is:
 

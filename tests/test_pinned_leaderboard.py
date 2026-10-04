@@ -1,10 +1,13 @@
 import unittest
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.methods import SendMessage
 
-from tg_summary_bot.bot import refresh_pinned_leaderboard, render_leaderboard
+from tg_summary_bot.bot import (
+    refresh_pinned_leaderboard, refresh_recovered_casino_leaderboards, render_leaderboard,
+)
 from tg_summary_bot.storage import PinnedLeaderboard, PointBalance
 
 
@@ -63,6 +66,17 @@ class FakeStore:
 
 
 class PinnedLeaderboardTests(unittest.IsolatedAsyncioTestCase):
+    async def test_startup_refresh_uses_current_allowlist(self) -> None:
+        for allowed, expected in (({2}, [2]), (set(), [1, 2])):
+            with self.subTest(allowed=allowed), patch(
+                "tg_summary_bot.bot.refresh_pinned_leaderboard_for_chat", new_callable=AsyncMock
+            ) as refresh:
+                await refresh_recovered_casino_leaderboards(
+                    settings=SimpleNamespace(allowed_chat_ids=allowed),
+                    bot=FakeBot(), store=FakeStore(), chat_ids={1, 2},
+                )
+                self.assertEqual([call.kwargs["chat_id"] for call in refresh.await_args_list], expected)
+
     def test_rendering_matches_top_order(self) -> None:
         rendered = render_leaderboard(
             [PointBalance(1, "id:1", "Alice", 10, "now")]

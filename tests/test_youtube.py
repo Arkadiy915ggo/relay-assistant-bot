@@ -1,3 +1,4 @@
+import asyncio
 import sys
 import tempfile
 import threading
@@ -14,6 +15,7 @@ from tg_summary_bot.youtube import (
     youtube_url,
     youtube_url_from_message,
 )
+from tg_summary_bot import youtube
 
 
 class YouTubeUrlTests(unittest.TestCase):
@@ -174,6 +176,87 @@ class YouTubeDownloaderTests(unittest.TestCase):
 
 
 class YouTubeDownloadTimeoutTests(unittest.IsolatedAsyncioTestCase):
+    async def test_late_success_is_cleaned_after_cancellation_or_timeout(self) -> None:
+        for timeout in (False, True):
+            with self.subTest(timeout=timeout), tempfile.TemporaryDirectory() as tmp:
+                directory = Path(tmp)
+                selected = threading.Event()
+                release = threading.Event()
+                cleaned = threading.Event()
+                cleanup_calls = []
+                workers = []
+                stop_signals = []
+                original_select = youtube._select_downloaded_file
+                original_cleanup = youtube._cleanup_prefix
+                original_to_thread = asyncio.to_thread
+                original_wait = asyncio.wait
+
+                async def run_thread(function, *args, **kwargs):
+                    if function is youtube._download_youtube_video:
+                        workers.append(asyncio.current_task())
+                        stop_signals.append(kwargs["stop_event"])
+                    return await original_to_thread(function, *args, **kwargs)
+
+                async def wait_for_download(tasks, *, timeout):
+                    if timeout_case:
+                        if not await original_to_thread(selected.wait, 1):
+                            raise RuntimeError("download did not reach final stop check")
+                        return set(), set(tasks)
+                    return await original_wait(tasks, timeout=timeout)
+
+                def select_after_stop_check(directory: Path, prefix: str) -> Path:
+                    selected.set()
+                    if not release.wait(2):
+                        raise RuntimeError("test did not release download")
+                    return original_select(directory, prefix)
+
+                def cleanup(directory: Path, prefix: str, *, keep: Path | None = None) -> None:
+                    cleanup_calls.append((prefix, keep is None, threading.current_thread().name))
+                    original_cleanup(directory, prefix, keep=keep)
+                    if keep is None:
+                        cleaned.set()
+
+                def write_files(options: dict[str, object]) -> None:
+                    Path(str(options["outtmpl"]).replace("%(ext)s", "mp4")).write_bytes(b"video")
+
+                FakeYoutubeDL.metadata = {"duration": 1, "title": "Test video", "_type": "video"}
+                FakeYoutubeDL.downloaded = dict(FakeYoutubeDL.metadata)
+                FakeYoutubeDL.download_callback = write_files
+                timeout_case = timeout
+                with patch.dict(sys.modules, {"yt_dlp": SimpleNamespace(YoutubeDL=FakeYoutubeDL)}), patch(
+                    "tg_summary_bot.youtube._select_downloaded_file", side_effect=select_after_stop_check
+                ), patch("tg_summary_bot.youtube._cleanup_prefix", side_effect=cleanup), patch(
+                    "tg_summary_bot.youtube.asyncio.to_thread", side_effect=run_thread
+                ), patch(
+                    "tg_summary_bot.youtube.asyncio.wait", side_effect=wait_for_download
+                ):
+                    task = asyncio.create_task(download_youtube_video(
+                        url="https://youtu.be/abc", directory=directory,
+                        max_size_mb=1, max_seconds=120, timeout_seconds=10,
+                    ))
+                    try:
+                        self.assertTrue(await asyncio.to_thread(selected.wait, 1))
+                        if timeout:
+                            self.assertTrue(await asyncio.to_thread(stop_signals[0].wait, 1))
+                        else:
+                            task.cancel()
+                            with self.assertRaises(asyncio.CancelledError):
+                                await task
+                        self.assertFalse(cleaned.is_set(), cleanup_calls)
+                        release.set()
+                        if timeout:
+                            with self.assertRaisesRegex(YouTubeDownloadError, "timed out"):
+                                await task
+                        self.assertTrue(await asyncio.to_thread(cleaned.wait, 1))
+                        # Join the worker and its callback before another patch/test starts.
+                        await asyncio.gather(*workers, return_exceptions=True)
+                        await asyncio.sleep(0)
+                        self.assertEqual(list(directory.iterdir()), [])
+                    finally:
+                        release.set()
+                        await asyncio.gather(task, *workers, return_exceptions=True)
+                        await asyncio.sleep(0)
+
     async def test_timeout_requests_worker_cancellation(self) -> None:
         stopped = threading.Event()
 

@@ -24,8 +24,8 @@ relay-assistant-bot-doc/Features/05 Autonomous Joke Awards and Bot Casino.md
 Зафиксированные продуктовые правила:
 
 - autonomous jokes disabled by default;
-- block = 20 eligible messages;
-- partial block = 5-19 messages старше 24h;
+- current default block = 50 eligible messages;
+- current default partial block = 5-49 messages старше 3d;
 - 0/1 winner per block;
 - fixed +10 per winner;
 - no daily cap and no award-inflation protection: более активный чат намеренно получает больше блоков и динамики;
@@ -52,7 +52,7 @@ PR 5A: Durable Foundation
 4. Add chat_joke_outbox with independently claimed/fenced/retried award_notification, award_leaderboard_refresh, bot_casino and casino_leaderboard_refresh actions so terminal jobs cannot lose post-finalize work after a crash or miss the second balance refresh.
 5. Add nullable chat_point_ledger.joke_job_id and partial unique (joke_job_id).
 6. Preserve existing unique (chat_id, reason, source_message_id).
-7. Implement planner: full blocks of 20; partial 5-19 only after 24h; fewer than 5 remain open.
+7. Preserve configurable planner defaults: full blocks of 50; partial 5-49 only after 3d; fewer than 5 remain open. Historical 20/24h jobs keep their original policy.
 8. Implement claim/reclaim with BEGIN IMMEDIATE, opaque lease-token fencing and CAS lease renewal. Abort immediately on lost ownership. Validate lease > one selector timeout + 60 seconds.
 9. Implement exact job-message reads through immutable job items and canonical messages rows.
 10. Refactor joke award transaction into a private connection-level helper used by both current manual award and autonomous finalize.
@@ -64,8 +64,8 @@ PR 5A: Durable Foundation
 PR 5B: Shadow Worker and Summary Decoupling
 
 1. Add src/tg_summary_bot/autonomous_jokes.py.
-2. Add worker startup grace, planning, one-job claim, selector execution, retry/backoff, independently claimed outbox processing and graceful shutdown.
-3. Keep strong task references and await/cancel worker in main try/finally.
+2. Add worker startup grace, planning, one-job claim, selector execution, retry/backoff, independently claimed outbox processing and graceful shutdown. Apply the current allowlist/disabled-chat policy to both job and outbox claims, including old queued work. Retry activation and initial backfill failures inside the worker loop.
+3. Keep strong task references, report unexpected task failures, and await/cancel worker in main try/finally.
 4. Use the same shared GPU coordination as all Ollama/Whisper flows. Never create an independent lock.
 5. A background acquisition performs at most one model batch call, releases between pages and does not hold GPU while doing SQLite, Telegram send or sleep.
 6. If strict foreground priority cannot be guaranteed with asyncio.Lock, add a small foreground/background GpuScheduler and migrate call sites deliberately; do not rely on lock.locked() while claiming strict priority.

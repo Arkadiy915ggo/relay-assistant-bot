@@ -44,10 +44,10 @@ git diff --check
 ## Зафиксированные продуктовые решения
 
 - Автономные награды включаются отдельным config toggle и выключены по умолчанию.
-- Базовый блок содержит `20` eligible-сообщений одного чата.
-- Полный блок закрывается сразу после накопления 20 сообщений.
-- Неполный блок закрывается через `24h` после первого сообщения, только если накоплено минимум `5` сообщений.
-- Если сообщений меньше 5, блок остаётся открытым до достижения 5 или 20 сообщений.
+- Базовый блок содержит `50` eligible-сообщений одного чата.
+- Полный блок закрывается сразу после накопления 50 сообщений.
+- Неполный блок из 5-49 сообщений закрывается через `3d` после первого enqueue, только если накоплено минимум `5` сообщений.
+- Если сообщений меньше 5, блок остаётся открытым; после достижения minimum применяется возрастной критерий, после 50 закрывается full block.
 - Один блок даёт `0` или `1` победителя.
 - Базовая награда остаётся фиксированной: `+10`.
 - Модель не обязана выбирать победителя; `no_joke` является успешным terminal outcome.
@@ -119,7 +119,7 @@ git diff --check
 - после restart Telegram может доставить старые pending updates;
 - timestamp-only cursor неоднозначен;
 - повторный scan всей таблицы дорог и усложняет разграничение блоков;
-- закрытый временной snapshot не фиксирует точный набор из 20 сообщений.
+- закрытый временной snapshot не фиксирует точный набор из 50 сообщений.
 
 Новый inbox фиксирует порядок фактического поступления eligible row в локальную систему. Он является очередью обработки, а не копией текста.
 
@@ -198,7 +198,7 @@ CREATE INDEX IF NOT EXISTS idx_chat_joke_jobs_chat_range
 ON chat_joke_jobs(chat_id, last_queue_id);
 ```
 
-`policy_version` первого rollout: `message_blocks_20_or_24h_v1`.
+`policy_version` текущих defaults: `message_blocks_50_or_259200s_v1`. Исторический `message_blocks_20_or_24h_v1` остаётся валидным; существующие jobs не пересобираются при смене config.
 
 ### Exact membership
 
@@ -346,14 +346,14 @@ Planner работает отдельно для каждого allowed chat:
 
 1. Прочитать первые currently eligible inbox rows без `chat_joke_job_items` по `queue_id`.
 2. Зафиксировать exact rows как будущие immutable job items.
-3. Если доступно минимум 20, создать job из первых 20.
-4. Если доступно 5-19 и oldest `enqueued_at` старше 24h, создать partial job из всех доступных rows.
+3. Если доступно минимум 50, создать job из первых 50.
+4. Если доступно 5-49 и oldest `enqueued_at` старше 3 дней, создать partial job из всех доступных rows.
 5. Если меньше 5, ничего не закрывать.
 6. Повторять, пока можно создать следующую full job.
 
 Job creation и все item inserts выполняются под `_write_lock` и `BEGIN IMMEDIATE`. Unique job items предотвращают duplicate planning после restart и при конкурентных `MessageStore` instances.
 
-`ALLOWED_CHAT_IDS` применяется до planning. При пустом allowlist планируются все chat IDs с eligible inbox rows, как и текущая access policy.
+`ALLOWED_CHAT_IDS` применяется при planning, claim/reclaim jobs и claim/reclaim outbox вместе с текущим `JOKE_AWARDS_DISABLED_CHAT_IDS`. При пустом allowlist разрешены все чаты. Исключённая работа остаётся paused без изменения attempt count и durable state; после возвращения доступа может продолжиться.
 
 ## Selector Integration
 
@@ -436,13 +436,14 @@ Startup:
 4. создать LLM clients, selector, shared GPU coordination и dispatcher.
 5. создать worker task, но выдержать startup grace по умолчанию `60s`.
 6. начать polling.
-7. после grace worker начинает backfill/planning, чтобы Telegram backlog сначала сохранился в inbox.
+7. после grace worker читает/создаёт activation point, выполняет backfill и начинает planning. Ошибки activation/backfill повторяются внутри worker loop с poll interval; незавершённая backfill не помечается успешной.
 
 Shutdown:
 
 ```python
 stop_event = asyncio.Event()
 worker_task = asyncio.create_task(worker.run(stop_event))
+worker_task.add_done_callback(log_worker_failure)
 try:
     await dp.start_polling(...)
 finally:
@@ -456,6 +457,8 @@ Cancellation не переводит running job в terminal state. Lease поз
 ## Claim, Lease и Retry
 
 `claim_due_joke_job(worker_id, now, lease_seconds)`:
+
+Production caller также передаёт текущие `allowed_chat_ids`, `disabled_chat_ids` и `start_after`; outbox claim использует те же ограничения.
 
 1. `_write_lock` + `BEGIN IMMEDIATE`.
 2. Найти одну `pending/retry` job с due `next_attempt_at` либо `running` с истёкшим lease.
@@ -630,9 +633,9 @@ Router должен различать `casino` и `casino_bot` строгим a
 ```env
 AUTONOMOUS_JOKES_ENABLED=false
 AUTONOMOUS_JOKES_SHADOW_MODE=true
-AUTONOMOUS_JOKES_BLOCK_MESSAGES=20
+AUTONOMOUS_JOKES_BLOCK_MESSAGES=50
 AUTONOMOUS_JOKES_PARTIAL_MIN_MESSAGES=5
-AUTONOMOUS_JOKES_MAX_BLOCK_AGE=24h
+AUTONOMOUS_JOKES_MAX_BLOCK_AGE=3d
 AUTONOMOUS_JOKES_INITIAL_LOOKBACK=7d
 AUTONOMOUS_JOKES_STARTUP_GRACE_SECONDS=60
 AUTONOMOUS_JOKES_POLL_SECONDS=30
@@ -742,7 +745,7 @@ Startup grace уменьшает race между worker и ingestion накоп�
 - Generated/legacy rows не входят.
 - Initial lookback и allowed chats.
 - Full blocks 100+100+remainder.
-- Partial block 5-19 после 24h; меньше 5 остаётся open.
+- Partial block 5-49 после 3 дней; меньше 5 остаётся open.
 - Two planners не присваивают одну inbox row двум job items.
 - Claim/reclaim/token fencing.
 - Lease renewal CAS и немедленный abort при lost ownership.
