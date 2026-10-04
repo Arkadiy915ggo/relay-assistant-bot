@@ -5,11 +5,11 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import aiosqlite
 
-from tg_summary_bot.bot import spin_casino
+from tg_summary_bot.bot import run_casino_dice_lifecycle, spin_casino
 from tg_summary_bot.casino import CASINO_RULES_VERSION, CASINO_STAKE, bot_request_casino_trigger, slot_result
 from tg_summary_bot.storage import MessageStore
 
@@ -321,3 +321,81 @@ class CasinoBotTests(unittest.IsolatedAsyncioTestCase):
         balance = await self.store.get_point_balance(chat_id=1, participant_key="id:1")
         self.assertEqual(balance.balance if balance else None, 10)
         self.assertTrue(any("возвращена" in text for text, _ in message.replies))
+
+    async def test_transient_settlement_error_retries_without_sending_another_dice(self) -> None:
+        original_settle = self.store.settle_casino_spin
+
+        async def settle(**kwargs: object):
+            if retried.await_count == 1:
+                raise aiosqlite.OperationalError("temporarily locked")
+            return await original_settle(**kwargs)
+
+        retried = AsyncMock(side_effect=settle)
+        message = self.message()
+        bot = SimpleNamespace(edit_message_text=AsyncMock(), pin_chat_message=AsyncMock())
+        with patch.object(self.store, "settle_casino_spin", retried), patch(
+            "tg_summary_bot.bot.CASINO_SETTLEMENT_RETRY_DELAYS", (0, 0)
+        ), self.assertLogs(level="ERROR"):
+            outcome = await spin_casino(self.settings, self.store, bot, message)
+        self.assertEqual(outcome.reason, "completed")
+        self.assertEqual(retried.await_count, 2)
+        self.assertEqual(len(message.dice_calls), 1)
+        self.assertEqual((await self.store.get_point_balance(chat_id=1, participant_key="id:1")).balance, 250)
+
+    async def test_uncertain_commit_replay_preserves_one_payout_and_reports_success(self) -> None:
+        original_settle = self.store.settle_casino_spin
+
+        async def settle(**kwargs: object):
+            result = await original_settle(**kwargs)
+            if retried.await_count == 1:
+                raise RuntimeError("response lost after commit")
+            return result
+
+        retried = AsyncMock(side_effect=settle)
+        message = self.message()
+        bot = SimpleNamespace(edit_message_text=AsyncMock(), pin_chat_message=AsyncMock())
+        with patch.object(self.store, "settle_casino_spin", retried), patch(
+            "tg_summary_bot.bot.CASINO_SETTLEMENT_RETRY_DELAYS", (0, 0)
+        ), self.assertLogs(level="ERROR"):
+            outcome = await spin_casino(self.settings, self.store, bot, message)
+        self.assertEqual((outcome.status, outcome.reason), ("succeeded", "completed"))
+        self.assertEqual(len(message.dice_calls), 1)
+        self.assertEqual((await self.store.get_point_balance(chat_id=1, participant_key="id:1")).balance, 250)
+        async with aiosqlite.connect(self.path) as db:
+            count = await (await db.execute(
+                "SELECT COUNT(*) FROM chat_point_ledger WHERE reason='casino_payout'"
+            )).fetchone()
+        self.assertEqual(count[0], 1)
+        self.assertIn("выплата: 250", message.replies[0][0])
+
+    async def test_exhausted_settlement_retries_warn_and_keep_startup_recovery(self) -> None:
+        retried = AsyncMock(side_effect=aiosqlite.OperationalError("private database detail"))
+        message = self.message()
+        with patch.object(self.store, "settle_casino_spin", retried), patch(
+            "tg_summary_bot.bot.CASINO_SETTLEMENT_RETRY_DELAYS", (0, 0)
+        ), self.assertLogs(level="ERROR"):
+            outcome = await spin_casino(self.settings, self.store, SimpleNamespace(), message)
+        self.assertEqual((outcome.status, outcome.reason), ("failed", "settlement_unconfirmed"))
+        self.assertEqual(retried.await_count, 3)
+        self.assertEqual(len(message.dice_calls), 1)
+        self.assertEqual(len(message.replies), 1)
+        self.assertIn("перезапуске", message.replies[0][0])
+        self.assertNotIn("private database detail", message.replies[0][0])
+        self.assertEqual((await self.store.get_point_balance(chat_id=1, participant_key="id:1")).balance, 0)
+        await self.store.refund_pending_casino_spins(created_before=datetime.now(timezone.utc))
+        self.assertEqual((await self.store.get_point_balance(chat_id=1, participant_key="id:1")).balance, 10)
+
+    async def test_cancellation_during_settlement_attempts_refund(self) -> None:
+        reserved = await self.store.reserve_casino_spin(
+            chat_id=1, request_message_id=10, participant_key="id:1", participant_name="Alice",
+        )
+        with self.assertRaises(asyncio.CancelledError):
+            await run_casino_dice_lifecycle(
+                chat_id=1, spin_id=reserved.spin.spin_id,
+                send_dice=self.message().reply_dice,
+                settle=AsyncMock(side_effect=asyncio.CancelledError()),
+                refund=lambda reason: self.store.refund_casino_spin(
+                    spin_id=reserved.spin.spin_id, reason=reason,
+                ),
+            )
+        self.assertEqual((await self.store.get_point_balance(chat_id=1, participant_key="id:1")).balance, 10)

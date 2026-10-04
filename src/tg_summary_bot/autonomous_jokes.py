@@ -20,6 +20,17 @@ def retry_delay(attempt_count: int) -> timedelta:
     return timedelta(seconds=RETRY_SECONDS[min(max(attempt_count - 1, 0), len(RETRY_SECONDS) - 1)])
 
 
+def log_worker_failure(task: asyncio.Task[None]) -> None:
+    if task.cancelled():
+        return
+    error = task.exception()
+    if error is not None:
+        logging.error(
+            "Autonomous joke worker stopped unexpectedly",
+            exc_info=(type(error), error, error.__traceback__),
+        )
+
+
 class AutonomousJokeWorker:
     """Durable single-process job worker. SQLite leases make cancellation restart-safe."""
 
@@ -46,10 +57,11 @@ class AutonomousJokeWorker:
             return
         except TimeoutError:
             pass
-        self.start_after = await self.store.get_or_create_autonomous_joke_start_at()
         backfill_needed = True
         while not stop_event.is_set():
             try:
+                if self.start_after is None:
+                    self.start_after = await self.store.get_or_create_autonomous_joke_start_at()
                 if backfill_needed:
                     await self.store.backfill_autonomous_joke_inbox(
                         allowed_chat_ids=self.settings.allowed_chat_ids,
@@ -85,6 +97,7 @@ class AutonomousJokeWorker:
             worker_id=self.worker_id,
             now=now,
             lease_seconds=self.settings.autonomous_jokes_lease_seconds,
+            allowed_chat_ids=self.settings.allowed_chat_ids,
             disabled_chat_ids=self.settings.joke_awards_disabled_chat_ids,
             start_after=self.start_after,
         )
@@ -173,6 +186,7 @@ class AutonomousJokeWorker:
             worker_id=self.worker_id,
             now=datetime.now(timezone.utc),
             lease_seconds=self.settings.autonomous_jokes_lease_seconds,
+            allowed_chat_ids=self.settings.allowed_chat_ids,
             disabled_chat_ids=self.settings.joke_awards_disabled_chat_ids,
             start_after=self.start_after,
         )

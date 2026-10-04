@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import threading
 from dataclasses import dataclass
 from pathlib import Path
@@ -84,19 +85,33 @@ async def download_youtube_video(
             stop_event=stop_event,
         )
     )
+
+    def discard_result(task: asyncio.Task[DownloadedYouTubeVideo]) -> None:
+        # Never cancel the thread task on timeout: cleanup must follow its final writes.
+        if task.cancelled():
+            return
+        task.exception()
+        try:
+            _cleanup_prefix(directory, prefix)
+        except OSError:
+            logging.exception("YouTube abandoned download cleanup failed")
+
+    def abandon() -> None:
+        stop_event.set()
+        worker.add_done_callback(discard_result)
+
     try:
         done, _ = await asyncio.wait({worker}, timeout=max(timeout_seconds, 0.01))
         if worker in done:
             return worker.result()
-        stop_event.set()
+        abandon()
         try:
-            await asyncio.wait_for(worker, timeout=YOUTUBE_SOCKET_TIMEOUT_SECONDS + 5)
+            await asyncio.wait_for(asyncio.shield(worker), timeout=YOUTUBE_SOCKET_TIMEOUT_SECONDS + 5)
         except Exception:  # noqa: BLE001
             pass
         raise YouTubeDownloadError("YouTube download timed out.")
     except asyncio.CancelledError:
-        stop_event.set()
-        worker.add_done_callback(lambda task: task.exception() if not task.cancelled() else None)
+        abandon()
         raise
 
 
@@ -230,3 +245,7 @@ def _download_youtube_video(
     except Exception as exc:  # noqa: BLE001
         _cleanup_prefix(directory, prefix)
         raise YouTubeDownloadError("YouTube download failed.") from exc
+    finally:
+        # Also clean inside the thread, including when the event loop shuts down.
+        if stop_event.is_set():
+            _cleanup_prefix(directory, prefix)

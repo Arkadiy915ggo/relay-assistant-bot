@@ -19,7 +19,7 @@ from aiogram.filters import Command
 from aiogram.types import FSInputFile, Message
 
 from tg_summary_bot.addressing import remove_aliases_from_text, split_aliases
-from tg_summary_bot.autonomous_jokes import AutonomousJokeWorker
+from tg_summary_bot.autonomous_jokes import AutonomousJokeWorker, log_worker_failure
 from tg_summary_bot.assistant import ChatAssistant
 from tg_summary_bot.casino import CASINO_STAKE, CasinoTrigger, bot_request_casino_trigger, slot_result
 from tg_summary_bot.config import Settings, load_settings
@@ -56,6 +56,7 @@ from tg_summary_bot.youtube import (
 
 RESPONSE_LOGGER_NAME = "tg_summary_bot.responses"
 SURPRISE_MEME_CHANCE = 0.02
+CASINO_SETTLEMENT_RETRY_DELAYS = (0.25, 0.5)
 _BOT_IDENTITIES: dict[int, tuple[int, str | None, str]] = {}
 
 
@@ -593,6 +594,18 @@ async def refresh_existing_pinned_leaderboard(*, bot: Bot, store: MessageStore, 
         logging.warning("Pinned leaderboard alias refresh failed chat_id=%s", chat_id)
 
 
+async def refresh_recovered_casino_leaderboards(
+    *, settings: Settings, bot: Bot, store: MessageStore, chat_ids: set[int]
+) -> None:
+    for chat_id in sorted(chat_ids):
+        if not is_allowed(settings, chat_id):
+            continue
+        try:
+            await refresh_pinned_leaderboard_for_chat(bot=bot, store=store, chat_id=chat_id)
+        except Exception:  # noqa: BLE001
+            logging.exception("Startup casino leaderboard refresh failed chat_id=%s", chat_id)
+
+
 def telegram_message_not_found(error: Exception) -> bool:
     return isinstance(error, TelegramBadRequest) and "not found" in str(error).lower()
 
@@ -787,11 +800,24 @@ async def run_casino_dice_lifecycle(
     dice = valid_slot_dice(sent, chat_id=chat_id)
     if not dice:
         return "telegram_response_invalid", await refund("telegram_response_invalid")
-    try:
-        return "completed", await settle(*dice)
-    except Exception:  # noqa: BLE001
-        logging.exception("Casino settlement failed chat_id=%s spin_id=%s", chat_id, spin_id)
-        return "settlement_unconfirmed", None
+    for attempt in range(len(CASINO_SETTLEMENT_RETRY_DELAYS) + 1):
+        try:
+            return "completed", await settle(*dice)
+        except asyncio.CancelledError:
+            await asyncio.shield(refund("settlement_cancelled"))
+            raise
+        except Exception:  # noqa: BLE001
+            logging.exception(
+                "Casino settlement failed chat_id=%s spin_id=%s attempt=%s",
+                chat_id, spin_id, attempt + 1,
+            )
+        if attempt < len(CASINO_SETTLEMENT_RETRY_DELAYS):
+            try:
+                await asyncio.sleep(CASINO_SETTLEMENT_RETRY_DELAYS[attempt])
+            except asyncio.CancelledError:
+                await asyncio.shield(refund("settlement_cancelled"))
+                raise
+    return "settlement_unconfirmed", None
 
 
 async def spin_casino(
@@ -852,10 +878,19 @@ async def spin_casino(
         ),
         refund=lambda reason: store.refund_casino_spin(spin_id=spin.spin_id, reason=reason),
     )
-    if outcome_reason == "settlement_unconfirmed" or not terminal or not terminal.spin:
-        return OperationOutcome("casino", "failed", outcome_reason)
-    if outcome_reason == "completed" and terminal.status != "completed":
-        return OperationOutcome("casino", "failed", terminal.status)
+    if (
+        outcome_reason == "settlement_unconfirmed" or not terminal or not terminal.spin
+        or (outcome_reason == "completed" and terminal.status not in {"completed", "already_completed"})
+    ):
+        response = await reply_logged(
+            message,
+            "Не удалось подтвердить результат спина. Повторно слот не запускаю. "
+            "Если ставка осталась зарезервирована, она будет возвращена при перезапуске бота.",
+        )
+        return OperationOutcome(
+            "casino", "failed", terminal.status if terminal else outcome_reason,
+            response_message_id=response.message_id,
+        )
     response = await reply_logged(message, render_casino_spin(terminal.spin))
     try:
         await refresh_pinned_leaderboard(bot=bot, store=store, source_message=message)
@@ -3529,11 +3564,10 @@ async def main() -> None:
     recovery = await store.refund_pending_casino_spins(created_before=startup_cutoff)
     automatic_recovery = await store.recover_pending_automatic_casino_spins(created_before=startup_cutoff)
     await cached_bot_identity(bot)
-    for chat_id in sorted(set(recovery.chat_ids) | set(automatic_recovery.chat_ids)):
-        try:
-            await refresh_pinned_leaderboard_for_chat(bot=bot, store=store, chat_id=chat_id)
-        except Exception:  # noqa: BLE001
-            logging.exception("Startup casino leaderboard refresh failed chat_id=%s", chat_id)
+    await refresh_recovered_casino_leaderboards(
+        settings=settings, bot=bot, store=store,
+        chat_ids=set(recovery.chat_ids) | set(automatic_recovery.chat_ids),
+    )
     llm = build_llm_client(settings)
     question_llm = build_llm_client(settings, model=settings.question_model or None)
     router_llm = build_llm_client(
@@ -3616,6 +3650,7 @@ async def main() -> None:
         )
         stop_event = asyncio.Event()
         worker_task = asyncio.create_task(worker.run(stop_event))
+        worker_task.add_done_callback(log_worker_failure)
     try:
         await dp.start_polling(
             bot,
