@@ -382,6 +382,7 @@ Duplicate UX:
 - `/stats` leader берётся из того же ordering.
 - Pinned title меняется на `Топ балансов`.
 - Joke award, completed casino, refund и startup recovery используют одну best-effort refresh operation.
+- Refresh одного чата сериализован отдельным process-local async lock от чтения balances до edit/create/save/pin. Это предотвращает перезапись свежего баланса запоздалым snapshot и создание двух первых leaderboard messages. Другие чаты независимы; SQLite write lock и `gpu_lock` во время Telegram I/O не удерживаются.
 - Проигрыш может понизить место, jackpot повысить.
 - Refresh failure никогда не откатывает committed ledger/balance/spin state.
 - Удалённое pinned сообщение пересоздаётся только для подтверждённого Telegram not-found; transient/no-change error сохраняет stored message id.

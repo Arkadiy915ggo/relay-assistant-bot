@@ -157,7 +157,9 @@ LLM prompt должен требовать выбирать только явн�
 5. После всех raw pages провести tournament только среди page winners.
 6. Если winners не помещаются в один prompt, разбивать их тем же page budget и проводить следующие rounds, пока не останется один winner или ни одного.
 7. Каждый round валидирует id только против exact set своего prompt. Winner всегда остаётся ссылкой на исходную строку, а не synthetic candidate.
-8. Защититься от отсутствия прогресса: round обязан уменьшать количество кандидатов; неправильная конфигурация page size/budget завершает selector failure.
+8. Round обязан уменьшать количество кандидатов. Если все winners образуют singleton batches, сравнивать их парами, используя bounded excerpts вместо повторной оценки каждого отдельно. Обе версии турнира (manual и worker callback) используют общий алгоритм.
+
+Serialized candidate JSON ограничен `char_budget`, включая envelope, поля и JSON escaping. При превышении бюджета тексты детерминированно сокращаются: начало и конец с маркером ` […] `. Модель оценивает только видимый текст. Это компромисс качества для длинных расшифровок: шутка в пропущенной середине может не попасть в оценку. Canonical `StoredMessage`, source ID и исходный текст не меняются; award/quote перечитываются из оригинала. Если в budget не помещаются даже IDs/author metadata, selector возвращает `prompt_budget_too_small` без model call. В парном fallback допускаются два кандидата, даже если page row limit равен 1; character budget по-прежнему соблюдается.
 
 Reason можно логировать как технический selector metadata только при разрешённом content capture; award и UI от reason не зависят.
 

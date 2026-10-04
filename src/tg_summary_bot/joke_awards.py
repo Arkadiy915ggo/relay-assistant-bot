@@ -18,6 +18,7 @@ DEFAULT_SELECTOR_CHAR_BUDGET = 12_000
 SYSTEM_PROMPT = """
 Ты выбираешь одну действительно смешную реплику из предложенных сообщений Telegram-чата.
 Никогда не выбирай нейтральный текст только потому, что нужно вернуть кандидата.
+Длинные реплики могут быть сокращены с маркером […]; оценивай только видимый текст, не додумывай пропущенное.
 Верни ровно один JSON object без Markdown, пояснений и дополнительных ключей.
 Схема только такая:
 {"has_joke":true,"source_message_id":123,"reason":"короткое объяснение"}
@@ -113,6 +114,40 @@ def _candidate_batches(
     if current:
         batches.append(current)
     return batches
+
+
+def _candidate_prompt(candidates: list[StoredMessage], char_budget: int) -> str | None:
+    """Bound the serialized prompt, retaining canonical objects for award persistence."""
+    def render(limit: int) -> str:
+        def excerpt(text: str) -> str:
+            if len(text) <= limit:
+                return text
+            if limit < 5:
+                return text[:limit]
+            head = (limit - 5) // 2
+            tail = limit - 5 - head
+            return text[:head] + " […] " + (text[-tail:] if tail else "")
+
+        return json.dumps(
+            {"candidates": [
+                {"target_message_id": item.message_id, "author": item.sender_name,
+                 "text": excerpt(item.text)} for item in candidates
+            ]}, ensure_ascii=False, separators=(",", ":"),
+        )
+
+    low, high = 0, max((len(item.text) for item in candidates), default=0)
+    full = render(high)
+    if len(full) <= char_budget:
+        return full
+    if len(render(0)) > char_budget:
+        return None
+    while low < high:
+        middle = (low + high + 1) // 2
+        if len(render(middle)) <= char_budget:
+            low = middle
+        else:
+            high = middle - 1
+    return render(low)
 
 
 class JokeSelector:
@@ -235,36 +270,7 @@ class JokeSelector:
         self,
         candidates: list[StoredMessage],
     ) -> tuple[StoredMessage | None, str | None, int, str | None]:
-        current = candidates
-        rounds = 0
-        last_reason: str | None = None
-        while len(current) > 1:
-            rounds += 1
-            batches = _candidate_batches(
-                current,
-                row_limit=self.row_limit,
-                char_budget=self.char_budget,
-            )
-            next_round: list[StoredMessage] = []
-            for batch in batches:
-                selection = await self._select_from(batch)
-                if not selection.valid:
-                    return None, None, rounds, selection.error
-                if selection.has_joke:
-                    next_round.append(
-                        next(
-                            message
-                            for message in batch
-                            if message.message_id == selection.source_message_id
-                        )
-                    )
-                    last_reason = selection.reason
-            if len(next_round) >= len(current):
-                return None, None, rounds, "tournament_no_progress"
-            current = next_round
-            if not current:
-                return None, None, rounds, None
-        return current[0], last_reason, rounds, None
+        return await self._run_tournament_with(candidates, self._select_from)
 
     async def _run_tournament_with(
         self,
@@ -277,7 +283,12 @@ class JokeSelector:
         while len(current) > 1:
             rounds += 1
             next_round: list[StoredMessage] = []
-            for batch in _candidate_batches(current, row_limit=self.row_limit, char_budget=self.char_budget):
+            batches = _candidate_batches(current, row_limit=self.row_limit, char_budget=self.char_budget)
+            if len(batches) == len(current):
+                # Singleton-only comparisons cannot eliminate a candidate. Compare
+                # pairs using bounded excerpts; source text and identity stay intact.
+                batches = [current[index:index + 2] for index in range(0, len(current), 2)]
+            for batch in batches:
                 selection = await select_batch(batch)
                 if not selection.valid:
                     return None, None, rounds, selection.error
@@ -293,11 +304,9 @@ class JokeSelector:
 
     async def _select_from(self, candidates: list[StoredMessage]) -> JokeSelection:
         candidate_ids = {candidate.message_id for candidate in candidates}
-        prompt = json.dumps(
-            {"candidates": [json.loads(_candidate_line(item)) for item in candidates]},
-            ensure_ascii=False,
-            separators=(",", ":"),
-        )
+        prompt = _candidate_prompt(candidates, self.char_budget)
+        if prompt is None:
+            return _reject("prompt_budget_too_small")
         try:
             async with asyncio.timeout(JOKE_SELECTOR_TIMEOUT_SECONDS):
                 response = await self.llm.complete(

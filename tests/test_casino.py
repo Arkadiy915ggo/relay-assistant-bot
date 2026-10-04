@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock, patch
 
 import aiosqlite
 
-from tg_summary_bot.bot import run_casino_dice_lifecycle, spin_casino
+from tg_summary_bot.bot import create_dispatcher, run_casino_dice_lifecycle, spin_casino
 from tg_summary_bot.casino import CASINO_RULES_VERSION, CASINO_STAKE, bot_request_casino_trigger, slot_result
 from tg_summary_bot.storage import MessageStore
 
@@ -293,6 +293,26 @@ class CasinoBotTests(unittest.IsolatedAsyncioTestCase):
         bot.edit_message_text.assert_awaited_once()
         self.assertEqual(bot.edit_message_text.await_args.kwargs["message_id"], 88)
         self.assertIn("Alice - 250", bot.edit_message_text.await_args.kwargs["text"])
+
+    async def test_denied_command_rejects_before_usage_reply_or_bot_identity(self) -> None:
+        settings = SimpleNamespace(allowed_chat_ids={2})
+        dispatcher = await create_dispatcher(
+            settings, self.store, SimpleNamespace(), SimpleNamespace(), None,
+            SimpleNamespace(), SimpleNamespace(), SimpleNamespace(), SimpleNamespace(),
+            None, None, asyncio.Lock(), SimpleNamespace(),
+        )
+        handler = next(h.callback for h in dispatcher.message.handlers if h.callback.__name__ == "casino_command")
+        bot = SimpleNamespace(get_me=AsyncMock())
+        for command in ("/casino", "/casino bad", "/casino bot", "/casino bot extra"):
+            message = self.message()
+            message.text = command
+            with patch.object(self.store, "get_chat_bot_aliases", new_callable=AsyncMock) as aliases:
+                await handler(message, bot)
+                aliases.assert_not_awaited()
+            self.assertEqual(message.replies, [])
+            self.assertEqual(message.dice_calls, [])
+        bot.get_me.assert_not_awaited()
+        self.assertEqual((await self.store.get_point_balance(chat_id=1, participant_key="id:1")).balance, 10)
 
     async def test_insufficient_balance_never_calls_telegram(self) -> None:
         async with aiosqlite.connect(self.path) as db:

@@ -1,9 +1,11 @@
 import asyncio
+import json
 import sqlite3
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 import aiosqlite
 
@@ -207,6 +209,64 @@ class JokeStorageTests(unittest.IsolatedAsyncioTestCase):
 
 
 class JokeSelectorTests(unittest.IsolatedAsyncioTestCase):
+    async def test_long_candidates_converge_with_bounded_prompts_and_original_winner(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = MessageStore(Path(directory) / "messages.sqlite3")
+            await store.init()
+            originals = {}
+            for message_id in range(1, 6):
+                text = f"Начало {message_id}: " + ('"\\\n' * 7000) + f" конец {message_id}"
+                originals[message_id] = text
+                await store.save_message(
+                    chat_id=1, message_id=message_id, chat_type="group", sender_id=message_id,
+                    sender_name=f"User {message_id}", text=text, created_at=NOW,
+                    reply_to_message_id=None, origin="incoming", kind="voice_transcript",
+                )
+            boundary = await store.get_eligible_snapshot_boundary(chat_id=1, since=NOW)
+            page = await store.get_eligible_snapshot_page(
+                chat_id=1, since=NOW, boundary=boundary, after=None, row_limit=20, char_budget=200000,
+            )
+            for mode in ("manual", "direct", "worker"):
+                with self.subTest(mode=mode):
+                    prompts = []
+
+                    async def complete(**kwargs):
+                        prompts.append(kwargs["user"])
+                        candidates = json.loads(kwargs["user"])["candidates"]
+                        return json.dumps(dict(has_joke=True, reason="test",
+                            source_message_id=candidates[-1]["target_message_id"]))
+
+                    selector = JokeSelector(SimpleNamespace(complete=complete))
+                    if mode == "manual":
+                        result = await selector.choose(store, chat_id=1, since=NOW, boundary=boundary)
+                    else:
+                        result = await selector.choose_messages(
+                            page.messages, select_batch=selector._select_from if mode == "worker" else None,
+                        )
+                    self.assertEqual(result.status, "selected")
+                    self.assertEqual(result.winner.message_id, 5)
+                    self.assertEqual(result.winner.text, originals[5])
+                    self.assertEqual(result.tournament_rounds, 3)
+                    self.assertTrue(all(len(prompt) <= selector.char_budget for prompt in prompts))
+                    self.assertTrue(any(len(json.loads(prompt)["candidates"]) == 2 for prompt in prompts))
+                    self.assertTrue(any(" […] " in prompt for prompt in prompts))
+                    award = await store.award_unique_joke(chat_id=1, source_message_id=result.winner.message_id)
+                    self.assertEqual(award.source_text, originals[5])
+
+    async def test_long_finalists_still_reject_invalid_ids_and_accept_no_joke(self) -> None:
+        messages = [StoredMessage(i, 1, "group", i, "Test", "x" * 7000,
+                                  NOW.isoformat(), None, "incoming", "voice_transcript") for i in (1, 2)]
+        for final, expected in ((
+            '{"has_joke":true,"source_message_id":999,"reason":"bad"}', "invalid"
+        ), ('{"has_joke":false,"source_message_id":null,"reason":"none"}', "none")):
+            client = FakeLLM([
+                '{"has_joke":true,"source_message_id":1,"reason":"page"}',
+                '{"has_joke":true,"source_message_id":2,"reason":"page"}', final,
+            ])
+            result = await JokeSelector(client).choose_messages(messages)
+            self.assertEqual(result.status, expected)
+            self.assertIsNone(result.winner)
+
     def test_strict_json_rejects_bool_and_out_of_prompt_and_repairs_nothing(self) -> None:
         valid = parse_joke_selection('{"has_joke":true,"source_message_id":1,"reason":"yes"}', {1})
         self.assertTrue(valid.valid)
