@@ -1,8 +1,16 @@
 .env
 .venv/
+.venv-tts/
+.venv-cosyvoice3/
 __pycache__/
 *.pyc
 data/
+experiments/qwen3-tts/models/
+experiments/qwen3-tts/outputs/
+experiments/cosyvoice3/upstream/
+experiments/cosyvoice3/models/
+experiments/cosyvoice3/outputs/
 *.sqlite3
 *.db
 *.egg-info/
+relay-assistant-bot-doc/.obsidian/

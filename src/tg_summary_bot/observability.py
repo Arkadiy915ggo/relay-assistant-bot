@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 import functools
+import json
+import logging
 from collections.abc import Awaitable, Callable
 from contextvars import ContextVar
-from typing import Any, TypeVar, cast
+from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
+from typing import Any, Literal, TypeVar, cast
 
 
 _opik_enabled = False
@@ -15,6 +19,49 @@ _llm_usage_totals: ContextVar[dict[str, int] | None] = ContextVar(
 )
 
 F = TypeVar("F", bound=Callable[..., Awaitable[Any]])
+
+
+@dataclass(frozen=True)
+class OperationOutcome:
+    operation: str
+    status: Literal["succeeded", "rejected", "partial", "failed"]
+    reason: str
+    persisted: bool | None = None
+    cache_hit: bool | None = None
+    response_message_id: int | None = None
+    metadata: dict[str, object] | None = None
+
+
+def log_operation_outcome(
+    outcome: OperationOutcome,
+    *,
+    chat_id: int,
+    message_id: int,
+    invocation: str,
+    route_action: str | None = None,
+    route_reason: str | None = None,
+    elapsed_seconds: float | None = None,
+    provider: str | None = None,
+    model: str | None = None,
+) -> None:
+    outcome_data = asdict(outcome)
+    metadata = outcome_data.pop("metadata") or {}
+    event = {
+        "event": "operation_outcome",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "invocation": invocation,
+        "route_action": route_action,
+        "route_reason": route_reason,
+        "elapsed_ms": round(elapsed_seconds * 1000, 1) if elapsed_seconds is not None else None,
+        "provider": provider,
+        "model": model,
+        **outcome_data,
+        **metadata,
+    }
+    logging.getLogger("tg_summary_bot.operations").info(json.dumps(event, ensure_ascii=False))
+    update_opik_span_metadata({key: value for key, value in event.items() if key != "created_at"})
 
 
 def configure_opik_tracing(*, enabled: bool, project_name: str) -> None:

@@ -122,6 +122,14 @@ def main() -> int:
     else:
         _ok("COMPARE_MODELS is empty; /compare is disabled until models are configured")
 
+    if settings.intent_router_model and settings.resolved_llm_provider == "ollama":
+        if not _check_optional_model(ollama_models, settings.intent_router_model, "Intent router"):
+            warnings += 1
+
+    if settings.autonomous_joke_judge_model and settings.resolved_llm_provider == "ollama":
+        if not _check_optional_model(ollama_models, settings.autonomous_joke_judge_model, "Autonomous joke judge"):
+            warnings += 1
+
     if settings.image_recognition_model and ollama_models is not None:
         if not _check_optional_model(ollama_models, settings.image_recognition_model, "Image recognition"):
             warnings += 1
@@ -140,6 +148,13 @@ def main() -> int:
         else:
             _warn("ffmpeg is required for video recognition/audio extraction. On Mac: brew install ffmpeg")
             warnings += 1
+
+    if settings.video_recognition_model:
+        if importlib.util.find_spec("yt_dlp"):
+            _ok("yt-dlp is installed for YouTube video recognition")
+        else:
+            _fail("yt-dlp is not installed. Reinstall the bot dependencies: ./run.sh install")
+            errors += 1
 
     if settings.transcribe_voice or settings.video_transcribe_audio:
         if importlib.util.find_spec("faster_whisper"):

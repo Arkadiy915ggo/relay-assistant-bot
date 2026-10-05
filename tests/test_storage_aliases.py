@@ -46,3 +46,12 @@ class ChatBotAliasStorageTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(await store.remove_chat_bot_alias(chat_id=1, normalized_alias="реле"))
             self.assertFalse(await store.get_chat_bot_aliases(1))
             self.assertEqual(len(await store.get_chat_bot_aliases(2)), 1)
+
+    async def test_same_timestamp_keeps_alias_insertion_order(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = MessageStore(Path(directory) / "messages.sqlite3")
+            await store.init()
+            now = datetime.now(timezone.utc)
+            await store.add_chat_bot_alias(chat_id=1, alias="Zed", normalized_alias="zed", created_by_user_id=1, created_at=now)
+            await store.add_chat_bot_alias(chat_id=1, alias="Alpha", normalized_alias="alpha", created_by_user_id=1, created_at=now)
+            self.assertEqual([item.alias for item in await store.get_chat_bot_aliases(1)], ["Zed", "Alpha"])
