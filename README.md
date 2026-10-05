@@ -427,6 +427,11 @@ Set `OPIK_CAPTURE_CONTENT=false` to log only metadata without prompts and output
 
 The bot can locally transcribe Telegram voice/audio messages through `faster-whisper` and store the transcript as a normal message for future `/summary` calls. It can also send the fast raw Whisper result first, then format the already-sent message with an LLM in the background.
 
+Voice generation is currently a standalone experiment, not a bot command. See the
+[Qwen3-TTS experiment](experiments/qwen3-tts/README.md),
+[CosyVoice 3 experiment](experiments/cosyvoice3/README.md), and the
+[planned voice-generation design](relay-assistant-bot-doc/Features/06%20Voice%20Message%20Generation.md).
+
 Install CPU voice dependencies:
 
 ```bash
@@ -614,7 +619,8 @@ Behavior:
 YouTube availability depends on the hosting network and upstream access requirements. The current
 downloader does not configure cookies or authenticated browser sessions. A sign-in/anti-bot error
 can prevent downloads even when the URL is valid; IP blocking is not established just from that
-error. Cookie/session support is not implemented.
+error. Cookie/session support and TikTok/Instagram adapters are future work in the
+[social-video design](relay-assistant-bot-doc/Features/09%20Social%20Video%20Recognition.md).
 On timeout or cancellation, the downloader requests a stop and removes abandoned files after the
 download thread finishes, including a late successful download; it does not remove files while
 that thread is still writing.
@@ -787,3 +793,15 @@ telegram-summary-bot/data/messages.sqlite3
 ```
 
 Do not commit this directory to git.
+
+## Development Roadmap
+
+The [feature roadmap](relay-assistant-bot-doc/00%20Feature%20Roadmap.md) separates implemented
+behavior from future designs: voice generation, chat search/source links, document understanding,
+YouTube/TikTok/Instagram ingestion, reactions, proactive messages, and product onboarding/GUI with
+optional local compute. Draft commands and settings in those notes are not current bot capabilities.
+The [product vision](relay-assistant-bot-doc/01%20Product%20Vision.md) is community-first: an enjoyable
+AI participant with useful skills, growing into a configurable builder of chat personalities,
+voices, capabilities, and introductory prompts; a formal work profile is one possible preset.
+The [pre-merge stabilization notes](relay-assistant-bot-doc/Features/05.5%20Pre-Merge%20Stabilization.md)
+describe the current reliability fixes and regression checks.

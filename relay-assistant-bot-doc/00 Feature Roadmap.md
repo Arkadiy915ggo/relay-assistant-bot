@@ -2,6 +2,8 @@
 
 Этот vault содержит независимые спецификации для развития Telegram-бота. Каждая задача рассчитана на отдельную агентскую сессию и ссылается на конкретные исходные файлы.
 
+Продуктовая рамка: [[01 Product Vision]]. Primary experience — забавный участник комьюнити с полезными навыками. Долгосрочное направление — настраиваемый конструктор характера/голосов/навыков/промптов; формальный рабочий профиль является одним из вариантов настройки.
+
 ## Порядок работ
 
 | Этап | Фича | Зависимости | Результат |
@@ -9,11 +11,33 @@
 | 1, реализовано | [[Features/01 Aliases and Address Detection]] | Нет | Любой участник чата задаёт имена бота; адресованные сообщения безопасно распознаются. |
 | 2, реализовано | [[Features/02 Intent Router and User Actions]] | Фича 1 | Обращение по имени вызывает подходящее пользовательское действие. |
 | 2.5, реализовано | [[Features/02.5 Pre-Feature 03 Stabilization]] | Фичи 1-2 | Terminal outcomes, честная persistence policy и стабилизация спорных intent-ов перед очками. |
-| 3, реализовано в worktree | [[Features/03 Joke Points and Leaderboard]] | Завершённый этап 2.5 | Уникальная validated шутка получает очки; есть spendable balance и top-10. |
+| 3, реализовано | [[Features/03 Joke Points and Leaderboard]] | Завершённый этап 2.5 | Уникальная validated шутка получает очки; есть spendable balance и top-10. |
 | 4, реализовано | [[Features/04 Casino Slots]] | Проверенная и отдельно зафиксированная Фича 3 | Виртуальные очки можно поставить в versioned Telegram-слоте с atomic reserve/settle/refund. |
 | 5, реализовано | [[Features/05 Autonomous Joke Awards and Bot Casino]] | Завершённые Фичи 3-4 | Durable worker начисляет очки без `/summary`; бот становится alias-участником leaderboard и казино. |
+| 5.5, стабилизация в текущей рабочей ветке | [[Features/05.5 Pre-Merge Stabilization]] | Фичи 1-5 и TTS-эксперименты | Актуальный access control очередей, устойчивый worker, bounded casino retry и YouTube cleanup. |
+| 6, дизайн / локальные эксперименты | [[Features/06 Voice Message Generation]] | Стабильная база, выбор TTS provider | Генерация и отправка голосовых ответов. |
+| 7, идея / базовый дизайн | [[Features/07 Chat Search and Source Links]] | Существующее хранилище; Фича 8 для содержимого документов | Поиск сообщений и файлов с проверяемыми ссылками на источники. |
+| 8, идея / базовый дизайн | [[Features/08 Files and Document Understanding]] | Индекс файлов и bounded extraction | Чтение PDF и других документов, OCR и ответы с указанием страницы. |
+| 9, идея / базовый дизайн | [[Features/09 Social Video Recognition]] | Существующий video/audio pipeline | Восстановление доступности YouTube; позже TikTok и Instagram. |
+| 10, идея / базовый дизайн | [[Features/10 Message Reactions]] | Telegram capabilities и политика чата | Явные и опциональные автоматические реакции. |
+| 11, идея / базовый дизайн | [[Features/11 Proactive Chat Messages]] | Durable scheduler и настройки чата | Редкие уместные сообщения от бота без обращения. |
+| 12, продуктовый трек / базовый дизайн | [[Features/12 Product UX and Portfolio]] | Community-first вижен; стабильный API-only путь | Конструктор навыков/persona/prompts, установка, GUI, onboarding, optional local compute и портфолио PM. |
 
 Фичи 1-5 реализованы. Feature 05 включает durable inbox/jobs/outbox, shadow rollout, read-only `/summary` при enabled worker и bot casino; PR 5D prefilter остаётся отложенным до shadow-метрик.
+
+По состоянию на 2026-10-03 основная ветка репозитория называется `main`. Production-фичи и TTS-эксперименты находятся в цепочке невлитых веток; наличие кода не означает, что он уже опубликован в main. Feature 5.5 фиксирует текущую стабилизацию перед объединением.
+
+Features 06-12 — базовый дизайн для будущих сессий. Команды и настройки в этих документах предварительные и пока не реализованы. YouTube sign-in/download failure отмечен как известная проблема окружения: cookies/IP-гипотезу ещё нужно подтвердить диагностикой.
+
+## Предлагаемые следующие шаги
+
+1. Проверить и объединить стабилизированную базу и изолированные TTS-эксперименты.
+2. Проработать голосовую генерацию (Feature 06) как ближайшую новую фичу.
+3. Уточнить first-run journey владельца комьюнити и простые chat profiles/toggles из Feature 12.
+4. Проверить реакции и один редкий proactive-сценарий как community-first social capabilities. Поиск и media understanding развивать по реальным запросам чата; документы — по спросу.
+5. Отдельно уточнить будущие сценарии community meetings и fact-based/шуточного разбора споров из Product Vision.
+
+Это предложение по приоритетам, а не обязательство реализовать весь backlog. Для каждой фичи сначала уточняются MVP, ограничения, критерии приёмки и измеримая гипотеза.
 
 ## Зафиксированные продуктовые решения
 
@@ -31,7 +55,7 @@
 - Неизвестный/не committed Telegram Dice outcome считается void, stake возвращается.
 - `/top`, `/stats` leader и pinned `Топ балансов` показывают текущие spendable balances, включая casino changes.
 - Feature 04 поддерживает один активный процесс; multi-instance recovery не входит в v1.
-- Feature 05 отвязывает awards от `/summary`: блок из 20 eligible сообщений либо aged partial block из 5-19 сообщений даёт 0/1 награду `+10`.
+- Feature 05 отвязывает awards от `/summary`: по умолчанию блок из 50 eligible сообщений либо aged partial block из 5-49 сообщений после 3 дней даёт 0/1 награду `+10`.
 - Assistant answers остаются eligible; бот использует stable `id:<bot_id>`, отображается первым chat alias и может играть в казино автоматически или по явной просьбе.
 - Safety/toxicity фильтрация шуток не входит в Feature 05.
 

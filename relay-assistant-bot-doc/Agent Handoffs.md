@@ -4,6 +4,10 @@
 
 Текущий статус: Feature 01-05 реализованы; Feature 05D prefilter отложен до shadow-метрик. Feature 04 использует только виртуальные chat-scoped points: нет денег, платежей, transfers или withdrawals; unknown Telegram Dice outcome void/refund-ится.
 
+Актуализация 2026-10-03: [[Features/05.5 Pre-Merge Stabilization]] описывает текущие исправления перед объединением в `main`. Реализационные промпты ниже сохраняются как исторические handoffs; для сопровождения сверять их с актуальными спецификациями и кодом.
+
+Product source of truth: [[01 Product Vision]]. При будущих дизайнах использовать community-first positioning и конструктор chat persona/skills/prompts. Формальный рабочий профиль — один из presets; existing aliases/access/economics contracts не менять лишь из-за нового вижена.
+
 ## Фича 1: алиасы (реализовано)
 
 Документ: [[Features/01 Aliases and Address Detection]]
@@ -81,7 +85,19 @@ Selector failure не должен ломать summary, /compare не начи�
 ```text
 Реализуй Feature 05 только по standalone prompt relay-assistant-bot-doc/Prompts/05 Autonomous Joke Awards Implementation Prompt.md.
 Сначала проверь Feature 03-04 и baseline tests. Выполни PR-ready этапы Durable Foundation, Shadow Worker/Summary Decoupling и Bot Identity/Casino; small-model prefilter отложи до shadow-метрик.
-Используй непересекающиеся блоки 20 сообщений или aged partial 5-19, 0/1 winner и fixed +10. Assistant answers eligible; safety/toxicity filtering out of scope. При enabled worker /summary больше не начисляет points.
+Используй текущие defaults: непересекающиеся блоки 50 сообщений или aged partial 5-49 после 3 дней, 0/1 winner и fixed +10. Assistant answers eligible; safety/toxicity filtering out of scope. При enabled worker /summary больше не начисляет points. Текущий allowlist применяется к planning, job claims и outbox claims; transient activation/backfill errors повторяются.
 Бот использует id:<bot_id>, отображается первым chat alias и играет через /casino bot, addressed self-intent и durable automatic 25% decision. Не ослабляй human casino admission, не создавай synthetic Message и не меняй slot mapping/RTP.
 Не читай .env и data/. Добавь migrations, restart/race/rollback/GPU/lifecycle/bot-casino tests и выполни full verification.
 ```
+
+## Будущие сессии: пока только дизайн
+
+- [[Features/06 Voice Message Generation]] — подключение TTS к голосовым сообщениям; Qwen/CosyVoice остаются экспериментами до отдельной реализации.
+- [[Features/07 Chat Search and Source Links]] — поиск по сообщениям/файлам и выдача ссылок.
+- [[Features/08 Files and Document Understanding]] — индекс документов, PDF extraction и OCR.
+- [[Features/09 Social Video Recognition]] — исследовать sign-in/cookies проблему YouTube, затем TikTok/Instagram adapters.
+- [[Features/10 Message Reactions]] — реакции с явной chat policy.
+- [[Features/11 Proactive Chat Messages]] — редкие самостоятельные сообщения, quiet hours и cooldown.
+- [[Features/12 Product UX and Portfolio]] — PM case study, API-only/local compute, установка, GUI и onboarding.
+
+Эти заметки не являются поручением на реализацию. В будущей сессии сначала согласовать открытые продуктовые решения и выбрать один MVP; не превращать весь backlog в один большой PR. Новые команды/настройки появятся в runtime-документации только после реализации.

@@ -134,6 +134,12 @@ SQLite tables are initialized in `MessageStore.init()`:
 - Trusted casino settlement has up to three attempts (0.25/0.5-second backoff), never a second Dice. Unconfirmed manual settlement sends a safe warning and preserves pending state for startup refund; startup Telegram refresh respects the current allowlist.
 - YouTube cancellation/timeout cleanup waits for final thread writes, including late success. Cookies/authentication are not configured by the current downloader; upstream sign-in failures remain a known limitation.
 
+## Product Roadmap
+
+`relay-assistant-bot-doc/00 Feature Roadmap.md` links implemented Features 01-05, pre-merge stabilization, and draft Features 06-12: voice generation, chat search, documents/files, social videos, reactions, proactive messages, and product onboarding/GUI/provider modularity. Draft commands, settings, metrics, and architecture are proposals, not current runtime capabilities. Implement them only when requested.
+
+`relay-assistant-bot-doc/01 Product Vision.md` is the product source of truth: community-first entertainment plus useful assistance, evolving into configurable chat personas, skills, voices, initiative, and editable introductory prompts. Formal work use is one preset. Profile/prompt editing and meeting/debate assistance remain future designs; preserve current runtime contracts until explicitly implemented.
+
 ## Configuration
 
 Use `.env.example` as the source of truth for documented environment variables. Also check `config.py` when changing settings, because it may contain newer in-progress knobs not yet documented in `.env.example`. The most important groups are:
