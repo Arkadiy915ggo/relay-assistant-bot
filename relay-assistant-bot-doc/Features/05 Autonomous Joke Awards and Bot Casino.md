@@ -4,6 +4,8 @@
 
 Реализована: durable foundation, shadow worker/summary decoupling и bot identity/casino. PR 5D prefilter намеренно отложен до shadow-метрик.
 
+Актуальные defaults: 50 сообщений / 3 дня, partial minimum 5. Исторические блоки с политикой 20 / 24h сохраняются как есть. Стабилизация текущих access/retry contracts описана в [[05.5 Pre-Merge Stabilization]].
+
 Feature 01-04 считаются завершённой базой. Перед изменениями текущий full test suite должен проходить. Feature 05 не меняет правила Telegram slot mapping, stake, payouts или RTP.
 
 ## Цель
