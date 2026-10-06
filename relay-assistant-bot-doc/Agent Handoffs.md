@@ -8,6 +8,35 @@
 
 Product source of truth: [[01 Product Vision]]. При будущих дизайнах использовать community-first positioning и конструктор chat persona/skills/prompts. Формальный рабочий профиль — один из presets; existing aliases/access/economics contracts не менять лишь из-за нового вижена.
 
+## Handoff после стабилизации и синхронизации веток
+
+Снимок состояния, зафиксированный 2026-10-06 перед этим documentation-only дополнением:
+
+| Изменение | `experiment/qwen3-tts-voice-clone` | `feature/intent-router-casino` |
+| --- | --- | --- |
+| Первый раунд стабилизации | `4ddf173` | `9e19a92` |
+| Пять исправлений полного ревью | `d3c821c` | `142bb38` |
+| Community-first vision и будущие дизайны | `2242915` | `73599a1` |
+
+- Обе ветки были отправлены на `origin`; на точке `2242915` / `73599a1` их tracked file contents полностью совпадали.
+- Все отсутствовавшие TTS-коммиты также cherry-picked в казино-ветку. Она включает runtime fixes, TTS CLI experiments, Product Vision и Features 06-12 drafts.
+- 116 тестов прошли на синхронизированной казино-ветке; `compileall` и `git diff --check` прошли. Полный результат и ограничения: [[Features/05.5 Pre-Merge Stabilization]].
+- Известная ошибка `yt-dlp` successful-download handling исправлена; реальная YouTube availability/cookies/network diagnosis не выполнена. Не считать этот вопрос закрытым только по unit tests.
+- Следующий интеграционный PR: `feature/intent-router-casino` → `main`. PR/merge не создавались в рамках синхронизации. Проверять актуальные refs: этот snapshot не является обещанием, что последующие commits уже перенесены или опубликованы.
+
+Проверка перед дальнейшей интеграцией:
+
+```bash
+git fetch origin
+git status --short --branch
+git diff feature/intent-router-casino experiment/qwen3-tts-voice-clone
+git cherry feature/intent-router-casino experiment/qwen3-tts-voice-clone
+```
+
+Cherry-pick создаёт разные commit IDs при одинаковом содержимом. `git diff` проверяет file contents, `git cherry` помогает определить patch-equivalent commits. После merge казино-ветки не вливать старую TTS-ветку повторно только ради уже перенесённого набора изменений; для следующей фичи предпочтительна новая ветка от обновлённого `main`.
+
+При squash merge patch-equivalence отдельных commits может не определиться через `git cherry`; сверять итоговый diff и состав merged PR. Если всё же продолжается старая TTS-ветка, сначала привести её базу в соответствие с новым main и исключить повторное внесение старых изменений. Последующие documentation-only дополнения переносить отдельно при необходимости.
+
 ## Фича 1: алиасы (реализовано)
 
 Документ: [[Features/01 Aliases and Address Detection]]
