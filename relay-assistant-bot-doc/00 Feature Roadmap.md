@@ -14,7 +14,7 @@
 | 3, реализовано | [[Features/03 Joke Points and Leaderboard]] | Завершённый этап 2.5 | Уникальная validated шутка получает очки; есть spendable balance и top-10. |
 | 4, реализовано | [[Features/04 Casino Slots]] | Проверенная и отдельно зафиксированная Фича 3 | Виртуальные очки можно поставить в versioned Telegram-слоте с atomic reserve/settle/refund. |
 | 5, реализовано | [[Features/05 Autonomous Joke Awards and Bot Casino]] | Завершённые Фичи 3-4 | Durable worker начисляет очки без `/summary`; бот становится alias-участником leaderboard и казино. |
-| 5.5, стабилизация в текущей рабочей ветке | [[Features/05.5 Pre-Merge Stabilization]] | Фичи 1-5 и TTS-эксперименты | Актуальный access control очередей, устойчивый worker, bounded casino retry и YouTube cleanup. |
+| 5.5, стабилизация в текущей рабочей ветке | [[Features/05.5 Pre-Merge Stabilization]] | Фичи 1-5 | Актуальный access control очередей, устойчивый worker, bounded casino retry и YouTube cleanup. |
 | 6, runtime MVP в рабочей ветке / manual smoke предстоит | [[Features/06 Voice Message Generation]] | Стабильная база, CosyVoice 3 и bundled reference | `/voice`, `/ask voice`, chat-scoped `/voice_type`; text + voice replies без Whisper. |
 | 7, идея / базовый дизайн | [[Features/07 Chat Search and Source Links]] | Существующее хранилище; Фича 8 для содержимого документов | Поиск сообщений и файлов с проверяемыми ссылками на источники. |
 | 8, идея / базовый дизайн | [[Features/08 Files and Document Understanding]] | Индекс файлов и bounded extraction | Чтение PDF и других документов, OCR и ответы с указанием страницы. |
@@ -25,13 +25,13 @@
 
 Фичи 1-5 реализованы. Feature 05 включает durable inbox/jobs/outbox, shadow rollout, read-only `/summary` при enabled worker и bot casino; PR 5D prefilter остаётся отложенным до shadow-метрик.
 
-По состоянию на 2026-10-03 основная ветка репозитория называется `main`. Production-фичи и TTS-эксперименты находятся в цепочке невлитых веток; наличие кода не означает, что он уже опубликован в main. Feature 5.5 фиксирует текущую стабилизацию перед объединением.
+Релизная ветка с реализацией бота и bundled голосами Ануб’арака/Картмана — `release/bot-voice-presets` (актуализация 2026-10-28). Каталог `experiments/` и локальный план экспериментов исключены из индекса и добавлены в `.gitignore`; runtime от них не зависит. Резервная точка до очистки — `backup/before-voice-release-2026-10-28`, коммит `2d4640b`. Наличие кода в релизной ветке не означает публикацию в `main`.
 
 Feature 06 имеет runtime MVP от 2026-10-12 и [standalone prompt](Prompts/06%20Voice%20Message%20Generation%20Implementation%20Prompt.md): CosyVoice 3, owner-confirmed bundled Anub’арак reference и chat-scoped voice selection. Реальные GPU/listening/Telegram smoke checks остаются manual follow-up. Features 07-12 — базовый дизайн для будущих сессий; их команды и настройки предварительные. YouTube sign-in/download failure отмечен как известная проблема окружения: cookies/IP-гипотезу ещё нужно подтвердить диагностикой.
 
 ## Предлагаемые следующие шаги
 
-1. Проверить и объединить стабилизированную базу и изолированные TTS-эксперименты.
+1. Проверить и объединить стабилизированную реализацию бота и готовые голосовые presets из релизной ветки.
 2. Настроить и проверить Feature 06 на реальной GPU и в Telegram; прослушать bundled reference и генерации, измерить LLM → TTS VRAM baseline.
 3. Уточнить first-run journey владельца комьюнити и простые chat profiles/toggles из Feature 12.
 4. Проверить реакции и один редкий proactive-сценарий как community-first social capabilities. Поиск и media understanding развивать по реальным запросам чата; документы — по спросу.

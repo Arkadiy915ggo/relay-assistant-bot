@@ -368,6 +368,28 @@ class HandlerTests(unittest.IsolatedAsyncioTestCase):
         self.assistant.ask.assert_not_called()
         self.assertFalse(self.speech.calls)
 
+    async def test_disabled_tts_skips_checks_and_speech_but_keeps_text_and_selection(self):
+        self.settings.tts_enabled = False
+        self.speech.check_available = AsyncMock()
+        dp = await self.dispatcher()
+        self.speech.check_available.assert_not_awaited()
+        self.assertEqual(self.speech.unavailable_reason, "disabled")
+        for callback, text in (("voice_command", "/voice Привет"),
+                               ("ask_command", "/ask voice Вопрос?")):
+            message = FakeMessage(text)
+            await handler(dp, callback)(message)
+            self.assertIn("недоступна", message.answers[0].text)
+        self.assistant.ask.assert_not_awaited()
+        self.assertFalse(self.speech.calls)
+        self.whisper.transcribe.assert_not_awaited()
+        await handler(dp, "voice_type_command")(FakeMessage("/voice_type cartman"))
+        self.assertEqual(await self.store.get_chat_voice(1), "cartman")
+        text_request = FakeMessage("/ask Вопрос?")
+        await handler(dp, "ask_command")(text_request)
+        self.assistant.ask.assert_awaited_once()
+        self.assertIn("Готовый ответ", text_request.answers[0].text)
+        self.assertFalse(self.speech.calls)
+
     async def test_selection_invalid_reset_missing_fallback_and_admission_snapshot(self):
         dp = await self.dispatcher()
         await handler(dp, "voice_type_command")(FakeMessage("/voice_type anubarak"))

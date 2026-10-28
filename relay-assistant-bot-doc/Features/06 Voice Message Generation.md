@@ -2,7 +2,66 @@
 
 ## Статус и границы
 
-Runtime MVP реализован 2026-10-12 в текущей рабочей ветке: отдельный production runner CosyVoice 3, `/voice`, `/ask voice`, `/voice_type`, package registry, chat-scoped SQLite selection, supervision/cleanup и own-bot transcription guard. TTS по умолчанию выключен. Оригинальный Anub’арак sample и точный transcript подтверждены владельцем; bundled WAV получен из `nerubiancryptlordpissed3.ogg` (24 kHz mono, 8.93 s). По следующему запросу владельца добавлен второй preset `cartman`: выбранный `cartman_002_ai_mdx_extra.wav` + `cartman_002_raw.txt`, без tempo/pitch post-processing. Изолированные tests не заменяют реальные GPU/listening/Telegram smoke checks: эти проверки ещё предстоят. Setup и ограничения описаны в README; эксперименты остаются независимыми CLI.
+Runtime MVP реализован 2026-10-12: отдельный production runner CosyVoice 3, `/voice`, `/ask voice`, `/voice_type`, package registry, chat-scoped SQLite selection, supervision/cleanup и own-bot transcription guard. Релизная ветка — `release/bot-voice-presets` (2026-10-28). TTS по умолчанию выключен. Готовые bundled presets — `anubarak` и `cartman`; их WAV и transcript включены в пакет. Runtime и setup не используют локальные эксперименты: `experiments/` исключён из индекса Git и игнорируется. Изолированные tests не заменяют реальные GPU/listening/Telegram smoke checks: эти проверки ещё предстоят.
+
+## Запуск и отключение
+
+Подробная инструкция с диагностикой: [README: Voice generation](../../README.md#voice-generation-feature-06).
+
+1. Настроить обычный текстовый бот по README: Python 3.11+, `./run.sh install`,
+   `TELEGRAM_BOT_TOKEN` и LLM в `.env`. Существующий `.env` не заменять целиком.
+2. Для TTS нужны Linux, NVIDIA GPU и драйвер с поддержкой CUDA 12.1, `uv`, Git,
+   C/C++ build tools и ffmpeg/ffprobe с `libopus` и фильтром `rubberband`.
+   CPU/macOS TTS fallback в этом setup не предусмотрен.
+3. Из корня репозитория выполнить `./run.sh install-tts-cosyvoice3`.
+   Установщик создаёт отдельную `.venv-cosyvoice3` на Python 3.10, скачивает upstream
+   и около 5 GB модели в `tts/cosyvoice3/`. При старте бота скачиваний нет.
+4. В `.env` установить:
+
+```dotenv
+TTS_ENABLED=true
+TTS_PROVIDER=cosyvoice3
+TTS_DEFAULT_VOICE=anubarak
+TTS_PYTHON_PATH=.venv-cosyvoice3/bin/python
+TTS_COSYVOICE_UPSTREAM_DIR=tts/cosyvoice3/upstream
+TTS_MODEL_DIR=tts/cosyvoice3/models/Fun-CosyVoice3-0.5B-2512
+# Для локального Ollama перед TTS освобождать модель:
+OLLAMA_UNLOAD_AFTER_TASK=true
+```
+
+Остальные лимиты и пути — в `.env.example`. Если пути установки нестандартные,
+экспортировать те же `TTS_PYTHON_PATH`, `TTS_COSYVOICE_UPSTREAM_DIR`, `TTS_MODEL_DIR`
+перед запуском installer: сам shell-скрипт `.env` не читает.
+
+5. Выполнить `./run.sh doctor`, затем запустить или перезапустить бот через
+   `./run.sh start`. В doctor ожидается сообщение о доступности CosyVoice runner/CUDA
+   и ffmpeg libopus/rubberband. Эта проверка не синтезирует речь.
+6. В разрешённом чате проверить `/voice_type anubarak`, `/voice Привет!`, затем
+   `/voice_type cartman` и `/voice Привет!`. `/ask voice 24h Что обсуждали?`
+   должен прислать текст, затем voice reply. `/voice_type reset` возвращает default.
+
+**Отключение:** поставить `TTS_ENABLED=false` и перезапустить бот. Проверки TTS
+окружения/CUDA/ffmpeg не запускаются, `/voice` и `/ask voice` сообщают о недоступности
+озвучки до model work. Обычные `/ask` и `/question` работают. Сохранённый голос чата
+остаётся в SQLite, `/voice_type` доступен для настройки. Whisper независимо
+управляется `TRANSCRIBE_VOICE`; для генерации речи он не нужен.
+
+## Проверки релизной подготовки — 2026-10-28
+
+- `compileall src`, полный offline suite **206 tests**, `git diff --check` и
+  `bash -n run.sh scripts/install_tts_cosyvoice3.sh` прошли.
+- Новый handler test проверяет `TTS_ENABLED=false`: TTS availability check, synthesis
+  и voice-mode LLM не запускаются; обычный `/ask` и chat voice selection работают.
+- Wheel собран и установлен в отдельный временный каталог. Из внешнего CWD
+  обнаружены ровно два bundled references — `anubarak` и `cartman`; импорт registry
+  и synthesizer не загружает torch/CosyVoice, экспериментов в wheel нет.
+- Реальный CPU ffmpeg encode установленных references прошёл: Ануб’арак —
+  OGG/Opus mono 48 kHz, 10.497 s, atempo + rubberband; Картман — 11.406 s,
+  без effect filters. Это проверка упаковки/кодирования, не генерации или качества голоса.
+- Runtime и installer не ссылаются на `experiments/`. Installer/download, реальные
+  GPU synthesis и Telegram playback в этой сессии не запускались.
+
+## История реализации
 
 Проверено в implementation-сессии: `compileall src`, полный `unittest discover` (145 tests, включая 29 новых), `git diff --check`, shell syntax setup scripts, wheel build и installed-package discovery из внешнего CWD. Отдельно проверена реальная ffmpeg-цепочка на оригинальном reference: OGG/Opus, 10.497 s после atempo/rubberband. Это проверка encoding/filter availability, не качества синтеза или Telegram playback. Model installer, bot startup, GPU generation и Telegram smoke не запускались; `.env` и `data/` не читались.
 
@@ -20,7 +79,7 @@ Runtime MVP реализован 2026-10-12 в текущей рабочей в�
 - `/ask voice` возвращает generated answer как текст и voice. Обе копии — replies на исходную команду. Это не transcript и не результат Whisper.
 - Default voice можно выбрать отдельно для каждого чата через `/voice_type`.
 - Bundled samples хранятся в Git; дополнительные samples конкретной установки — в Git-ignored каталоге.
-- Второй bundled voice — `cartman` / Картман: предоставленный владельцем audio/text pair из `experiments/cartman-voice`; model speed 1.0 и никакой tempo/pitch post-processing.
+- Второй bundled voice — `cartman` / Картман: готовые `reference.wav` и `preset.json` внутри пакета; model speed 1.0 и никакой tempo/pitch post-processing.
 - Generated voice этого бота не запускает Whisper, transcript formatter или автоматическую recognition-проверку качества.
 
 Следующие defaults — инженерные предложения этого плана: любому участнику allowed chat доступна смена voice (как aliases), лимит текста 2 000 символов, аудио 180 секунд, execution timeout 180 секунд. Это не измеренные гарантии модели; значения должны быть конфигурируемыми и проверяться на baseline.
@@ -75,17 +134,17 @@ voices/local/                     # весь каталог Git-ignored
 
 ### Ануб’арак
 
-Кандидат reference из существующего README: `experiments/qwen3-tts/outputs/reference-anubarak-worker.wav`, исходная реплика `nerubiancryptlordpissed3.ogg` из `$HOME/Downloads/Анубарак`.
+Готовый reference: `src/tg_summary_bot/voice_presets/anubarak/reference.wav` (PCM16 mono 24 kHz, 8.93 s). Исходная реплика — `nerubiancryptlordpissed3.ogg`.
 
 Reference transcript: «Мы, нежить, народ работящий. Такая уж наша тяжкая доля.»
 
-Наличие и содержимое аудио в этой planning-сессии не проверены. Перед bundling подтвердить правильный файл и transcript прослушиванием; не использовать generated speech в качестве оригинального reference. Если sample недоступен — запросить у владельца точный путь, продолжая независимые code/tests tasks. Не читать `.env` или `data/` ради поиска.
+Оригинальный sample и transcript подтверждены владельцем при bundling. Для новой установки достаточно файлов пакета; искать исходник в локальных экспериментах или Downloads не требуется.
 
-Воспроизвести проверенную последовательность: zero-shot CosyVoice с model speed 1.0 → `atempo=0.85` → pitch −1 semitone с formants preserved → OGG/Opus. Не заменять post-processing модельным speed=0.85 без listening comparison. Existing `pitch_shift.py` использует ffmpeg `rubberband`; проверять наличие фильтра. Не подменять выбранный эффект молча.
+Последовательность: zero-shot CosyVoice с model speed 1.0 → `atempo=0.85` → pitch −1 semitone с formants preserved → OGG/Opus. Не заменять post-processing модельным speed=0.85 без listening comparison. Production encoder использует ffmpeg `rubberband`; проверять наличие фильтра. Не подменять выбранный эффект молча.
 
 ### Картман
 
-По явному выбору владельца bundled reference получен из `experiments/cartman-voice/output/separated/cartman_002_ai_mdx_extra.wav`; transcript скопирован без изменений из `output/transcripts/cartman_002_raw.txt`. Исходный float WAV (44.1 kHz stereo, 11.4 s) преобразован в PCM16 mono 24 kHz для registry/package compatibility, без normalization или tempo/pitch эффектов. Transcript остаётся ASR draft эксперимента; независимое listening-подтверждение в implementation-сессии не выполнялось.
+Готовые файлы: `src/tg_summary_bot/voice_presets/cartman/reference.wav` и `preset.json`. По явному выбору владельца использованы исходник `cartman_002_ai_mdx_extra.wav` и неизменённый transcript `cartman_002_raw.txt`. Исходный float WAV (44.1 kHz stereo, 11.4 s) преобразован в PCM16 mono 24 kHz для registry/package compatibility, без normalization или tempo/pitch эффектов. Transcript остаётся ASR draft; независимое listening-подтверждение в implementation-сессии не выполнялось.
 
 Preset ID `cartman`, display name `Картман`, language `ru`, speed 1.0, pitch 0. Generated speech не проходит даже neutral atempo/rubberband: фильтры полностью пропускаются, остаётся только Telegram OGG/Opus encoding. Выбор: `/voice_type cartman`; default Anub’арак не изменён.
 
@@ -120,7 +179,7 @@ Preset resolve делать один раз при admission операции: �
 - Dedicated CosyVoice runner вне обязательных bot imports: конфигурируемые model/upstream paths, вход через JSON file/stdin, WAV output и structured result. Можно разместить в `scripts/tts/`; deployment/setup должны включать runner.
 - `bot.py`: command parsing/admission, reuse question operation, reply delivery, logged outcomes.
 
-Не запускать experiment CLI с hardcoded paths как неявную production dependency. Вынести/адаптировать только проверенную zero-shot логику `experiments/cosyvoice3/clone.py`; эксперименты оставить воспроизводимыми.
+Production использует только `cosyvoice_runner.py`; локальные experiment CLI не являются зависимостями. Их файлы остаются на диске под `.gitignore`.
 
 CosyVoice работает в отдельной `.venv-cosyvoice3` (текущий experiment — Python 3.10); bot остаётся Python >=3.11. Heavy ML dependencies не входят в mandatory package requirements. Для MVP — один завершённый subprocess на запрос, без постоянно resident TTS worker.
 

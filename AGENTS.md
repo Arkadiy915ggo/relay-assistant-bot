@@ -10,6 +10,7 @@ The bot uses the official Telegram Bot API through `aiogram`. It cannot read his
 
 - Do not read `.env`; use `.env.example` for configuration shape.
 - Do not read or dump `data/` by default; it may contain private Telegram logs, media cache, SQLite databases, and model responses.
+- `experiments/` and local summary-experiment plans are Git-ignored working material. Keep them local; bot runtime/setup must use the packaged voice presets, never experiment scripts or outputs.
 - Keep changes small and local. This project is intentionally simple and mostly single-module-per-feature.
 - Prefer async-compatible code. Do not add blocking network, file, or model work to handlers unless it is already wrapped safely.
 - Preserve Russian bot prompts and response behavior unless the task explicitly asks to change language or tone.

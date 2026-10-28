@@ -10,6 +10,13 @@ Product source of truth: [[01 Product Vision]]. При будущих дизай
 
 ## Handoff после стабилизации и синхронизации веток
 
+Актуализация 2026-10-28: локальная `experiment/qwen3-tts-voice-clone` переименована в
+`release/bot-voice-presets`. Резервный коммит `2d4640b` сохранён веткой
+`backup/before-voice-release-2026-10-28`. Эксперименты остаются локально под
+`.gitignore`, а bundled references находятся в `src/tg_summary_bot/voice_presets/`.
+Для текущего setup использовать README и раздел «Запуск и отключение» Feature 06.
+Ниже — исторический snapshot синхронизации, а не инструкция вливать эксперименты.
+
 Снимок состояния, зафиксированный 2026-10-06 перед этим documentation-only дополнением:
 
 | Изменение | `experiment/qwen3-tts-voice-clone` | `feature/intent-router-casino` |
@@ -29,8 +36,8 @@ Product source of truth: [[01 Product Vision]]. При будущих дизай
 ```bash
 git fetch origin
 git status --short --branch
-git diff feature/intent-router-casino experiment/qwen3-tts-voice-clone
-git cherry feature/intent-router-casino experiment/qwen3-tts-voice-clone
+git diff main...release/bot-voice-presets --stat
+git log --oneline main..release/bot-voice-presets
 ```
 
 Cherry-pick создаёт разные commit IDs при одинаковом содержимом. `git diff` проверяет file contents, `git cherry` помогает определить patch-equivalent commits. После merge казино-ветки не вливать старую TTS-ветку повторно только ради уже перенесённого набора изменений; для следующей фичи предпочтительна новая ветка от обновлённого `main`.

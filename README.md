@@ -40,11 +40,39 @@ TTS is disabled by default and uses a separate Python 3.10 environment. The bot 
 on Python 3.11+; its mandatory dependencies do not include torch or CosyVoice.
 `install-voice` and `install-voice-cuda` still install **Whisper transcription**.
 
+### Installation and enabling
+
+The supported TTS setup is **Linux with an NVIDIA GPU** and a driver compatible with
+CUDA 12.1. The helper installs CUDA-enabled PyTorch; it does not install the NVIDIA
+driver or provide a CPU/macOS TTS fallback. Text commands remain usable on those systems
+with `TTS_ENABLED=false`.
+
+1. Complete [Quick Start](#quick-start) for the text bot (`./run.sh install`, Telegram
+   token and LLM settings in `.env`). Keep your existing `.env` when adding TTS.
+2. Install `uv`, Git, ffmpeg/ffprobe and C/C++ build tools (needed by Python audio
+   dependencies). On Debian/Ubuntu, system packages include `git ffmpeg build-essential
+   python3-dev`. Install `uv` using its [official instructions](https://docs.astral.sh/uv/getting-started/installation/).
+3. Check the driver and audio tools:
+
+```bash
+nvidia-smi
+uv --version
+ffmpeg -hide_banner -h filter=rubberband
+ffmpeg -hide_banner -h encoder=libopus
+ffprobe -version
+```
+
+The ffmpeg commands must describe `Filter rubberband` and `Encoder libopus`, rather
+than report an unknown filter/encoder. Both bundled presets use the same availability
+check, so rubberband is required even when the selected voice is Cartman.
+
+4. From the repository root, install the separate TTS environment and model:
+
 ```bash
 ./run.sh install-tts-cosyvoice3
 ```
 
-This explicit helper installs the pinned experiment baseline and downloads about
+This explicit helper installs the pinned runtime baseline and downloads about
 5 GB of model files. It requires `uv`, Git, an NVIDIA/CUDA installation, and ffmpeg
 with `libopus` and the `rubberband` filter. It is never run at startup or by tests.
 Upstream revision: `074ca6dc9e80a2f424f1f74b48bdd7d3fea531cc`.
@@ -54,7 +82,7 @@ real synthesis on this installation remains a manual check).
 PyTorch/torchaudio: 2.3.1/cu121; ONNX Runtime GPU: 1.18.0.
 See `scripts/install_tts_cosyvoice3.sh` for the remaining pinned baseline dependencies.
 
-Set these values in your installation configuration:
+5. Add or update these values in `.env`:
 
 ```dotenv
 TTS_ENABLED=true
@@ -72,12 +100,44 @@ TTS_ENCODING_TIMEOUT_SECONDS=60
 TTS_UPLOAD_TIMEOUT_SECONDS=60
 ```
 
+If the bot uses local Ollama, also set `OLLAMA_UNLOAD_AFTER_TASK=true` so completed
+LLM requests release their model before TTS needs the GPU. This is independent of
+`TRANSCRIBE_VOICE`: you do not need Whisper to generate speech.
+
 Paths resolve against the installation working directory; bundled presets resolve
 against the installed package. The helper accepts exported `TTS_PYTHON_PATH`,
 `TTS_COSYVOICE_UPSTREAM_DIR`, and `TTS_MODEL_DIR`; it does not read `.env`.
-After configuring, run `./run.sh doctor`. Disabled or broken TTS leaves ordinary
+For custom paths, export the same values before running the installer and put them
+in `.env` for the bot. No files under `experiments/` are needed for setup or runtime;
+the two ready references and their transcripts are included in the installed package.
+
+6. Validate the setup, then start (or restart) the bot:
+
+```bash
+./run.sh doctor
+./run.sh start
+```
+
+Doctor should report `CosyVoice runner/CUDA and ffmpeg libopus/rubberband available`.
+Disabled or broken TTS leaves ordinary
 text commands usable. Startup checks runner/imports/CUDA and ffmpeg capabilities
 without loading the synthesis model. No model is downloaded automatically.
+
+### Disabling
+
+Set this in `.env` and restart the bot:
+
+```dotenv
+TTS_ENABLED=false
+```
+
+No CosyVoice environment, model, CUDA or ffmpeg capability checks are required in
+this mode. `/voice` and `/ask voice` report that speech is unavailable before any
+model work. Ordinary `/ask` and `/question` still work; Whisper remains controlled
+by `TRANSCRIBE_VOICE`. `/voice_type` can still show or save a selection for later
+use, and disabling TTS preserves the saved chat selections.
+
+### Commands and bundled voices
 
 | Command | Result |
 | --- | --- |
@@ -99,9 +159,9 @@ Zero-shot generation always uses model speed **1.0**, followed by `atempo=0.85`,
 pitch **−1 semitone with preserved formants**, then Opus encoding. No substitute
 effect is used if rubberband is unavailable.
 
-The second bundled voice is **`cartman` / Картман**. It uses the user-selected
-`experiments/cartman-voice/output/separated/cartman_002_ai_mdx_extra.wav` and the
-exact contents of `output/transcripts/cartman_002_raw.txt`. The 11.4-second reference
+The second bundled voice is **`cartman` / Картман**. Its ready reference and
+transcript are `src/tg_summary_bot/voice_presets/cartman/reference.wav` and
+`preset.json`. The user-selected 11.4-second reference
 is converted to mono PCM16 24 kHz for package compatibility; no tempo/pitch effects
 or normalization are applied. The supplied transcript remains the experiment's ASR
 draft; independent listening verification was not performed during bundling.
@@ -144,6 +204,35 @@ directory kept until upload finishes. Timed-out/cancelled runner and ffmpeg proc
 are terminated, escalated to kill if needed, and awaited before unlock/cleanup.
 The synthesis execution timeout starts after acquiring the existing shared GPU lock;
 encoding and upload have separate limits.
+
+### First Telegram check and troubleshooting
+
+In an allowed chat, send these commands one at a time:
+
+```text
+/voice_type anubarak
+/voice Привет! Проверяем голос Ануб’арака.
+/voice_type cartman
+/voice Привет! Проверяем голос Картмана.
+/ask voice 24h Что обсуждали в чате?
+/voice_type reset
+```
+
+Check that `/voice` returns a playable voice reply and `/ask voice` sends its text
+first, then audio replying to the same command. A very long answer can be text-only
+with a voice-skipped notice; `TTS_MAX_TEXT_CHARS` limits spoken text, not the full
+text response.
+
+| Doctor diagnosis | What to check |
+| --- | --- |
+| `disabled` | Set `TTS_ENABLED=true` and restart when speech is wanted. |
+| `missing_python` / `wrong_python_version` | Run the TTS installer; `TTS_PYTHON_PATH` must point to the separate Python 3.10 environment. |
+| `missing_upstream` / `missing_model` | Check the configured paths or rerun the installer with the same exported paths. |
+| `missing_dependencies` / `runner_incompatible` | Reinstall the pinned TTS environment and upstream submodules. |
+| `cuda_unavailable` | Check `nvidia-smi` and CUDA visibility in the TTS environment. |
+| `missing_ffmpeg` / `missing_rubberband_or_libopus` | Install ffmpeg/ffprobe with both the required filter and encoder. |
+| `invalid_default_voice` | Use the bundled `anubarak` or `cartman` ID, or a valid installed local preset. |
+| `invalid_limits` | All `TTS_MAX_*` and `TTS_*_SECONDS` values must be positive integers. |
 
 For the **manual acceptance smoke**, listen to the original reference and short/long
 Russian outputs; check tempo, pitch, Telegram playback and direct reply IDs. Measure
@@ -668,10 +757,10 @@ Set `OPIK_CAPTURE_CONTENT=false` to log only metadata without prompts and output
 
 The bot can locally transcribe Telegram voice/audio messages through `faster-whisper` and store the transcript as a normal message for future `/summary` calls. It can also send the fast raw Whisper result first, then format the already-sent message with an LLM in the background.
 
-Voice generation is currently a standalone experiment, not a bot command. See the
-[Qwen3-TTS experiment](experiments/qwen3-tts/README.md),
-[CosyVoice 3 experiment](experiments/cosyvoice3/README.md), and the
-[planned voice-generation design](relay-assistant-bot-doc/Features/06%20Voice%20Message%20Generation.md).
+For outgoing `/voice` and `/ask voice` replies, use the separate
+[voice-generation setup](#voice-generation-feature-06) above. It includes the ready
+Anub’арак and Cartman presets and is controlled by `TTS_ENABLED`.
+The instructions below concern incoming audio transcription with Whisper.
 
 Install CPU voice dependencies:
 
