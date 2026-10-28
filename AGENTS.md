@@ -48,7 +48,9 @@ Current focused tests:
 - `tests/test_autonomous_worker.py`: current access policy for queued jobs/outbox, activation/backfill retries, and worker failure reporting.
 - `tests/test_casino.py`: slot mapping, atomic balances, bounded settlement retries, uncertain commit replay, cancellation, and startup recovery.
 - `tests/test_pinned_leaderboard.py`: leaderboard reuse and allowlisted startup refresh.
-- `tests/test_profile_stabilization.py`, `tests/test_observability_operations.py`: bounded profile batches/keyset migration, timeout/checkpoint safety, and content-free handled-outcome tracing.
+- `tests/test_profile_stabilization.py`, `tests/test_observability_operations.py`: bounded profile batches/keyset migration, timeout/checkpoint safety, no-key exporter isolation and content-free handled-outcome tracing.
+- `tests/test_whisper_local.py`: local snapshot/tokenizer/preprocessing completeness and explicit download opt-in, without models or network. An optional installed-faster-whisper contract check verifies actual 80/128 mel preprocessing with fake weight/tokenizer construction.
+- `dev/opik/tests`: bounded exporter lifecycle and pinned SDK serialization through fake HTTP; run separately with `PYTHONPATH=dev/opik/src .venv/bin/python -m unittest discover -s dev/opik/tests -v` after developer setup.
 - `tests/test_voice_presets.py`, `tests/test_voice_handlers.py`, `tests/test_speech_synthesizer.py`, `tests/test_cosyvoice_runner.py`: registry/storage, command delivery/provenance, own-bot isolation, runner protocol and supervised process cleanup without GPU/network/models.
 
 ## Runtime Flow
@@ -67,6 +69,7 @@ Current focused tests:
 - `src/tg_summary_bot/config.py`: `.env` parsing into frozen `Settings`; provider selection with `resolved_llm_provider`.
 - `src/tg_summary_bot/storage.py`: SQLite schema and async persistence for messages, indexed images/videos, and cached video recognitions.
 - `src/tg_summary_bot/llm.py`: `LLMClient` abstraction plus OpenAI and Ollama clients.
+- `src/tg_summary_bot/observability.py`: local operation logs and generic tracing hooks; no vendor SDK imports. `dev/opik` is a separate opt-in development distribution, not a bot dependency.
 - `src/tg_summary_bot/summarizer.py`: Russian summary prompts, chunking, partial summary merge.
 - `src/tg_summary_bot/assistant.py`: `/question` flow with relevant-context extraction for long histories.
 - `src/tg_summary_bot/image_recognizer.py`: manual `/image` and `/ocr` recognition through Ollama vision.
@@ -131,7 +134,8 @@ SQLite tables are initialized in `MessageStore.init()`:
 - `chat_voice_settings` stores per-chat preset IDs; direct voice uses ineligible `generated/tts_text`, and `/ask voice` persists only one eligible assistant answer. Bundled Anub’арак uses model speed 1.0 then atempo=0.85/pitch −1 with formants preserved. Real GPU/listening/Telegram acceptance remains manual.
 - Bundled `cartman` uses the user-selected MDX Extra reference and raw transcript from the Cartman experiment. Speed 1.0/pitch 0 bypass all tempo/pitch filters; only Telegram-compatible encoding remains.
 - Profile refresh uses one rendered-size/message-count bounded batch, a separate profile client/token budget, timeout and per-chat cooldown; busy GPU work is deferred. Invalid JSON/timeouts preserve the cursor; `chat_profile_state.processed_message_id` handles same-timestamp boundaries.
-- Slash operations have end-to-end Opik traces with speech stages and handled partial/failure outcomes. Background profile traces are detached. `tests/voice_trace_smoke.py` is an explicit synthetic live-ingestion check, not part of offline tests.
+- Optional tracing requires a separately installed dev exporter, `TRACING_ENABLED=true` and an explicit nonblank `TRACING_API_KEY` (legacy `OPIK_*` fallbacks supported). No key means no SDK import or network; SDK home config is ignored. Content capture defaults false. The Opik adapter disables SDK Sentry before import and stops exports on first error, without retrying bot work. `/stats` reports actual state; doctor diagnoses without importing the SDK. Slash traces retain speech stages and handled partial/failure errors; background profile traces are detached. `dev/opik/voice_trace_smoke.py --send` is an explicit synthetic live-ingestion check, not part of offline tests. Opik MCP is personal developer configuration, not project startup.
+- Whisper defaults to `WHISPER_LOCAL_FILES_ONLY=true`: prepare models explicitly with `./run.sh download-whisper <model>`. Missing/incomplete local tokenizer/model/preprocessing files or invalid preprocessing `feature_size` fail before model construction, without online or 80-mel fallback. Set false only to explicitly allow runtime Hugging Face downloads/checks.
 - Harmless leaderboard not-modified edits are quiet; confirmed pin-permission failures are best effort with a ten-minute cooldown, while balance edits continue and transient failures remain retryable.
 - Video recognition can include audio transcription when `VIDEO_TRANSCRIBE_AUDIO=true` and a transcriber is configured.
 - Long summaries/questions are chunked before model calls; final summaries merge partials.
@@ -168,7 +172,8 @@ Use `.env.example` as the source of truth for documented environment variables. 
 - LLM provider: `LLM_PROVIDER`, `OPENAI_API_KEY`, `OPENAI_MODEL`, `OLLAMA_BASE_URL`, `OLLAMA_MODEL`.
 - Ollama generation: `OLLAMA_TIMEOUT_SECONDS`, `OLLAMA_KEEP_ALIVE`, `OLLAMA_UNLOAD_AFTER_TASK`, `OLLAMA_NUM_CTX`, `OLLAMA_NUM_PREDICT`.
 - Storage/logs: `DATABASE_PATH`, `LOG_FILE`, `RESPONSE_LOG_FILE`.
-- Voice: `TRANSCRIBE_VOICE`, `WHISPER_MODEL`, `WHISPER_DEVICE`, `WHISPER_COMPUTE_TYPE`, `WHISPER_LANGUAGE`, `MAX_VOICE_SECONDS`, `TRANSCRIPTION_FORMAT_*`.
+- Optional developer tracing: `TRACING_ENABLED`, `TRACING_BACKEND`, `TRACING_API_KEY`, `TRACING_WORKSPACE`, `TRACING_PROJECT_NAME`, `TRACING_CAPTURE_CONTENT`, `TRACING_ENDPOINT`; install with `./run.sh install-dev`.
+- Voice: `TRANSCRIBE_VOICE`, `WHISPER_MODEL`, `WHISPER_LOCAL_FILES_ONLY`, `WHISPER_DEVICE`, `WHISPER_COMPUTE_TYPE`, `WHISPER_LANGUAGE`, `MAX_VOICE_SECONDS`, `TRANSCRIPTION_FORMAT_*`.
 - TTS: `TTS_ENABLED`, `TTS_PROVIDER`, `TTS_DEFAULT_VOICE`, `TTS_LOCAL_VOICES_DIR`, `TTS_OUTPUT_DIR`, `TTS_PYTHON_PATH`, `TTS_COSYVOICE_UPSTREAM_DIR`, `TTS_MODEL_DIR`, `TTS_MAX_TEXT_CHARS`, `TTS_MAX_AUDIO_SECONDS`, `TTS_TIMEOUT_SECONDS`, `TTS_ENCODING_TIMEOUT_SECONDS`, `TTS_UPLOAD_TIMEOUT_SECONDS`.
 - Image/video: `IMAGE_RECOGNITION_MODEL`, `VIDEO_RECOGNITION_MODEL`, frame limits, size/duration limits, and download directories.
 - Summary limits: `MAX_MESSAGE_CHARS`, `MAX_SUMMARY_INPUT_CHARS`, `CHUNK_CHARS`, `DEFAULT_SUMMARY_PERIOD`.

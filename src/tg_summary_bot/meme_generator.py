@@ -11,7 +11,7 @@ from typing import Any
 import httpx
 
 from tg_summary_bot.config import Settings
-from tg_summary_bot.observability import opik_track, update_opik_llm_usage, update_opik_span_metadata
+from tg_summary_bot.observability import trace, update_llm_usage, update_span_metadata
 
 
 MEME_SYSTEM_PROMPT = """
@@ -65,10 +65,10 @@ class MemeGenerator:
         self.num_predict = settings.meme_num_predict
         self.font_path = settings.meme_font_path
 
-    @opik_track(name="meme.generate_caption")
+    @trace(name="meme.generate_caption")
     async def generate_caption(self, image_path: Path) -> MemeCaption:
         image_size = image_path.stat().st_size if image_path.exists() else 0
-        update_opik_span_metadata(
+        update_span_metadata(
             {
                 "model": self.model,
                 "image_size_bytes": image_size,
@@ -80,9 +80,9 @@ class MemeGenerator:
         response = await self._complete_with_image(image_b64=image_b64, image_size=image_size)
         return parse_meme_caption(response)
 
-    @opik_track(name="meme.vision", type="llm")
+    @trace(name="meme.vision", type="llm")
     async def _complete_with_image(self, *, image_b64: str, image_size: int) -> str:
-        update_opik_span_metadata(
+        update_span_metadata(
             {
                 "provider": "ollama",
                 "model": self.model,
@@ -140,7 +140,7 @@ class MemeGenerator:
         eval_duration = (data.get("eval_duration") or 0) / 1_000_000_000
         tokens_per_second = eval_count / eval_duration if eval_duration else 0
         content = str(data.get("message", {}).get("content", "")).strip()
-        update_opik_llm_usage(
+        update_llm_usage(
             provider="ollama",
             model=self.model,
             usage={

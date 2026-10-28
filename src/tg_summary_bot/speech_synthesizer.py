@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from tg_summary_bot.config import Settings
-from tg_summary_bot.observability import opik_stage
+from tg_summary_bot.observability import trace_stage
 from tg_summary_bot.voice_presets import VoicePreset, VoiceRegistry
 
 
@@ -210,10 +210,10 @@ class SpeechSynthesizer:
                                   "transcript": preset.transcript, "output": str(wav),
                                   "max_raw_seconds": s.tts_max_audio_seconds * preset.speed},
                                  ensure_ascii=False).encode()
-            with opik_stage("speech.gpu_wait", {"voice_id": preset.id}):
+            with trace_stage("speech.gpu_wait", {"voice_id": preset.id}):
                 await gpu_lock.acquire()
             try:
-                with opik_stage("speech.synthesize", {"voice_id": preset.id, "input_chars": len(text),
+                with trace_stage("speech.synthesize", {"voice_id": preset.id, "input_chars": len(text),
                                                      "model_speed": 1.0, "post_speed": preset.speed,
                                                      "pitch_semitones": preset.pitch_semitones}):
                     await run_process(self.runner_args(), payload=payload, timeout=s.tts_timeout_seconds)
@@ -234,12 +234,12 @@ class SpeechSynthesizer:
                 formant = "preserved" if preset.preserve_formants else "shifted"
                 filters.append(f"rubberband=tempo=1:pitch={factor:.8f}:formant={formant}:pitchq=quality")
             filter_args = ["-af", ",".join(filters)] if filters else []
-            with opik_stage("speech.encode", {"voice_id": preset.id, "effect_filters": len(filters)}):
+            with trace_stage("speech.encode", {"voice_id": preset.id, "effect_filters": len(filters)}):
                 await run_process(["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
                                    "-i", str(wav), *filter_args, "-ac", "1", "-ar", "48000",
                                    "-c:a", "libopus", "-b:a", "48k", str(output)],
                                   timeout=s.tts_encoding_timeout_seconds)
-            with opik_stage("speech.validate"):
+            with trace_stage("speech.validate"):
                 probe = await run_process(["ffprobe", "-v", "error", "-show_entries",
                                            "format=duration:stream=codec_name", "-of", "json", str(output)],
                                           timeout=s.tts_encoding_timeout_seconds)

@@ -8,7 +8,7 @@ from collections.abc import Awaitable, Callable
 from typing import Literal
 
 from tg_summary_bot.llm import LLMClient
-from tg_summary_bot.observability import opik_track, update_opik_span_metadata
+from tg_summary_bot.observability import trace, update_span_metadata
 from tg_summary_bot.storage import MessageStore, SnapshotBoundary, StoredMessage
 
 
@@ -324,7 +324,7 @@ class JokeSelector:
             return JokeSelectionResult("invalid", reason="qualification_source_mismatch", pages=pages, tournament_rounds=rounds)
         return JokeSelectionResult("selected", winner=winner, reason=judgment.reason, pages=pages, tournament_rounds=rounds)
 
-    @opik_track(name="joke.qualify", create_duplicate_root_span=True)
+    @trace(name="joke.qualify")
     async def _qualify(self, candidate: StoredMessage) -> JokeSelection:
         prompt = _candidate_prompt([candidate], self.char_budget)
         if prompt is None:
@@ -338,7 +338,7 @@ class JokeSelector:
         except Exception:
             return _reject("qualification_model_error")
         result = parse_joke_qualification(response, candidate, visible)
-        update_opik_span_metadata({"source_message_id": candidate.message_id, "valid": result.valid,
+        update_span_metadata({"source_message_id": candidate.message_id, "valid": result.valid,
                                   "has_joke": result.has_joke, "qualification_error": result.error})
         return result
 

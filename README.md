@@ -270,7 +270,7 @@ batches split messages sharing the same timestamp. Startup idempotently adds nul
 `chat_profile_state.processed_message_id`; legacy timestamp checkpoints are preserved.
 Oversized messages are clipped only in the model input; raw stored messages remain intact.
 
-With Opik enabled, slash commands have end-to-end `telegram.voice` / `telegram.question`
+With the separate development exporter explicitly enabled, slash commands have end-to-end `telegram.voice` / `telegram.question`
 traces. Speech spans show GPU wait, synthesis, encoding, validation, upload, and direct
 voice persistence. Voice-answer traces also include model unload, text delivery and
 canonical persistence, with existing LLM spans nested under the command. Stage metadata
@@ -281,10 +281,11 @@ Telegram handler. Profile refresh is an independent trace; invalid JSON is a fai
 An optional **synthetic** ingestion check is available:
 
 ```bash
-.venv/bin/python tests/voice_trace_smoke.py
+.venv/bin/python dev/opik/voice_trace_smoke.py --send
 ```
 
-It uses the existing Opik SDK configuration and publishes tagged verification traces.
+Install `./run.sh install-dev` first and explicitly export `TRACING_API_KEY` and, for cloud,
+`TRACING_WORKSPACE`. It publishes tagged verification traces; `~/.opik.config` is ignored.
 It uses fake model/ffmpeg/Telegram calls and a temporary SQLite database: no production
 data, `.env`, GPU work or Telegram requests. It is not part of the offline unit suite.
 
@@ -377,10 +378,10 @@ For local voice transcription with Whisper:
 ./run.sh install-voice
 ```
 
-For Opik tracing:
+For the optional development tracing package (not needed to run the bot):
 
 ```bash
-./run.sh install-opik
+./run.sh install-dev
 ```
 
 ## BotFather Setup
@@ -742,24 +743,85 @@ Use this log to inspect real bot answers and improve prompt quality.
 
 ## Opik Tracing
 
-Opik can collect LLM traces for `/summary`, `/question`, `/compare`, and transcript formatting. It is disabled by default because prompts can contain private chat history.
+Tracing is disabled by default. The bot contains only provider-neutral timing hooks
+and local structured operation logs. The Opik exporter is a **separate installable
+development distribution** under [`dev/opik`](dev/opik/README.md), excluded from the
+bot wheel and normal dependencies. Installing it alone never activates tracing.
 
-Install and configure:
+Install only for development:
 
 ```bash
-./run.sh install-opik
-opik configure
+./run.sh install-dev
+# Equivalent: .venv/bin/python -m pip install -e . -e ./dev/opik
 ```
 
-Enable in `.env`:
+Enable explicitly in `.env` or the process environment:
 
 ```env
-OPIK_ENABLED=true
-OPIK_PROJECT_NAME=telegram-summary-bot
-OPIK_CAPTURE_CONTENT=true
+TRACING_ENABLED=true
+TRACING_BACKEND=opik
+TRACING_API_KEY=your_opik_api_key
+TRACING_WORKSPACE=your_workspace
+TRACING_PROJECT_NAME=telegram-summary-bot
+TRACING_CAPTURE_CONTENT=false
+# TRACING_ENDPOINT=http://localhost:5173/api/
 ```
 
-Set `OPIK_CAPTURE_CONTENT=false` to log only metadata without prompts and outputs. For private chats, prefer a local or self-hosted Opik backend.
+**Without a nonblank explicit key, tracing is completely inactive even if enabled:**
+no exporter/SDK import, Sentry initialization, SDK config lookup or background sender.
+`~/.opik.config` and `opik configure` do not activate this integration. A key is required
+even for self-hosted installations (an explicit placeholder is sufficient only when
+that server does not require authentication).
+
+The exporter disables the SDK's own Sentry error reporting **before import**. It uses
+the pinned SDK's async REST client, not its global tracker, connection monitor or
+retry workers. Completed spans are batched through a bounded queue. The first HTTP,
+authorization, timeout or queue-overflow failure stops exports until bot restart,
+with one content-free warning. Shutdown waits at most three seconds for queued work.
+Bot requests are never repeated or failed because of tracing errors.
+
+`TRACING_CAPTURE_CONTENT=false` sends IDs, timings, model/token usage and safe outcome
+metadata, without prompts, answers, audio, image files or raw exception messages.
+Set it to `true` only when you explicitly want to export LLM text. Operation and speech
+hooks remain content-free. `/stats` reports the **actual runtime state** (`active`,
+`disabled`, `missing_api_key`, `missing_backend`, `export_failed`, etc.). `./run.sh doctor`
+diagnoses configuration/package availability without importing the exporter or contacting Opik;
+`configured` there is not an authentication or server-health check.
+
+Migration: legacy `OPIK_ENABLED`, `OPIK_API_KEY`, `OPIK_PROJECT_NAME`,
+`OPIK_CAPTURE_CONTENT`, `OPIK_WORKSPACE` and `OPIK_URL_OVERRIDE` are fallback names.
+The corresponding `TRACING_*` name takes precedence even when explicitly empty/false.
+Content capture defaults to `false` when neither name is set. Replace the old
+`./run.sh install-opik` / `.[opik]` setup with `./run.sh install-dev`.
+
+Opik **MCP is separate from bot tracing**. The repository no longer starts an MCP
+server from either OpenCode config or carries a machine-specific credential launcher.
+Configure MCP in your personal OpenCode settings if needed; see the dev package guide.
+Restart OpenCode after changing its configuration, and restart the bot after changing
+tracing configuration. Already-installed SDK packages do not need to be uninstalled
+to keep tracing inactive.
+
+## Network Requests
+
+| Destination | When and why |
+| --- | --- |
+| Telegram Bot API | Bot identity/startup, long polling (including an idle bot), media downloads and replies. Required. |
+| Configured OpenAI-compatible endpoint | Text/model operations when that provider is selected. Without `OPENAI_BASE_URL`, the OpenAI client uses its standard endpoint. |
+| Configured Ollama endpoint | Text generation, OCR/video/meme recognition and model-unload requests. Defaults to `http://localhost:11434`; a remote URL is still a network service. |
+| Wikipedia | Explicit `/wiki` or a routed search when `WIKI_SEARCH_ENABLED=true`. The search query is sent, not the whole chat history. |
+| YouTube and media CDN | Explicit video URL processing through `yt-dlp`. |
+| Hugging Face | Explicit `download-whisper`, or transcription with `WHISPER_LOCAL_FILES_ONLY=false`. Local-only mode is the default. |
+| Configured Opik endpoint | Only with the development exporter installed, tracing enabled and an explicit nonblank key. No MCP is launched by the bot. |
+
+`LLM_PROVIDER=auto` chooses OpenAI whenever `OPENAI_API_KEY` is present, including an
+inherited environment variable. Use **`LLM_PROVIDER=ollama`** to force local text
+generation. Media recognition and transcript formatting have their own model/provider
+settings. Optional TTS uses a separate local CosyVoice process and preinstalled model;
+its explicit installer contacts GitHub, package indexes and Hugging Face. Third-party
+TTS upstream behavior is independent of the tracing exporter.
+
+Installation commands (`pip`, `uv`, model downloads) also use the network. This table
+describes application flows, not an OS-level firewall or every third-party dependency.
 
 ## Voice Messages
 
@@ -770,16 +832,30 @@ For outgoing `/voice` and `/ask voice` replies, use the separate
 Anub’арак and Cartman presets and is controlled by `TTS_ENABLED`.
 The instructions below concern incoming audio transcription with Whisper.
 
-Install CPU voice dependencies:
+`WHISPER_LOCAL_FILES_ONLY=true` is the default. Runtime resolves only complete local
+model snapshots and requires `tokenizer.json`, preventing the library's online tokenizer
+fallback. A valid `preprocessor_config.json` with a positive integer `feature_size` is
+also required before model construction: otherwise faster-whisper silently falls back
+to 80 mel features, breaking `large-v3`/`turbo` models that require 128. Existing 80-feature
+models retain their configured feature size. If files are missing or preprocessing is
+invalid, transcription reports a setup error and text commands
+remain available. `WHISPER_MODEL` can also be a complete local model directory.
+`download-whisper` is an explicit network-enabled preparation command and does not load
+bot credentials or `.env`. Set `WHISPER_LOCAL_FILES_ONLY=false` to opt back into automatic
+downloads/checks at transcription time.
+
+Install CPU voice dependencies and explicitly prepare the model:
 
 ```bash
 ./run.sh install-voice
+./run.sh download-whisper small
 ```
 
 Install NVIDIA GPU voice dependencies:
 
 ```bash
 ./run.sh install-voice-cuda
+./run.sh download-whisper large-v3
 ```
 
 Recommended high-quality NVIDIA GPU settings:
@@ -787,6 +863,7 @@ Recommended high-quality NVIDIA GPU settings:
 ```env
 TRANSCRIBE_VOICE=true
 WHISPER_MODEL=large-v3
+WHISPER_LOCAL_FILES_ONLY=true
 WHISPER_DEVICE=cuda
 WHISPER_COMPUTE_TYPE=float16
 WHISPER_LANGUAGE=
@@ -805,6 +882,7 @@ Recommended first-run macOS/CPU settings:
 ```env
 TRANSCRIBE_VOICE=true
 WHISPER_MODEL=small
+WHISPER_LOCAL_FILES_ONLY=true
 WHISPER_DEVICE=cpu
 WHISPER_COMPUTE_TYPE=int8
 WHISPER_LANGUAGE=
