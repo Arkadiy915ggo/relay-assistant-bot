@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import gc
+import json
 import logging
 import time
 from pathlib import Path
@@ -11,7 +12,7 @@ from tg_summary_bot.observability import trace, update_span_metadata
 
 
 def resolve_whisper_model(model_name: str, *, local_files_only: bool) -> str:
-    """Resolve a complete cached snapshot without allowing tokenizer fallbacks online."""
+    """Resolve a complete snapshot without online tokenizer or mel-size fallbacks."""
     if not local_files_only:
         return model_name
     from faster_whisper.utils import download_model
@@ -20,9 +21,17 @@ def resolve_whisper_model(model_name: str, *, local_files_only: bool) -> str:
         if not directory.is_dir():
             directory = Path(download_model(model_name, local_files_only=True))
         # WhisperModel would otherwise call Tokenizer.from_pretrained() online.
-        for name in ("model.bin", "config.json", "tokenizer.json"):
+        # Missing/invalid preprocessing silently defaults to 80 mel features,
+        # which is incompatible with large-v3/turbo models expecting 128.
+        for name in ("model.bin", "config.json", "tokenizer.json", "preprocessor_config.json"):
             if not (directory / name).is_file() or (directory / name).stat().st_size == 0:
                 raise FileNotFoundError(name)
+        with (directory / "preprocessor_config.json").open(encoding="utf-8") as file:
+            preprocessing = json.load(file)
+        if (not isinstance(preprocessing, dict)
+                or type(preprocessing.get("feature_size")) is not int
+                or preprocessing["feature_size"] <= 0):
+            raise ValueError("missing_or_invalid_feature_size")
     except Exception:
         raise RuntimeError(
             "Whisper model is missing or incomplete locally. Prepare it explicitly with "

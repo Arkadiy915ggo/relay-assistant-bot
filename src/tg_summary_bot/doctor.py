@@ -183,7 +183,7 @@ def main() -> int:
                     _warn(str(exc))
                     warnings += 1
                 else:
-                    _ok("Whisper model/tokenizer available locally; runtime downloads disabled")
+                    _ok("Whisper model/tokenizer/preprocessing available locally; runtime downloads disabled")
             else:
                 _warn("WHISPER_LOCAL_FILES_ONLY=false permits runtime Hugging Face requests")
                 warnings += 1

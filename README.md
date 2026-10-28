@@ -834,7 +834,11 @@ The instructions below concern incoming audio transcription with Whisper.
 
 `WHISPER_LOCAL_FILES_ONLY=true` is the default. Runtime resolves only complete local
 model snapshots and requires `tokenizer.json`, preventing the library's online tokenizer
-fallback. If files are missing, transcription reports a setup error and text commands
+fallback. A valid `preprocessor_config.json` with a positive integer `feature_size` is
+also required before model construction: otherwise faster-whisper silently falls back
+to 80 mel features, breaking `large-v3`/`turbo` models that require 128. Existing 80-feature
+models retain their configured feature size. If files are missing or preprocessing is
+invalid, transcription reports a setup error and text commands
 remain available. `WHISPER_MODEL` can also be a complete local model directory.
 `download-whisper` is an explicit network-enabled preparation command and does not load
 bot credentials or `.env`. Set `WHISPER_LOCAL_FILES_ONLY=false` to opt back into automatic
