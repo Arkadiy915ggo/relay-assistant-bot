@@ -6,6 +6,22 @@
 
 Актуальные defaults: 50 сообщений / 3 дня, partial minimum 5. Исторические блоки с политикой 20 / 24h сохраняются как есть. Стабилизация текущих access/retry contracts описана в [[05.5 Pre-Merge Stabilization]].
 
+Runtime follow-up 2026-10-13 после review: свежие award notifications получают приоритет и доставляются до unrelated GPU selection. `AUTONOMOUS_JOKE_ANNOUNCEMENT_MAX_AGE=24h` отсчитывается от committed award, а не возраста source message; старые notices переходят в `skipped/announcement_expired`, points/ledger не меняются. Уведомление указывает оригинальное время начисления в UTC. До десяти expired notices очищаются за delivery pass, максимум одно реальное Telegram action за pass. Access, activation, disabled-chat, shadow и action-pause policy остаются прежними; paused notices проверяются при возобновлении. Schema migration не нужна.
+
+Повторный smoke владельца показал пробел этой политики: после restart отправились шесть вчерашних awards внутри 24h window. Добавлен default `AUTONOMOUS_JOKE_ANNOUNCE_BACKLOG=false`: notices с award commitment до старта текущего worker переходят в `skipped/announcement_before_worker_start`, без изменения points/ledger. Новые awards после старта доставляются как обычно. Per-worker delivery cutoff не заменяет durable activation cutoff. Explicit backlog=true сохраняет catch-up внутри age limit; existing access/shadow/action-pause gates остаются обязательными.
+
+Startup replay regression проверен: 181 offline tests, `compileall src` и `git diff --check` прошли. Новый restart-policy test воспроизводит несколько вчерашних awards моложе 24h и подтверждает отсутствие Telegram sends при сохранении points; post-start awards и explicit backlog opt-in проверены отдельно. Live применение требует restart текущего bot process.
+
+Следующий review выявил уже новые awards: два notices в одном чате в 13:17 и 13:19. Добавлен hard per-chat cooldown `AUTONOMOUS_JOKE_ANNOUNCEMENT_MIN_INTERVAL=12h` (один notice на чат в полдня). Posting admission atomically резервирует attempt в `chat_joke_announcement_state` с проверкой outbox lease; confirmed delivery сохраняется в той же transaction, что completion outbox. Init idempotently создаёт state и подхватывает старые confirmed deliveries, поэтому restart/upgrade не обнуляет лимит. Failed/uncertain send тоже расходует cooldown. Rate-limited notices получают `retry/announcement_rate_limited` до следующего разрешённого времени, points/ledger и leaderboard updates не изменяются; другие чаты независимы. Age/startup/access/shadow policies продолжают действовать.
+
+Cooldown verification: 188 offline tests, `compileall src`, `git diff --check` прошли. Tests покрывают второй notice в пределах cooldown, независимость чатов, expiry cooldown, restart/legacy history seeding, atomic reservation через разные store instances, fencing и uncertain sends. Production migration/admission включаются при restart бота; вручную real ledger/outbox не изменялись.
+
+Перед новым award final candidate проходит отдельный bounded qualification call: visible humour mechanism, exact evidence quote, отсутствие missing image/chat context. Primary strict JSON schema сохранена; у qualification отдельный strict contract. Валидный отказ даёт no_joke, malformed/unsupported IDs дают retry без points. Грубые и короткие self-contained jokes не запрещены; это не toxicity prefilter и не PR 5D. Дополнительный model call использует прежний shared GPU lock, lease renewal и timeout; output budget judge — 256 tokens. Ранее начисленные awards не переоцениваются. Humour calibration на реальном model остаётся subject to manual review, а не гарантией unit mocks.
+
+Пакетная оптимизация: модель переиспользуется между страницами, турниром, qualification и соседними jobs. Короткий блок из 50 сообщений помещается в один selection prompt в прежнем character budget; непарный финалист турнира проходит дальше без повторной оценки, но qualification остаётся обязательной. Model runs допускаются раз в 6h, до 4 jobs; допуск сохраняется атомарно с первым claim. Outbox проверяется и между запусками модели. Сессия уступает GPU после 8 calls или soft 120s, сохраняя текущий турнир в памяти. Повторяющиеся schema/validation failures получают отдельный durable counter и quarantine после трёх ошибок; transient errors этот лимит не расходуют. Новые счётчики на upgrade начинаются с нуля.
+
+Проверено: `compileall src`, full offline suite (205 tests) и `git diff --check`. Regression cases покрывают expired/fresh priority, сохранение earned points, paused/shadow policies, retry через expiry, bounded cleanup, source-grounded qualification, wrong/missing quote/context, warm sessions, foreground yield, durable run admission и quarantine. Реальная база не изменялась вручную, bot process не перезапускался автоматически; политика применяется после restart.
+
 Feature 01-04 считаются завершённой базой. Перед изменениями текущий full test suite должен проходить. Feature 05 не меняет правила Telegram slot mapping, stake, payouts или RTP.
 
 ## Цель
@@ -402,15 +418,15 @@ Prefilter не назначает points и не делает safety filtering. 
 
 Сейчас отдельной priority queue нет; `gpu_lock` является общей взаимной блокировкой. Worker должен использовать тот же объект.
 
-Контракт v1:
+Актуальный контракт пакетной обработки:
 
 - если `gpu_lock` занят, background worker не становится постоянным waiter, а откладывает попытку;
-- одна background acquisition выполняет максимум один model batch call;
-- между page calls worker освобождает lock и делает cooperative yield;
-- SQLite claim/finalize, Telegram send, sleep и planning выполняются без `gpu_lock`;
+- одна background acquisition переиспользует модель до 8 calls / soft 120s; граница проверяется между calls;
+- на границе сессии worker выгружает модель, освобождает lock и делает cooperative yield;
+- SQLite award finalize, Telegram send, sleep и planning выполняются без `gpu_lock`; короткие claim/lease transactions допустимы внутри admission;
 - unload выполняется в `finally` до release, если текущий client contract требует unload after task;
 - user command, уже ожидающая lock, не должна быть обойдена следующим background batch;
-- один long-running job не удерживает GPU на весь page/tournament cycle.
+- длинный job продолжается после уступки GPU с текущего page/tournament position, без повторного отбора уже обработанных страниц.
 
 Если это невозможно гарантировать одним `asyncio.Lock` без private API, добавить небольшой `GpuScheduler` с foreground/background admission и перевести существующие lock call sites отдельным PR. Не обещать strict foreground priority на основе только `lock.locked()`.
 
@@ -463,11 +479,13 @@ Cancellation не переводит running job в terminal state. Lease поз
 Production caller также передаёт текущие `allowed_chat_ids`, `disabled_chat_ids` и `start_after`; outbox claim использует те же ограничения.
 
 1. `_write_lock` + `BEGIN IMMEDIATE`.
-2. Найти одну `pending/retry` job с due `next_attempt_at` либо `running` с истёкшим lease.
+2. Найти одну не quarantined `pending/retry` job с due `next_attempt_at` либо `running` с истёкшим lease; исключить jobs, уже взятые в текущем запуске.
 3. Сгенерировать новый opaque `lease_token`.
 4. Increment `attempt_count`.
 5. Записать owner/token/until и `status='running'`.
 6. Commit и вернуть immutable job.
+
+Первый claim запуска дополнительно проверяет `autonomous_joke_state.next_run_at` и в той же transaction резервирует следующий запуск через `AUTONOMOUS_JOKES_RUN_INTERVAL`. Пустой claim не двигает расписание. Subsequent claims ограничены `AUTONOMOUS_JOKES_MAX_JOBS_PER_RUN`.
 
 Любой finalize/retry method проверяет `job_id + lease_token`. Старый worker после reclaim не может завершить job.
 
@@ -491,7 +509,7 @@ Outcomes:
 - timeout, invalid JSON, model error, transient SQLite error -> `retry`;
 - cancellation/process death -> lease expiry и reclaim.
 
-Не вводить малый finite retry limit. После 10 attempts логировать alert-level metadata, но продолжать capped retries.
+Transient failures сохраняют capped backoff; повтор модели допускается только в следующем scheduled run. Невалидный формат/ID/evidence увеличивает отдельный `validation_failures`; после `AUTONOMOUS_JOKES_MAX_VALIDATION_FAILURES=3` записывается `quarantined_at`, и job больше не claim-ится автоматически. Для совместимости с SQLite CHECK status остаётся `retry`; points не начисляются, immutable source block и причина сохраняются. Restart не сбрасывает quarantine. Высокий legacy `attempt_count` не подменяет счётчик ошибок валидации.
 
 ## Atomic Finalize
 
@@ -641,6 +659,11 @@ AUTONOMOUS_JOKES_MAX_BLOCK_AGE=3d
 AUTONOMOUS_JOKES_INITIAL_LOOKBACK=7d
 AUTONOMOUS_JOKES_STARTUP_GRACE_SECONDS=60
 AUTONOMOUS_JOKES_POLL_SECONDS=30
+AUTONOMOUS_JOKES_RUN_INTERVAL=6h
+AUTONOMOUS_JOKES_MAX_JOBS_PER_RUN=4
+AUTONOMOUS_JOKES_SESSION_MAX_CALLS=8
+AUTONOMOUS_JOKES_SESSION_MAX_SECONDS=120
+AUTONOMOUS_JOKES_MAX_VALIDATION_FAILURES=3
 AUTONOMOUS_JOKES_LEASE_SECONDS=900
 AUTONOMOUS_JOKE_JUDGE_MODEL=
 AUTONOMOUS_JOKE_ANNOUNCE=true
@@ -769,7 +792,7 @@ Startup grace уменьшает race между worker и ingestion накоп�
 - Exact job membership передаётся selector-у.
 - JSON candidate serialization и prompt-local IDs.
 - Reply/predecessor context не меняет target author.
-- One GPU batch per background acquisition.
+- Bounded warm GPU sessions; yield сохраняет page/tournament progress.
 - Busy GPU откладывает background work.
 - Cancellation до/во время/после model call оставляет recoverable job.
 - Retry backoff capped на 60m.
@@ -817,7 +840,7 @@ Startup grace уменьшает race между worker и ingestion накоп�
 - `/top`, `/stats` и pinned leaderboard показывают бота под первым alias.
 - Бот может крутить казино по `/casino bot`, явному addressed self-intent и durable automatic policy.
 - Human casino behavior, mapping, RTP и recovery не изменились.
-- Background LLM не создаёт второй GPU lock и не удерживает lock во время DB/Telegram операций.
+- Background LLM не создаёт второй GPU lock; award DB mutations и Telegram operations выполняются после release.
 - Shadow mode позволяет проверить качество до включения реальных начислений.
 - Полный unittest suite, compileall и `git diff --check` проходят.
 

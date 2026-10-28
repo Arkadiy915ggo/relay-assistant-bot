@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "id": "anubarak",
+  "display_name": "Ануб’арак",
+  "reference": "reference.wav",
+  "transcript": "Мы, нежить, народ работящий. Такая уж наша тяжкая доля.",
+  "language": "ru",
+  "post_processing": {"speed": 0.85, "pitch_semitones": -1, "preserve_formants": true}
+}

@@ -9,10 +9,11 @@ import random
 import re
 import time
 from collections.abc import Awaitable, Callable
+from contextvars import Context
 from datetime import datetime, timezone
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from weakref import WeakValueDictionary
+from weakref import WeakKeyDictionary, WeakValueDictionary
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.exceptions import TelegramBadRequest
@@ -33,17 +34,22 @@ from tg_summary_bot.intent_router import (
 )
 from tg_summary_bot.joke_awards import JokeSelector
 from tg_summary_bot.llm import build_llm_client
-from tg_summary_bot.memory import ChatMemory, MemoryCompressionError, participant_key, should_use_memory
+from tg_summary_bot.memory import ChatMemory, MemoryCompressionError, ProfileExtractionError, participant_key, should_use_memory
 from tg_summary_bot.meme_generator import MemeGenerator
 from tg_summary_bot.observability import (
     OperationOutcome,
     log_operation_outcome,
     opik_track,
+    opik_stage,
+    opik_operation,
+    traced_gpu_lock,
     update_opik_span_metadata,
 )
 from tg_summary_bot.periods import format_period, parse_period
 from tg_summary_bot.storage import CasinoSpin, CasinoSpinResult, MessageStore, PointBalance, StoredImage, StoredVideo
 from tg_summary_bot.summarizer import Summarizer
+from tg_summary_bot.speech_synthesizer import SpeechSynthesizer, speech_text
+from tg_summary_bot.voice_presets import VoicePreset, VoiceRegistry
 from tg_summary_bot.transcriber import FasterWhisperTranscriber
 from tg_summary_bot.transcript_formatter import TranscriptFormatter
 from tg_summary_bot.video_recognizer import VideoRecognizer
@@ -62,6 +68,8 @@ _BOT_IDENTITIES: dict[int, tuple[int, str | None, str]] = {}
 _LEADERBOARD_LOCKS: WeakValueDictionary[
     tuple[asyncio.AbstractEventLoop, int], asyncio.Lock
 ] = WeakValueDictionary()
+_PIN_DENIED_UNTIL: WeakKeyDictionary[Bot, dict[int, tuple[int, float]]] = WeakKeyDictionary()
+PIN_PERMISSION_RETRY_SECONDS = 600
 
 
 class TelegramDownloadTooLargeError(RuntimeError):
@@ -416,7 +424,13 @@ def parse_question_command(text: str, default_period: str) -> tuple[str, str] | 
     if len(args) < 2 or not args[1].strip():
         return None
 
-    raw = args[1].strip()
+    return parse_question_arguments(args[1], default_period)
+
+
+def parse_question_arguments(raw: str, default_period: str) -> tuple[str, str] | None:
+    raw = raw.strip()
+    if not raw:
+        return None
     parts = raw.split(maxsplit=1)
     if len(parts) == 2:
         try:
@@ -427,6 +441,29 @@ def parse_question_command(text: str, default_period: str) -> tuple[str, str] | 
             return parts[0], parts[1].strip()
 
     return default_period, raw
+
+
+def parse_ask_command(text: str, default_period: str) -> tuple[str, str, bool] | None:
+    parts = text.split(maxsplit=1)
+    if len(parts) < 2:
+        return None
+    arguments = parts[1].strip().split(maxsplit=1)
+    voice = bool(arguments and arguments[0].lower() == "voice")
+    if voice:
+        if len(arguments) < 2:
+            return None
+        raw = arguments[1]
+    else:
+        raw = parts[1]
+    if voice and len(raw.split()) == 1:
+        try:
+            parse_period(raw)
+        except ValueError:
+            pass
+        else:
+            return None
+    parsed = parse_question_arguments(raw, default_period)
+    return (*parsed, voice) if parsed else None
 
 
 def entity_type_name(entity: object) -> str:
@@ -655,7 +692,6 @@ async def _refresh_pinned_leaderboard_for_chat(
                 parse_mode="HTML",
             )
         except Exception as exc:  # noqa: BLE001
-            logging.warning("Pinned leaderboard edit failed chat_id=%s", chat_id, exc_info=True)
             if telegram_message_not_found(exc):
                 try:
                     await store.delete_pinned_leaderboard(chat_id=chat_id)
@@ -667,6 +703,7 @@ async def _refresh_pinned_leaderboard_for_chat(
                 # The previous attempt may have edited successfully before crashing; still retry pinning.
                 pass
             else:
+                logging.warning("Pinned leaderboard edit failed chat_id=%s", chat_id, exc_info=True)
                 return False
     if message_id is None:
         response = (
@@ -681,10 +718,25 @@ async def _refresh_pinned_leaderboard_for_chat(
             logging.warning("Pinned leaderboard state save failed chat_id=%s", chat_id, exc_info=True)
             return False
     try:
+        denied = _PIN_DENIED_UNTIL.setdefault(bot, {})
+    except TypeError:  # Lightweight test doubles need not support weak references.
+        denied = {}
+    previous = denied.get(chat_id)
+    if previous and previous[0] == message_id and time.monotonic() < previous[1]:
+        return True  # The balance display is current; pinning is best effort.
+    try:
         await bot.pin_chat_message(chat_id=chat_id, message_id=message_id, disable_notification=True)
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
+        if isinstance(exc, TelegramBadRequest) and any(
+            marker in str(exc).lower() for marker in ("not enough rights", "chat_admin_required")
+        ):
+            denied[chat_id] = (message_id, time.monotonic() + PIN_PERMISSION_RETRY_SECONDS)
+            logging.warning("Leaderboard updated but pin permission unavailable chat_id=%s; retry in %ss",
+                            chat_id, PIN_PERMISSION_RETRY_SECONDS)
+            return True
         logging.warning("Pinned leaderboard pin failed chat_id=%s", chat_id, exc_info=True)
         return False
+    denied.pop(chat_id, None)
     return True
 
 
@@ -934,9 +986,129 @@ async def create_dispatcher(
     gpu_lock: asyncio.Lock,
     intent_router: IntentRouterProtocol,
     joke_selector: JokeSelector | None = None,
+    speech_synthesizer: SpeechSynthesizer | None = None,
+    voice_registry: VoiceRegistry | None = None,
 ) -> Dispatcher:
     dp = Dispatcher()
     profile_refresh_tasks: set[asyncio.Task[None]] = set()
+    profile_refresh_by_chat: dict[int, asyncio.Task[None]] = {}
+    profile_refresh_attempted_at: dict[int, float] = {}
+    voice_registry = voice_registry or VoiceRegistry(getattr(settings, "tts_local_voices_dir", Path("voices/local")))
+    speech_synthesizer = speech_synthesizer or SpeechSynthesizer(settings, voice_registry)
+    if getattr(settings, "tts_enabled", False):
+        await speech_synthesizer.check_available()
+    else:
+        speech_synthesizer.unavailable_reason = "disabled"
+    for diagnostic in voice_registry.diagnostics:
+        logging.warning("Voice registry: %s", diagnostic)
+    logging.info("TTS availability: %s", speech_synthesizer.unavailable_reason or "ready")
+
+    async def admit_speech(message: Message) -> VoicePreset | None:
+        if speech_synthesizer.unavailable_reason:
+            await reply_logged(message, "Озвучка недоступна. Проверьте настройки TTS и `./run.sh doctor`.")
+            return None
+        try:
+            selected = await store.get_chat_voice(message.chat.id)
+            preset, fallback = voice_registry.resolve(selected, settings.tts_default_voice)
+        except Exception:
+            await reply_logged(message, "Не удалось определить голос. Проверьте настройки озвучки.")
+            return None
+        if fallback:
+            await reply_logged(message, "Выбранный голос больше недоступен. Используется голос по умолчанию.")
+        return preset
+
+    async def deliver_speech(message: Message, text: str, preset: VoicePreset,
+                             *, persist_text: bool) -> OperationOutcome:
+        try:
+            async with speech_synthesizer.synthesize(text, preset, gpu_lock) as result:
+                with opik_stage("speech.upload", {"voice_id": preset.id, "audio_duration_s": result.duration}):
+                    response = await asyncio.wait_for(
+                        message.reply_voice(FSInputFile(result.path),
+                                            request_timeout=settings.tts_upload_timeout_seconds),
+                        timeout=settings.tts_upload_timeout_seconds,
+                    )
+                log_bot_response(action="voice", text="", response_message=response, source_message=message)
+                persisted = None
+                if persist_text:
+                    try:
+                        bot_id, name = sender_name(response)
+                        with opik_stage("speech.persist"):
+                            await store.save_message(
+                                chat_id=message.chat.id, message_id=response.message_id,
+                                chat_type=str(message.chat.type), sender_id=bot_id, sender_name=name,
+                                text=text, created_at=response.date, reply_to_message_id=message.message_id,
+                                origin="generated", kind="tts_text",
+                            )
+                        persisted = True
+                    except Exception:
+                        logging.warning("TTS persistence failed chat_id=%s", message.chat.id)
+                        persisted = False
+                return OperationOutcome(
+                    "voice", "partial" if persisted is False else "succeeded",
+                    "context_persistence_failed" if persisted is False else "ok",
+                    persisted=persisted, response_message_id=response.message_id,
+                    metadata={"tts_provider": result.provider, "tts_model": result.model,
+                              "voice_id": preset.id, "audio_duration_s": round(result.duration, 2)},
+                )
+        except Exception as exc:
+            logging.warning("TTS failed chat_id=%s exception_type=%s", message.chat.id, type(exc).__name__)
+            return OperationOutcome("voice", "failed", "speech_delivery_failed", metadata={"voice_id": preset.id})
+
+    async def run_voice(message: Message) -> OperationOutcome:
+        if not is_allowed(settings, message.chat.id):
+            return OperationOutcome("voice", "rejected", "access_denied")
+        parts = (message.text or "").split(maxsplit=1)
+        text = parts[1].strip() if len(parts) > 1 else ""
+        if not text or len(text) > getattr(settings, "tts_max_text_chars", 2000):
+            await reply_logged(message, "Использование: `/voice <текст>`. "
+                               f"Лимит: {getattr(settings, 'tts_max_text_chars', 2000)} символов.")
+            return OperationOutcome("voice", "rejected", "invalid_text")
+        preset = await admit_speech(message)
+        if preset is None:
+            return OperationOutcome("voice", "rejected", "tts_unavailable")
+        outcome = await deliver_speech(message, text, preset, persist_text=True)
+        if outcome.status == "failed":
+            await reply_logged(message, "Не удалось отправить озвучку. Попробуйте позже.")
+        elif outcome.persisted is False:
+            await reply_logged(message, generated_context_note(False))
+        return outcome
+
+    @dp.message(Command("voice"))
+    async def voice_command(message: Message) -> None:
+        await execute_slash_operation(message, "voice", run_voice(message))
+
+    async def run_voice_type(message: Message) -> OperationOutcome:
+        if not is_allowed(settings, message.chat.id):
+            return OperationOutcome("voice_type", "rejected", "access_denied")
+        parts = (message.text or "").split(maxsplit=1)
+        value = parts[1].strip() if len(parts) > 1 else ""
+        try:
+            if value == "reset":
+                await store.reset_chat_voice(message.chat.id)
+            elif value:
+                if value not in voice_registry.presets:
+                    await reply_logged(message, "Неизвестный голос. Список: `/voice_type`.")
+                    return OperationOutcome("voice_type", "rejected", "unknown_preset")
+                await store.set_chat_voice(message.chat.id, value)
+            selected = await store.get_chat_voice(message.chat.id)
+            try:
+                preset, fallback = voice_registry.resolve(selected, getattr(settings, "tts_default_voice", "anubarak"))
+                current = f"{preset.display_name} (`{preset.id}`), источник: " + ("chat" if selected and not fallback else "default")
+                if fallback:
+                    current += ". Выбранный голос больше недоступен; используется default."
+            except ValueError:
+                current = "Голос по умолчанию недоступен; проверьте TTS_DEFAULT_VOICE."
+            available = ", ".join(f"`{key}`" for key in voice_registry.presets) or "нет"
+            await reply_logged(message, f"Голос: {current}\nДоступны: {available}\n"
+                               "`/voice_type <id>` — выбрать, `/voice_type reset` — сбросить.")
+            return OperationOutcome("voice_type", "succeeded", "ok")
+        except Exception:
+            await reply_logged(message, "Не удалось сохранить или прочитать настройки голоса.")
+            return OperationOutcome("voice_type", "failed", "settings_persistence_failed")
+
+    @dp.message(Command("voice_type"))
+    async def voice_type_command(message: Message) -> None:
+        await execute_slash_operation(message, "voice_type", run_voice_type(message))
 
     async def execute_routed_operation(
         message: Message,
@@ -988,12 +1160,15 @@ async def create_dispatcher(
             model=resolved_intent_router_model(settings),
         )
 
+    @opik_operation(name="telegram.command")
     async def execute_slash_operation(
         message: Message,
         operation: str,
         action: Awaitable[OperationOutcome | None],
-    ) -> None:
+    ) -> OperationOutcome:
         started = time.perf_counter()
+        update_opik_span_metadata({"chat_id": message.chat.id, "message_id": message.message_id,
+                                  "operation": operation, "invocation": "slash"}, name=f"telegram.{operation}")
         try:
             result = await action
         except Exception as exc:
@@ -1011,33 +1186,58 @@ async def create_dispatcher(
                 elapsed_seconds=time.perf_counter() - started,
             )
             raise
+        outcome = result or OperationOutcome(operation, "succeeded", "completed")
         log_operation_outcome(
-            result or OperationOutcome(operation, "succeeded", "completed"),
+            outcome,
             chat_id=message.chat.id,
             message_id=message.message_id,
             invocation="slash",
             elapsed_seconds=time.perf_counter() - started,
         )
+        return outcome
 
     async def refresh_recent_profile_facts(chat_id: int, *, now: datetime) -> None:
         if not chat_memory:
             return
         try:
+            # Let a just-arriving foreground command join the shared-lock queue first.
+            await asyncio.sleep(2)
+            if gpu_lock.locked():
+                logging.info("Recent profile batch deferred chat_id=%s reason=gpu_busy", chat_id)
+                return
             async with gpu_lock:
                 try:
                     saved = await chat_memory.ensure_recent_profiles_current(chat_id, now=now)
                 finally:
-                    await chat_memory.unload()
+                    await getattr(chat_memory, "unload_profiles", chat_memory.unload)()
             if saved:
                 logging.info("Recent profile facts refreshed chat_id=%s saved=%s", chat_id, saved)
+        except ProfileExtractionError as exc:
+            logging.warning("Recent profile batch deferred chat_id=%s reason=%s", chat_id, exc)
         except Exception:  # noqa: BLE001
             logging.exception("Recent profile fact refresh failed chat_id=%s", chat_id)
 
     def schedule_profile_refresh(chat_id: int, *, now: datetime) -> None:
         if chat_memory:
-            task = asyncio.create_task(refresh_recent_profile_facts(chat_id, now=now))
+            pending = profile_refresh_by_chat.get(chat_id)
+            if pending and not pending.done():
+                return
+            elapsed = time.monotonic() - profile_refresh_attempted_at.get(chat_id, float("-inf"))
+            if elapsed < getattr(settings, "profile_refresh_interval_seconds", 120):
+                return
+            profile_refresh_attempted_at[chat_id] = time.monotonic()
+            # Background work is a separate trace, not a child of a completed voice request.
+            task = asyncio.create_task(refresh_recent_profile_facts(chat_id, now=now), context=Context())
+            profile_refresh_by_chat[chat_id] = task
             profile_refresh_tasks.add(task)
             task.add_done_callback(profile_refresh_tasks.discard)
+
+    @dp.shutdown()
+    async def stop_profile_refreshes() -> None:
+        tasks = list(profile_refresh_tasks)
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
 
     async def get_bot_identity(bot: Bot) -> tuple[int | None, str | None]:
         bot_id, username, _fallback_name = await cached_bot_identity(bot)
@@ -1068,6 +1268,9 @@ async def create_dispatcher(
             "`/casino` - spin the virtual slot for 10 chat points\n"
             "`/casino bot` - let the bot spin with its own points\n"
             "`/question 24h <text>` - chat with the assistant using recent context\n"
+            "`/ask [period] <question>` — то же, что /question\n"
+            "`/ask voice [period] <question>` — текстовый ответ и его озвучка\n"
+            "`/voice <текст>` — озвучить текст; `/voice_type [id|reset]` — голос чата\n"
             "`/alias add <name[, name]>` - add chat names for the bot\n"
             "`/alias list` - show configured bot names\n"
             "`/alias remove <name>` - remove a bot name\n"
@@ -1204,8 +1407,16 @@ async def create_dispatcher(
             f"opik_capture_content: `{settings.opik_capture_content}`\n"
             f"autonomous_jokes_enabled: `{settings.autonomous_jokes_enabled}`\n"
             f"autonomous_jokes_shadow_mode: `{settings.autonomous_jokes_shadow_mode}`\n"
+            f"autonomous_jokes_run_interval: `{settings.autonomous_jokes_run_interval}`\n"
+            f"autonomous_jokes_next_run_at: `{await store.get_autonomous_joke_next_run_at() or 'not scheduled'}`\n"
+            f"autonomous_jokes_max_jobs_per_run: `{settings.autonomous_jokes_max_jobs_per_run}`\n"
+            f"autonomous_jokes_session_limits: `{settings.autonomous_jokes_session_max_calls} calls / {settings.autonomous_jokes_session_max_seconds}s`\n"
+            f"autonomous_jokes_max_validation_failures: `{settings.autonomous_jokes_max_validation_failures}`\n"
             f"autonomous_joke_judge_model: `{settings.autonomous_joke_judge_model or (settings.ollama_model if settings.resolved_llm_provider == 'ollama' else settings.openai_model)}`\n"
             f"autonomous_joke_announce: `{settings.autonomous_joke_announce}`\n"
+            f"autonomous_joke_announcement_max_age: `{getattr(settings, 'autonomous_joke_announcement_max_age', '24h')}`\n"
+            f"autonomous_joke_announce_backlog: `{getattr(settings, 'autonomous_joke_announce_backlog', False)}`\n"
+            f"autonomous_joke_announcement_min_interval: `{getattr(settings, 'autonomous_joke_announcement_min_interval', '12h')}`\n"
             f"bot_auto_casino_enabled: `{settings.bot_auto_casino_enabled}`\n"
             f"bot_auto_casino_chance: `{settings.bot_auto_casino_chance}`\n"
             f"joke_awards_enabled: `{joke_awards_enabled(settings, message.chat.id)}`\n"
@@ -1672,6 +1883,7 @@ async def create_dispatcher(
         question: str,
         reply_to_source: bool = False,
         exclude_message_id: int | None = None,
+        voice_preset: VoicePreset | None = None,
     ) -> OperationOutcome:
         if not is_allowed(settings, message.chat.id):
             return OperationOutcome("question", "rejected", "access_denied")
@@ -1713,7 +1925,7 @@ async def create_dispatcher(
         )
         started = time.perf_counter()
         try:
-            async with gpu_lock:
+            async with traced_gpu_lock(gpu_lock, "question"):
                 try:
                     profile_context = ""
                     context_messages = messages
@@ -1775,14 +1987,16 @@ async def create_dispatcher(
                         bot_names=[item.alias for item in aliases],
                     )
                 finally:
-                    if use_memory and chat_memory:
-                        await chat_memory.unload()
-                    await chat_assistant.unload()
+                    with opik_stage("question.unload"):
+                        if use_memory and chat_memory:
+                            await chat_memory.unload()
+                        await chat_assistant.unload()
         except Exception as exc:  # noqa: BLE001
             logging.exception("Question failed")
             await edit_text_logged(
                 wait_message,
-                f"Failed to answer question: `{type(exc).__name__}: {exc}`",
+                ("Не удалось подготовить ответ. Попробуйте позже." if voice_preset
+                 else f"Failed to answer question: `{type(exc).__name__}: {exc}`"),
                 source_message=message,
             )
             return OperationOutcome(
@@ -1800,17 +2014,36 @@ async def create_dispatcher(
         )
         text = f"**Answer for {format_period(period_raw)}**\n{answer}"
         parts = split_telegram_text(text)
-        await edit_text_logged(wait_message, parts[0], source_message=message)
-        for part in parts[1:]:
-            await answer_logged(message, part)
-        persisted = await try_save_final_assistant_answer(settings, store, wait_message, text)
+        with opik_stage("question.text_delivery"):
+            await edit_text_logged(wait_message, parts[0], source_message=message)
+            for part in parts[1:]:
+                await (reply_logged if reply_to_source else answer_logged)(message, part)
+        with opik_stage("question.persist"):
+            persisted = await try_save_final_assistant_answer(settings, store, wait_message, text)
+        failures = [] if persisted else ["context_persistence_failed"]
+        speech_metadata: dict[str, object] | None = {"voice_id": voice_preset.id} if voice_preset else None
+        if voice_preset:
+            spoken = speech_text(answer)
+            if not spoken or len(spoken) > settings.tts_max_text_chars:
+                failures.append("voice_skipped_text_limit")
+                await reply_logged(message, "Ответ отправлен полностью текстом. Озвучка пропущена: превышен лимит текста.")
+            else:
+                speech = await deliver_speech(message, spoken, voice_preset, persist_text=False)
+                speech_metadata.update(speech.metadata or {})
+                speech_metadata["voice_response_message_id"] = speech.response_message_id
+                if speech.status != "succeeded":
+                    failures.append(speech.reason)
+                    await reply_logged(message, "Текстовый ответ готов, но отправить озвучку не удалось.")
+            if not persisted:
+                await reply_logged(message, generated_context_note(False))
         schedule_profile_refresh(message.chat.id, now=now)
         return OperationOutcome(
             "question",
-            "succeeded" if persisted else "partial",
-            "ok" if persisted else "context_persistence_failed",
+            "partial" if failures else "succeeded",
+            "+".join(failures) if failures else "ok",
             persisted=persisted,
             response_message_id=wait_message.message_id,
+            metadata=speech_metadata,
         )
 
     async def handle_addressed_message(message: Message, bot: Bot) -> bool:
@@ -2009,6 +2242,24 @@ async def create_dispatcher(
                 started=started,
             )
         return True
+
+    async def run_ask(message: Message) -> OperationOutcome:
+        if not is_allowed(settings, message.chat.id):
+            return OperationOutcome("question", "rejected", "access_denied")
+        parsed = parse_ask_command(message.text or "", settings.default_summary_period)
+        if not parsed:
+            await reply_logged(message, "Использование: `/ask [voice] [period] <вопрос>`.")
+            return OperationOutcome("question", "rejected", "missing_question")
+        period, question, voice = parsed
+        preset = await admit_speech(message) if voice else None
+        if voice and preset is None:
+            return OperationOutcome("question", "rejected", "tts_unavailable")
+        return await answer_chat_question(message, period_raw=period, question=question,
+                                          reply_to_source=voice, voice_preset=preset)
+
+    @dp.message(Command("ask"))
+    async def ask_command(message: Message) -> None:
+        await execute_slash_operation(message, "question", run_ask(message))
 
     @dp.message(Command("question"))
     async def question_command(message: Message) -> None:
@@ -2969,6 +3220,10 @@ async def create_dispatcher(
         request_message = request_message or source_message
         if not is_allowed(settings, request_message.chat.id):
             return
+        if source_message.from_user and source_message.from_user.id == bot.id:
+            if notify_disabled:
+                await reply_logged(request_message, "Это голосовое сообщение самого бота. Повторное распознавание не требуется.")
+            return
         update_opik_span_metadata(
             {
                 "chat_id": request_message.chat.id,
@@ -3602,11 +3857,16 @@ async def main() -> None:
             settings,
             model=settings.question_model or None,
             num_ctx=4096,
-            num_predict=160,
+            num_predict=256,
         )
     )
     intent_router = IntentRouter(router_llm)
-    chat_memory = ChatMemory(store, llm, settings) if settings.memory_enabled else None
+    chat_memory = ChatMemory(
+        store, llm, settings, profile_llm=build_llm_client(
+            settings, model=settings.profile_model or None,
+            num_ctx=min(settings.ollama_num_ctx, 4096), num_predict=settings.profile_num_predict,
+        ),
+    ) if settings.memory_enabled else None
     transcript_formatter_llm = (
         build_llm_client(
             settings,
@@ -3662,7 +3922,8 @@ async def main() -> None:
     if settings.autonomous_jokes_enabled:
         autonomous_selector = JokeSelector(
             build_llm_client(settings, model=settings.autonomous_joke_judge_model or None,
-                             num_ctx=4096, num_predict=160)
+                              num_ctx=4096, num_predict=256),
+            row_limit=min(settings.autonomous_jokes_block_messages, 50),
         )
         worker = AutonomousJokeWorker(
             settings=settings, store=store, selector=autonomous_selector, bot=bot, gpu_lock=gpu_lock

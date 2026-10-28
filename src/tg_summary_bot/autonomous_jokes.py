@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 import uuid
 from datetime import datetime, timedelta, timezone
 
@@ -9,11 +10,15 @@ from aiogram import Bot
 
 from tg_summary_bot.casino import automatic_casino_trigger
 from tg_summary_bot.config import Settings
-from tg_summary_bot.joke_awards import JokeSelection, JokeSelector
+from tg_summary_bot.joke_awards import JokeSelection, JokeSelectionResult, JokeSelector
 from tg_summary_bot.storage import JokeJob, MessageStore, StoredMessage
 
 
 RETRY_SECONDS = (60, 120, 240, 480, 900, 1800, 3600)
+TRANSIENT_SELECTION_ERRORS = frozenset({
+    "gpu_busy", "lost_lease", "timeout", "model_error", "qualification_timeout",
+    "qualification_model_error", "worker_error",
+})
 
 
 def retry_delay(attempt_count: int) -> timedelta:
@@ -50,6 +55,16 @@ class AutonomousJokeWorker:
         self.gpu_lock = gpu_lock
         self.worker_id = uuid.uuid4().hex
         self.start_after: datetime | None = None
+        # The first-start eligibility boundary is durable; this delivery boundary
+        # is per process. A restart must not replay a burst of old award notices.
+        self.announcement_start_at = datetime.now(timezone.utc)
+        self._gpu_owned = False
+        self._session_calls = 0
+        self._session_started = 0.0
+        self._run_calls = 0
+        self._run_sessions = 0
+        self._run_jobs = 0
+        self._pending_results: list[tuple[JokeJob, JokeSelectionResult]] = []
 
     async def run(self, stop_event: asyncio.Event) -> None:
         try:
@@ -84,6 +99,11 @@ class AutonomousJokeWorker:
         now = datetime.now(timezone.utc)
         if self.start_after is None:
             self.start_after = await self.store.get_or_create_autonomous_joke_start_at(now=now)
+        # Delivery must not wait behind an unrelated multi-batch GPU selection.
+        await self._run_outbox()
+        next_run_at = await self.store.get_autonomous_joke_next_run_at()
+        if next_run_at and datetime.fromisoformat(next_run_at) > now:
+            return
         await self.store.plan_autonomous_joke_jobs(
             allowed_chat_ids=self.settings.allowed_chat_ids,
             disabled_chat_ids=self.settings.joke_awards_disabled_chat_ids,
@@ -93,20 +113,97 @@ class AutonomousJokeWorker:
             max_block_age=self.settings.autonomous_jokes_max_block_age,
             now=now,
         )
-        job = await self.store.claim_due_joke_job(
-            worker_id=self.worker_id,
-            now=now,
-            lease_seconds=self.settings.autonomous_jokes_lease_seconds,
-            allowed_chat_ids=self.settings.allowed_chat_ids,
-            disabled_chat_ids=self.settings.joke_awards_disabled_chat_ids,
-            start_after=self.start_after,
-        )
-        if job:
-            await self._run_job(job)
-        await self._run_outbox()
+        # Do not claim (or consume a model-failure attempt) while foreground work owns the GPU.
+        try:
+            await asyncio.wait_for(self.gpu_lock.acquire(), timeout=0.01)
+        except TimeoutError:
+            return
+        self._start_gpu_session()
+        self._run_calls = 0
+        self._run_sessions = 0
+        jobs = 0
+        started = time.monotonic()
+        try:
+            await self._run_selection_jobs()
+            jobs = self._run_jobs
+        finally:
+            await self._release_gpu_session()
+        if jobs:
+            logging.info(
+                "Joke run finished jobs=%s model_calls=%s gpu_sessions=%s elapsed_s=%.3f next_run_at=%s",
+                jobs, self._run_calls, self._run_sessions, time.monotonic() - started,
+                await self.store.get_autonomous_joke_next_run_at(),
+            )
+            await self._run_outbox()
 
-    async def _select_batch(self, job: JokeJob, candidates: list[StoredMessage]) -> JokeSelection:
+    def _start_gpu_session(self) -> None:
+        self._gpu_owned = True
+        self._session_calls = 0
+        self._session_started = time.monotonic()
+
+    def _session_full(self) -> bool:
+        return (self._session_calls >= getattr(self.settings, "autonomous_jokes_session_max_calls", 8)
+                or time.monotonic() - self._session_started >= getattr(
+                    self.settings, "autonomous_jokes_session_max_seconds", 120))
+
+    async def _release_gpu_session(self) -> None:
+        if self._gpu_owned:
+            try:
+                if self._session_calls:
+                    self._run_sessions += 1
+                    await self.selector.unload()
+            finally:
+                self._gpu_owned = False
+                self.gpu_lock.release()
+                if self._session_calls:
+                    logging.info("Joke GPU session finished model_calls=%s elapsed_s=%.3f",
+                                 self._session_calls, time.monotonic() - self._session_started)
+        # Award accounting must always happen AFTER releasing the shared GPU lock.
+        while self._pending_results:
+            job, result = self._pending_results[0]
+            await self._finish_job(job, result)
+            self._pending_results.pop(0)
+
+    async def _run_selection_jobs(self) -> None:
+        self._run_jobs = 0
+        claimed_ids: set[int] = set()
+        for index in range(getattr(self.settings, "autonomous_jokes_max_jobs_per_run", 4)):
+            job = await self.store.claim_due_joke_job(
+                worker_id=self.worker_id,
+                now=datetime.now(timezone.utc),
+                lease_seconds=self.settings.autonomous_jokes_lease_seconds,
+                allowed_chat_ids=self.settings.allowed_chat_ids,
+                disabled_chat_ids=self.settings.joke_awards_disabled_chat_ids,
+                start_after=self.start_after,
+                run_interval=(getattr(self.settings, "autonomous_jokes_run_interval", timedelta(hours=6))
+                              if index == 0 else None),
+                exclude_job_ids=claimed_ids,
+            )
+            if job is None:
+                break
+            self._run_jobs += 1
+            claimed_ids.add(job.job_id)
+            await self._run_job(job)
+            if self._session_full():
+                break
+
+    async def _select_batch(self, job: JokeJob, candidates: list[StoredMessage], *, qualification: bool = False) -> JokeSelection:
+        if self._session_full():
+            await self._release_gpu_session()
+            # FIFO admission lets queued user requests run. Keep in-flight tournament
+            # progress in this coroutine instead of restarting it when the GPU is busy.
+            await asyncio.sleep(0)
+            await self.gpu_lock.acquire()
+            self._start_gpu_session()
         # The job is fenced before every model call; a stale worker stops immediately.
+        # Completed selections await an unlocked commit. Keep their leases alive
+        # while reusing this model for another job in the same GPU session.
+        for pending_job, _result in self._pending_results:
+            await self.store.renew_joke_job_lease(
+                job_id=pending_job.job_id, lease_token=pending_job.lease_token,
+                now=datetime.now(timezone.utc),
+                lease_seconds=self.settings.autonomous_jokes_lease_seconds,
+            )
         if not job.lease_token or not await self.store.renew_joke_job_lease(
             job_id=job.job_id,
             lease_token=job.lease_token,
@@ -114,43 +211,70 @@ class AutonomousJokeWorker:
             lease_seconds=self.settings.autonomous_jokes_lease_seconds,
         ):
             return JokeSelection(False, None, "", valid=False, error="lost_lease")
+        self._session_calls += 1
+        self._run_calls += 1
+        started = time.monotonic()
+        phase = "qualify" if qualification else "select"
+        logging.info("Joke model call started job_id=%s chat_id=%s attempt=%s phase=%s candidates=%s",
+                     job.job_id, job.chat_id, job.attempt_count, phase, len(candidates))
         try:
-            await asyncio.wait_for(self.gpu_lock.acquire(), timeout=0.01)
-        except TimeoutError:
-            return JokeSelection(False, None, "", valid=False, error="gpu_busy")
-        try:
-            return await self.selector._select_from(candidates)
+            return await (self.selector._qualify(candidates[0]) if qualification else self.selector._select_from(candidates))
         finally:
-            try:
-                await self.selector.unload()
-            finally:
-                self.gpu_lock.release()
-            await asyncio.sleep(0)
+            logging.info("Joke model call finished job_id=%s phase=%s elapsed_s=%.3f",
+                         job.job_id, phase, time.monotonic() - started)
 
     async def _run_job(self, job: JokeJob) -> None:
         assert job.lease_token
+        started = time.monotonic()
+        calls_before = self._run_calls
+        logging.info("Joke job started job_id=%s chat_id=%s attempt=%s messages=%s validation_failures=%s",
+                     job.job_id, job.chat_id, job.attempt_count, job.message_count, job.validation_failures)
         try:
             messages = await self.store.get_joke_job_messages(job.job_id)
             result = await self.selector.choose_messages(
                 messages,
                 select_batch=lambda candidates: self._select_batch(job, candidates),
+                qualify_batch=lambda candidate: self._select_batch(job, [candidate], qualification=True),
             )
-            if result.status == "invalid":
-                if job.attempt_count >= 10:
-                    logging.error(
-                        "Autonomous joke job retry threshold exceeded job_id=%s attempts=%s reason=%s",
-                        job.job_id,
-                        job.attempt_count,
-                        result.reason,
-                    )
-                await self.store.retry_joke_job(
-                    job_id=job.job_id,
-                    lease_token=job.lease_token,
-                    error_code=result.reason or "selector_invalid",
-                    next_attempt_at=datetime.now(timezone.utc) + retry_delay(job.attempt_count),
-                )
-                return
-            await self.store.finalize_autonomous_joke_job(
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            logging.exception("Autonomous joke job failed job_id=%s", job.job_id)
+            result = JokeSelectionResult("error", reason="worker_error")
+        logging.info(
+            "Joke selection completed job_id=%s chat_id=%s attempt=%s status=%s reason=%s "
+            "pages=%s rounds=%s model_calls=%s elapsed_s=%.3f",
+            job.job_id, job.chat_id, job.attempt_count, result.status,
+            result.reason if result.status in {"invalid", "error"} else result.status,
+            result.pages, result.tournament_rounds, self._run_calls - calls_before,
+            time.monotonic() - started,
+        )
+        self._pending_results.append((job, result))
+
+    async def _finish_job(self, job: JokeJob, result: JokeSelectionResult) -> None:
+        assert job.lease_token
+        if result.status in {"invalid", "error"}:
+            reason = result.reason or "selector_invalid"
+            validation_failure = result.status == "invalid" and reason not in TRANSIENT_SELECTION_ERRORS
+            limit = getattr(self.settings, "autonomous_jokes_max_validation_failures", 3)
+            next_attempt_at = datetime.now(timezone.utc) + retry_delay(job.attempt_count)
+            committed = await self.store.fail_joke_job(
+                job_id=job.job_id, lease_token=job.lease_token, error_code=reason,
+                next_attempt_at=next_attempt_at, validation_failure=validation_failure,
+                max_validation_failures=limit,
+            )
+            quarantined = validation_failure and job.validation_failures + 1 >= limit
+            logging.log(
+                logging.WARNING if quarantined else logging.INFO,
+                "Joke job deferred job_id=%s chat_id=%s attempt=%s reason=%s validation_failures=%s "
+                "quarantined=%s next_attempt_at=%s committed=%s",
+                job.job_id, job.chat_id, job.attempt_count, reason,
+                job.validation_failures + int(validation_failure), quarantined,
+                None if quarantined else next_attempt_at.isoformat(), committed,
+            )
+            return
+        try:
+            committed = await self.store.finalize_autonomous_joke_job(
                 job_id=job.job_id,
                 lease_token=job.lease_token,
                 source_message_id=result.winner.message_id if result.winner else None,
@@ -170,10 +294,10 @@ class AutonomousJokeWorker:
                     and job.chat_id not in self.settings.casino_disabled_chat_ids else None
                 ),
             )
-        except asyncio.CancelledError:
-            raise
+            logging.info("Joke job committed job_id=%s chat_id=%s status=%s",
+                         job.job_id, job.chat_id, committed.status)
         except Exception:  # noqa: BLE001
-            logging.exception("Autonomous joke job failed job_id=%s", job.job_id)
+            logging.exception("Autonomous joke commitment failed job_id=%s", job.job_id)
             await self.store.retry_joke_job(
                 job_id=job.job_id,
                 lease_token=job.lease_token,
@@ -182,6 +306,12 @@ class AutonomousJokeWorker:
             )
 
     async def _run_outbox(self) -> None:
+        # Retire expired notices quickly, but send at most one real action per pass.
+        for _ in range(10):
+            if not await self._run_outbox_once():
+                break
+
+    async def _run_outbox_once(self) -> bool | None:
         # Rollback to shadow mode also pauses work committed by an earlier live run.
         if self.settings.autonomous_jokes_shadow_mode:
             return
@@ -198,6 +328,7 @@ class AutonomousJokeWorker:
             disabled_chat_ids=self.settings.joke_awards_disabled_chat_ids,
             start_after=self.start_after,
             allowed_actions=allowed_actions,
+            prioritize_notifications=True,
         )
         if not outbox or not outbox.lease_token:
             return
@@ -207,14 +338,50 @@ class AutonomousJokeWorker:
                 job = await self.store.get_joke_job(outbox.job_id)
                 if not job or not job.winner_participant_name or job.winner_source_text is None:
                     raise RuntimeError("missing committed award snapshot")
+                now = datetime.now(timezone.utc)
+                try:
+                    awarded_at = datetime.fromisoformat(job.completed_at or "")
+                    if awarded_at.tzinfo is None:
+                        awarded_at = awarded_at.replace(tzinfo=timezone.utc)
+                    max_age = getattr(self.settings, "autonomous_joke_announcement_max_age", timedelta(hours=24))
+                    expired = now - awarded_at > max_age
+                    reason = "announcement_expired" if expired else None
+                    if (not reason and not getattr(self.settings, "autonomous_joke_announce_backlog", False)
+                            and awarded_at < self.announcement_start_at):
+                        reason = "announcement_before_worker_start"
+                except (TypeError, ValueError):
+                    reason = "announcement_missing_award_time"
+                if reason:
+                    retired = await self.store.complete_joke_outbox(
+                        outbox_id=outbox.outbox_id, lease_token=outbox.lease_token,
+                        status="skipped", reason=reason,
+                    )
+                    logging.info("Joke notification retired job_id=%s outbox_id=%s reason=%s committed=%s",
+                                 job.job_id, outbox.outbox_id, reason, retired)
+                    return retired
+                available_at = await self.store.reserve_joke_announcement(
+                    chat_id=job.chat_id, outbox_id=outbox.outbox_id, lease_token=outbox.lease_token,
+                    now=now, min_interval=getattr(self.settings, "autonomous_joke_announcement_min_interval", timedelta(hours=12)),
+                )
+                if available_at is not None:
+                    await self.store.retry_joke_outbox(
+                        outbox_id=outbox.outbox_id, lease_token=outbox.lease_token,
+                        error_code="announcement_rate_limited", next_attempt_at=available_at,
+                    )
+                    logging.info("Joke notification deferred job_id=%s chat_id=%s reason=rate_limit until=%s",
+                                 job.job_id, job.chat_id, available_at.isoformat())
+                    return True  # Other chats and non-notification actions may proceed.
+                awarded_label = awarded_at.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
                 sent = await self.bot.send_message(
                     job.chat_id,
-                    f"Лучшая шутка: {job.winner_participant_name}: «{job.winner_source_text[:1000]}» (+10 очков)",
+                    f"Лучшая шутка: {job.winner_participant_name}: «{job.winner_source_text[:1000]}»\n"
+                    f"+10 очков начислено {awarded_label}.",
                 )
                 await self.store.complete_joke_outbox(
                     outbox_id=outbox.outbox_id, lease_token=outbox.lease_token,
                     telegram_message_id=getattr(sent, "message_id", None),
                 )
+                logging.info("Joke notification sent job_id=%s outbox_id=%s", job.job_id, outbox.outbox_id)
             elif outbox.action == "award_leaderboard_refresh":
                 from tg_summary_bot.bot import refresh_pinned_leaderboard_for_chat
 

@@ -15,6 +15,7 @@ A safe Telegram bot that stores new chat messages and produces short AI summarie
 - splits long discussions into chunks and merges the final summary;
 - restricts access with `ALLOWED_CHAT_IDS`;
 - optionally transcribes Telegram voice/audio messages locally with `faster-whisper`;
+- optionally generates Telegram voice replies with CosyVoice 3: `/voice`, `/ask voice`, `/voice_type`;
 - manually recognizes text from images with an Ollama vision model;
 - makes simple image memes with `/meme` from a replied/latest image;
 - manually recognizes videos through sampled key frames and auto-recognizes Telegram video notes;
@@ -32,6 +33,169 @@ A safe Telegram bot that stores new chat messages and produces short AI summarie
 - In channels, the bot must be an administrator. It can receive new channel posts, but it will not receive comments from a linked discussion group unless it is added there too.
 - In direct chats, the bot only sees messages sent directly to it.
 - The official cloud Telegram Bot API can reject large media downloads with `file is too big`. By default `TELEGRAM_DOWNLOAD_LIMIT_MB=0`, so the bot tries the download and handles Telegram's actual answer. Set a positive value only when you want an early local cutoff.
+
+## Voice generation (Feature 06)
+
+TTS is disabled by default and uses a separate Python 3.10 environment. The bot stays
+on Python 3.11+; its mandatory dependencies do not include torch or CosyVoice.
+`install-voice` and `install-voice-cuda` still install **Whisper transcription**.
+
+```bash
+./run.sh install-tts-cosyvoice3
+```
+
+This explicit helper installs the pinned experiment baseline and downloads about
+5 GB of model files. It requires `uv`, Git, an NVIDIA/CUDA installation, and ffmpeg
+with `libopus` and the `rubberband` filter. It is never run at startup or by tests.
+Upstream revision: `074ca6dc9e80a2f424f1f74b48bdd7d3fea531cc`.
+Model: `FunAudioLLM/Fun-CosyVoice3-0.5B-2512`, revision
+`29e01c4e8d000f4bcd70751be16fa94bf3d85a18` (pinned from the model catalogue;
+real synthesis on this installation remains a manual check).
+PyTorch/torchaudio: 2.3.1/cu121; ONNX Runtime GPU: 1.18.0.
+See `scripts/install_tts_cosyvoice3.sh` for the remaining pinned baseline dependencies.
+
+Set these values in your installation configuration:
+
+```dotenv
+TTS_ENABLED=true
+TTS_PROVIDER=cosyvoice3
+TTS_DEFAULT_VOICE=anubarak
+TTS_PYTHON_PATH=.venv-cosyvoice3/bin/python
+TTS_COSYVOICE_UPSTREAM_DIR=tts/cosyvoice3/upstream
+TTS_MODEL_DIR=tts/cosyvoice3/models/Fun-CosyVoice3-0.5B-2512
+TTS_LOCAL_VOICES_DIR=voices/local
+TTS_OUTPUT_DIR=data/tts
+TTS_MAX_TEXT_CHARS=2000
+TTS_MAX_AUDIO_SECONDS=180
+TTS_TIMEOUT_SECONDS=180
+TTS_ENCODING_TIMEOUT_SECONDS=60
+TTS_UPLOAD_TIMEOUT_SECONDS=60
+```
+
+Paths resolve against the installation working directory; bundled presets resolve
+against the installed package. The helper accepts exported `TTS_PYTHON_PATH`,
+`TTS_COSYVOICE_UPSTREAM_DIR`, and `TTS_MODEL_DIR`; it does not read `.env`.
+After configuring, run `./run.sh doctor`. Disabled or broken TTS leaves ordinary
+text commands usable. Startup checks runner/imports/CUDA and ffmpeg capabilities
+without loading the synthesis model. No model is downloaded automatically.
+
+| Command | Result |
+| --- | --- |
+| `/voice <text>` | Speak supplied text as an OGG/Opus voice reply to the command. |
+| `/ask [period] <question>` | Alias of `/question` with its contextual answer behavior. |
+| `/ask voice [period] <question>` | Generate one answer, send all text parts as replies, then speak only its body. |
+| `/voice_type` | Show effective voice, selection source, available IDs and usage. |
+| `/voice_type <id>` | Save this chat's selection; available to any participant in an allowed chat. |
+| `/voice_type reset` | Remove the override and use the bot default. |
+
+Only the first `/ask` argument `voice` is a flag. `/question voice ...` remains a
+literal question. Standard `@bot_username` suffixes work. Voice settings and synthesis
+are explicit slash commands, not intent-router actions.
+
+The bundled `anubarak` voice uses the original owner-confirmed
+`nerubiancryptlordpissed3.ogg`, converted to 24 kHz mono PCM WAV (8.93 seconds), with
+the exact transcript «Мы, нежить, народ работящий. Такая уж наша тяжкая доля.».
+Zero-shot generation always uses model speed **1.0**, followed by `atempo=0.85`,
+pitch **−1 semitone with preserved formants**, then Opus encoding. No substitute
+effect is used if rubberband is unavailable.
+
+The second bundled voice is **`cartman` / Картман**. It uses the user-selected
+`experiments/cartman-voice/output/separated/cartman_002_ai_mdx_extra.wav` and the
+exact contents of `output/transcripts/cartman_002_raw.txt`. The 11.4-second reference
+is converted to mono PCM16 24 kHz for package compatibility; no tempo/pitch effects
+or normalization are applied. The supplied transcript remains the experiment's ASR
+draft; independent listening verification was not performed during bundling.
+Generated speech uses model speed **1.0**, with **no atempo or rubberband filters**;
+only OGG/Opus encoding and Telegram-compatible channel/sample-rate conversion remain.
+
+Restart the bot to load the preset, then select it for the current chat:
+
+```text
+/voice_type cartman
+/voice Привет! У меня есть отличный план.
+```
+
+Use `/voice_type reset` to return to the configured default. To make Cartman the
+bot-wide default instead, set `TTS_DEFAULT_VOICE=cartman` and restart.
+
+Additional voices live in the fully ignored `voices/local/<directory>/` (or configured
+local root). Copy the bundled `preset.json` schema and provide an original PCM WAV
+reference with an exact transcript. IDs use lowercase ASCII letters/digits/underscore/
+hyphen; `reset` is reserved. Version 1 supports `ru/en/zh/ja/ko/de/fr/es/it`, speed
+0.5–2, pitch −12–12 semitones and boolean `preserve_formants`. References
+must resolve within the preset directory, including symlinks. Invalid and duplicate
+local entries are diagnosed and excluded; bundled IDs cannot be silently replaced.
+Restart after library edits. A removed chat voice falls back to the valid configured
+default with a notice. An invalid default makes TTS unavailable.
+
+`MessageStore.init()` idempotently creates `chat_voice_settings(chat_id, voice_id,
+updated_at)`; no manual SQL migration is required. Direct speech is persisted only
+after upload as `generated/tts_text` with reply linkage and is not a joke source.
+Voice answers keep one canonical `assistant/assistant_answer`; the audio is not a
+second eligible source. No outgoing voice invokes Whisper or transcript formatting,
+including automatic updates and slash/routed `/transcribe` replies to this bot.
+Human voice transcription keeps its existing behavior.
+
+Oversized direct text is rejected before work. Oversized generated answers are
+delivered fully as text with a voice-skipped notice, without truncation or rewriting.
+If synthesis, encoding or upload fails, the text remains available; persistence and
+voice errors both appear in the partial outcome. Each operation has its own temporary
+directory kept until upload finishes. Timed-out/cancelled runner and ffmpeg processes
+are terminated, escalated to kill if needed, and awaited before unlock/cleanup.
+The synthesis execution timeout starts after acquiring the existing shared GPU lock;
+encoding and upload have separate limits.
+
+For the **manual acceptance smoke**, listen to the original reference and short/long
+Russian outputs; check tempo, pitch, Telegram playback and direct reply IDs. Measure
+cold/warm time and VRAM for LLM → TTS with `OLLAMA_UNLOAD_AFTER_TASK=true`.
+Ollama unload failures and other resident models may still retain VRAM; serialization
+alone cannot prevent OOM. Whisper creates/deletes its model per transcription call.
+No external processes are killed. GPU synthesis, listening and Telegram playback
+have not been verified by the isolated automated tests.
+
+### Runtime stabilization and voice tracing
+
+Background participant-profile refresh uses **one batch per attempt**, bounded by
+`PROFILE_BATCH_CHARS=2000` (including rendered headers) and `PROFILE_BATCH_MESSAGES=8`.
+It asks for at most one useful source-backed fact, using a separate profile client
+with `PROFILE_NUM_PREDICT=256` for Ollama and a `PROFILE_TIMEOUT_SECONDS=60` request
+limit. `PROFILE_MODEL` optionally chooses an already-installed model; empty uses the
+main LLM model. These settings do not change ordinary answer generation.
+
+Profile work has a two-second foreground grace period, skips an already-busy GPU,
+coalesces overlapping requests per chat, and attempts at most once per
+`PROFILE_REFRESH_INTERVAL_SECONDS=120`. It releases the shared lock after the batch
+and model-unload attempt. The request timeout does not include lock wait or unload;
+Ollama unloading keeps its existing bounded, best-effort behavior.
+Invalid/truncated JSON and timeouts do **not** advance the checkpoint. The next
+admitted refresh can retry. A timestamp/message-ID cursor prevents loss when smaller
+batches split messages sharing the same timestamp. Startup idempotently adds nullable
+`chat_profile_state.processed_message_id`; legacy timestamp checkpoints are preserved.
+Oversized messages are clipped only in the model input; raw stored messages remain intact.
+
+With Opik enabled, slash commands have end-to-end `telegram.voice` / `telegram.question`
+traces. Speech spans show GPU wait, synthesis, encoding, validation, upload, and direct
+voice persistence. Voice-answer traces also include model unload, text delivery and
+canonical persistence, with existing LLM spans nested under the command. Stage metadata
+does not include spoken text, reference paths, audio files or raw provider exceptions.
+Handled failures/partial outcomes are searchable as trace errors without re-failing the
+Telegram handler. Profile refresh is an independent trace; invalid JSON is a failure.
+
+An optional **synthetic** ingestion check is available:
+
+```bash
+.venv/bin/python tests/voice_trace_smoke.py
+```
+
+It uses the existing Opik SDK configuration and publishes tagged verification traces.
+It uses fake model/ffmpeg/Telegram calls and a temporary SQLite database: no production
+data, `.env`, GPU work or Telegram requests. It is not part of the offline unit suite.
+
+Leaderboard `message is not modified` responses are quiet successes. A confirmed lack
+of pin permission no longer retries an otherwise-current balance display forever:
+pinning becomes best effort, with a ten-minute permission retry cooldown per bot/chat/
+message. Editing remains active. Transient failures stay retryable, and only confirmed
+not-found errors recreate the message.
 
 ## OpenAI API vs ChatGPT Subscription
 
@@ -227,6 +391,83 @@ of 50 eligible messages, or aged 5-49-message blocks after 3 days. Each block ha
 worth `+10`; shadow mode records selections without changing balances or Telegram messages. Enabled
 `/summary` is read-only and renders an already committed autonomous result when available. `/compare`
 never selects jokes or changes balances.
+
+Before a selected winner can earn points, a separate qualification call checks only its
+visible text. It must identify wordplay, irony, absurdity, a punchline, or a comic comparison
+and quote supporting text exactly. Candidates depending on an unseen image/chat context
+are declined, including contradictory rationales claiming missing context. A plain reaction
+or insult is not enough; rough language and short self-contained jokes remain allowed.
+The primary selector's JSON contract is unchanged. Qualification uses its own strict schema;
+invalid JSON/IDs lead to retry without points, while a valid rejection means no joke in that
+block. This adds one model call for a selected finalist, with the same shared GPU lock,
+per-call timeout and lease renewal. The judge output budget is 256 tokens. Humour remains a
+model judgment; the qualification guard does not guarantee agreement with every human rating.
+
+Autonomous model work is scheduled in batches, independently of the 30-second outbox
+poll. `AUTONOMOUS_JOKES_RUN_INTERVAL=6h` admits a run at most once per six hours, with
+up to `AUTONOMOUS_JOKES_MAX_JOBS_PER_RUN=4` ready jobs. The first nonempty run can start
+after startup grace; empty queues and a busy GPU do not consume the interval. Admission
+is persisted atomically with the first job claim, so restarting does not reset it.
+Retries also wait for a scheduled run, even when their individual backoff has elapsed.
+Busy chats may accumulate a backlog at these conservative defaults; increase the job
+limit or shorten the run interval if faster processing is needed.
+
+The autonomous judge accepts up to 50 candidates per prompt within the existing character
+budget: a short 50-message block needs one selection plus one qualification, rather than
+three selection pages, a tournament and qualification. Longer blocks still use bounded
+pages. The model stays loaded across pages, tournament, qualification and adjacent jobs.
+`AUTONOMOUS_JOKES_SESSION_MAX_CALLS=8` and `AUTONOMOUS_JOKES_SESSION_MAX_SECONDS=120`
+bound each GPU session. These are checked between calls, not a cancellation deadline:
+one in-flight call and model unloading can extend the time limit. At a boundary the worker
+unloads under the shared lock, releases it and lets queued foreground work run before
+continuing the same tournament. Normal configured Ollama unload/keep-alive behavior applies.
+Award writes occur only after releasing the GPU lock.
+
+`AUTONOMOUS_JOKES_MAX_VALIDATION_FAILURES=3` quarantines a job after repeated malformed
+model results, without points or notifications. The separate durable `validation_failures`
+counter excludes GPU contention, lost leases, timeouts, model/network errors and storage
+errors. Existing jobs start this new counter at zero on upgrade. Quarantined rows retain
+their immutable source block and error code; `quarantined_at` excludes them from automatic
+claims (their underlying status remains `retry` for legacy SQLite CHECK compatibility).
+They require explicit maintenance to resume, not a restart. Logs show job/chat/attempt,
+safe error code, next attempt, model-call count, GPU-session count and elapsed time; no
+source text or model-generated rationale is added to those events.
+
+Award delivery is separate from accounting. `AUTONOMOUS_JOKE_ANNOUNCEMENT_MAX_AGE=24h`
+limits how long a committed award can wait for a public notification. Older notices are
+retired as `skipped` with `announcement_expired`; **earned points and ledger rows are never
+removed or awarded again**. Fresh notices take priority and are delivered before unrelated
+model selection work. Notices include the original award time in UTC, so delivery time is
+not presented as a new credit. Up to ten expired notices are retired per delivery pass,
+with at most one actual Telegram action per pass. A newly awarded aged-message block can
+still be announced: freshness is measured from award commitment, not source-message age.
+Allowlisted/disabled-chat, shadow, activation and action-pause policies continue to apply;
+paused notices are assessed for expiry only when their delivery is enabled again. Existing
+pending notices use this policy after the bot restarts; no schema migration is needed.
+
+`AUTONOMOUS_JOKE_ANNOUNCE_BACKLOG=false` additionally prevents startup catch-up bursts:
+notices for awards committed **before the current worker started** are skipped as
+`announcement_before_worker_start`, even when they are less than 24 hours old. Awards
+committed after startup can be announced normally, including newly processed aged blocks.
+The cutoff is per worker instance, independent of the durable first-activation boundary.
+Points, past awards, leaderboard updates and casino decisions are unchanged. Set backlog
+to true only when catch-up delivery is wanted; the age limit still applies. Chat/access,
+shadow and action-pause policies still gate any retirement or delivery.
+
+`AUTONOMOUS_JOKE_ANNOUNCEMENT_MIN_INTERVAL=12h` is the **per-chat posting limit**:
+automatic best-joke notices are sent no more often than once per half day in each chat.
+This is separate from block size, notice age, and startup-backlog handling. Points and
+leaderboard updates still proceed; excess notices are deferred with
+`announcement_rate_limited` and are subject to the usual freshness/startup policy later.
+Other chats are independent and are not blocked by one chat's cooldown.
+
+SQLite `chat_joke_announcement_state` stores the latest attempt and confirmed delivery
+timestamps. Startup creates it idempotently and seeds confirmed deliveries from existing
+outbox history, so upgrading or restarting cannot reset the hour. Send admission uses
+the current outbox lease and an atomic transaction across workers. An uncertain/failed
+send also consumes the cooldown, preventing rapid retries that could duplicate a delivered
+message. Confirmed completion records its delivery timestamp atomically with outbox completion.
+No manual SQL migration or balance adjustment is needed. `/stats` shows the configured interval.
 
 Configure rollout with `AUTONOMOUS_JOKES_SHADOW_MODE`, block/partial/age settings,
 startup grace, poll and lease intervals, optional `AUTONOMOUS_JOKE_JUDGE_MODEL`, and

@@ -9,7 +9,7 @@ from types import SimpleNamespace
 
 import aiosqlite
 
-from tg_summary_bot.joke_awards import JokeSelector, parse_joke_selection
+from tg_summary_bot.joke_awards import QUALIFICATION_SYSTEM_PROMPT, JokeSelector, parse_joke_selection
 from tg_summary_bot.storage import (
     ELIGIBLE_MESSAGE_PROVENANCE,
     MessageStore,
@@ -22,6 +22,12 @@ from tg_summary_bot.storage import (
 NOW = datetime(2026, 1, 1, tzinfo=timezone.utc)
 
 
+def qualified_response(candidate):
+    return json.dumps({"has_joke": True, "source_message_id": candidate["target_message_id"],
+                       "humor_type": "wordplay", "evidence_quote": candidate["text"].split(" […] ")[0][:60],
+                       "needs_context": False, "reason": "Игра слов в видимом тексте."})
+
+
 class FakeLLM:
     def __init__(self, responses: list[str]) -> None:
         self.responses = responses
@@ -30,6 +36,8 @@ class FakeLLM:
 
     async def complete(self, **kwargs: object) -> str:
         self.calls.append(kwargs)
+        if kwargs["system"] == QUALIFICATION_SYSTEM_PROMPT:
+            return qualified_response(json.loads(kwargs["user"])["candidates"][0])
         return self.responses.pop(0)
 
     async def unload(self) -> None:
@@ -233,6 +241,8 @@ class JokeSelectorTests(unittest.IsolatedAsyncioTestCase):
                     async def complete(**kwargs):
                         prompts.append(kwargs["user"])
                         candidates = json.loads(kwargs["user"])["candidates"]
+                        if kwargs["system"] == QUALIFICATION_SYSTEM_PROMPT:
+                            return qualified_response(candidates[0])
                         return json.dumps(dict(has_joke=True, reason="test",
                             source_message_id=candidates[-1]["target_message_id"]))
 

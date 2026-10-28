@@ -11,6 +11,7 @@ from tg_summary_bot.bot import (
     refresh_recovered_casino_leaderboards, render_leaderboard,
 )
 from tg_summary_bot.storage import PinnedLeaderboard, PointBalance
+import tg_summary_bot.bot as bot_module
 
 
 class FakeBot:
@@ -69,6 +70,42 @@ class FakeStore:
 
 
 class PinnedLeaderboardTests(unittest.IsolatedAsyncioTestCase):
+    async def test_not_modified_is_quiet_success_and_still_repins(self):
+        bot = FakeBot(edit_error=TelegramBadRequest(method=SendMessage(chat_id=1, text="x"),
+                                                  message="Bad Request: message is not modified"))
+        store = FakeStore(PinnedLeaderboard(1, 44, "now"))
+        with patch.object(bot_module.logging, "warning") as warning:
+            self.assertTrue(await refresh_pinned_leaderboard_for_chat(bot=bot, store=store, chat_id=1))
+            warning.assert_not_called()
+        self.assertEqual(len(bot.pins), 1)
+        self.assertFalse(store.deleted)
+
+    async def test_pin_permission_is_best_effort_with_cooldown_and_recovery(self):
+        bot = FakeBot(pin_error=TelegramBadRequest(method=SendMessage(chat_id=1, text="x"),
+                                                 message="Bad Request: not enough rights to manage pinned messages in the chat"))
+        store = FakeStore(PinnedLeaderboard(1, 44, "now"))
+        with self.assertLogs(level="WARNING") as captured:
+            self.assertTrue(await refresh_pinned_leaderboard_for_chat(bot=bot, store=store, chat_id=1))
+        self.assertEqual(len(captured.output), 1)
+        with patch.object(bot_module.logging, "warning") as warning:
+            self.assertTrue(await refresh_pinned_leaderboard_for_chat(bot=bot, store=store, chat_id=1))
+            warning.assert_not_called()
+        self.assertEqual(len(bot.edits), 2)
+        self.assertEqual(len(bot.pins), 1)
+        self.assertFalse(store.deleted)
+        bot.pin_error = None
+        bot_module._PIN_DENIED_UNTIL[bot][1] = (44, 0)
+        self.assertTrue(await refresh_pinned_leaderboard_for_chat(bot=bot, store=store, chat_id=1))
+        self.assertEqual(len(bot.pins), 2)
+
+    async def test_transient_pin_failure_remains_retryable(self):
+        bot = FakeBot(pin_error=RuntimeError("temporary network failure"))
+        store = FakeStore(PinnedLeaderboard(1, 44, "now"))
+        with self.assertLogs(level="WARNING"):
+            self.assertFalse(await refresh_pinned_leaderboard_for_chat(bot=bot, store=store, chat_id=1))
+        bot.pin_error = None
+        self.assertTrue(await refresh_pinned_leaderboard_for_chat(bot=bot, store=store, chat_id=1))
+        self.assertEqual(len(bot.pins), 2)
     async def test_overlapping_refreshes_read_latest_balance_in_order(self) -> None:
         store = FakeStore(PinnedLeaderboard(1, 44, "now"))
         store.balances = [PointBalance(1, "id:1", "Alice", 10, "now")]

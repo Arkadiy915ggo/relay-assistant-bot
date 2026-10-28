@@ -47,6 +47,8 @@ Current focused tests:
 - `tests/test_autonomous_worker.py`: current access policy for queued jobs/outbox, activation/backfill retries, and worker failure reporting.
 - `tests/test_casino.py`: slot mapping, atomic balances, bounded settlement retries, uncertain commit replay, cancellation, and startup recovery.
 - `tests/test_pinned_leaderboard.py`: leaderboard reuse and allowlisted startup refresh.
+- `tests/test_profile_stabilization.py`, `tests/test_observability_operations.py`: bounded profile batches/keyset migration, timeout/checkpoint safety, and content-free handled-outcome tracing.
+- `tests/test_voice_presets.py`, `tests/test_voice_handlers.py`, `tests/test_speech_synthesizer.py`, `tests/test_cosyvoice_runner.py`: registry/storage, command delivery/provenance, own-bot isolation, runner protocol and supervised process cleanup without GPU/network/models.
 
 ## Runtime Flow
 
@@ -70,6 +72,9 @@ Current focused tests:
 - `src/tg_summary_bot/video_recognizer.py`: manual `/video` and `/vocr` key-frame recognition through Ollama vision with adaptive compression.
 - `src/tg_summary_bot/youtube.py`: validated single-video YouTube downloads through `yt-dlp` for the existing video recognition flow.
 - `src/tg_summary_bot/transcriber.py`: optional local Whisper transcription for voice/audio and video audio tracks.
+- `src/tg_summary_bot/voice_presets.py`: immutable bundled/local voice registry with confined references.
+- `src/tg_summary_bot/speech_synthesizer.py`: supervised optional TTS/ffmpeg lifecycle, shared GPU lock and upload-lifetime temporary files.
+- `src/tg_summary_bot/cosyvoice_runner.py`: dedicated Python 3.10 zero-shot runner; never imported into the bot environment.
 - `src/tg_summary_bot/transcript_formatter.py`: optional LLM post-processor that formats already-sent Whisper transcripts with minimal edits.
 - `src/tg_summary_bot/memory.py`: structured long-term chat memory, hybrid memory search, rollups, and participant profile facts used by `/summary`, `/question`, and mention answers.
 - `src/tg_summary_bot/periods.py`: period parsing for `30m`, `6h`, `24h`, `7d`, `2w`, `today`, and `сегодня`.
@@ -83,6 +88,8 @@ Current focused tests:
 - `/casino`: spin the Telegram `🎰` virtual slot for a fixed 10-point stake; no money, transfers, purchases, or withdrawals.
 - `/summary [period]`: summarize stored messages for the period; default comes from `DEFAULT_SUMMARY_PERIOD`.
 - `/question [period] <text>`: answer using stored chat context when relevant.
+- `/ask [period] <text>`: alias of `/question`; `/ask voice [period] <text>` sends one answer as text then voice replies.
+- `/voice <text>`: optional CosyVoice 3 speech reply; `/voice_type [id|reset]` manages chat-scoped voice selection.
 - `/memory`: show compressed chat memory status; `/memory rebuild` resets memory blocks/state so they can be rebuilt from stored raw messages.
 - `/profile`: show, forget, or correct source-backed participant profile facts.
 - `/transcribe`: transcribe a replied voice/audio message manually.
@@ -107,6 +114,7 @@ SQLite tables are initialized in `MessageStore.init()`:
 - `chat_pinned_leaderboards`: the chat-scoped Telegram `message_id` used for best-effort leaderboard edits and pinning.
 - `chat_casino_spins`: idempotent virtual slot reserve/settle/refund records linked to ledger rows by `casino_spin_id`.
 - `chat_joke_inbox`, `chat_joke_jobs`, `chat_joke_job_items`, `chat_joke_outbox`: durable autonomous joke queue, immutable blocks, fenced leases, and post-award delivery.
+- `chat_voice_settings`: chat-scoped voice preset ID and update timestamp; created idempotently at startup.
 
 ## Important Behavior
 
@@ -118,12 +126,23 @@ SQLite tables are initialized in `MessageStore.init()`:
 - Text and captions are stored passively unless the message is a slash command.
 - Images and videos are indexed passively by Telegram `file_id`; Telegram video notes are recognized automatically, while normal video files require explicit commands.
 - Voice/audio messages are transcribed only when `TRANSCRIBE_VOICE=true` and voice dependencies are installed. Optional transcript formatting runs after the raw Whisper response is already sent.
+- TTS defaults disabled and uses separate `.venv-cosyvoice3`; `./run.sh install-tts-cosyvoice3` explicitly installs/downloads its pinned baseline. Broken optional setup leaves text commands working. Own-bot audio is rejected before transcription work, including slash/routed replies.
+- `chat_voice_settings` stores per-chat preset IDs; direct voice uses ineligible `generated/tts_text`, and `/ask voice` persists only one eligible assistant answer. Bundled Anub’арак uses model speed 1.0 then atempo=0.85/pitch −1 with formants preserved. Real GPU/listening/Telegram acceptance remains manual.
+- Bundled `cartman` uses the user-selected MDX Extra reference and raw transcript from the Cartman experiment. Speed 1.0/pitch 0 bypass all tempo/pitch filters; only Telegram-compatible encoding remains.
+- Profile refresh uses one rendered-size/message-count bounded batch, a separate profile client/token budget, timeout and per-chat cooldown; busy GPU work is deferred. Invalid JSON/timeouts preserve the cursor; `chat_profile_state.processed_message_id` handles same-timestamp boundaries.
+- Slash operations have end-to-end Opik traces with speech stages and handled partial/failure outcomes. Background profile traces are detached. `tests/voice_trace_smoke.py` is an explicit synthetic live-ingestion check, not part of offline tests.
+- Harmless leaderboard not-modified edits are quiet; confirmed pin-permission failures are best effort with a ten-minute cooldown, while balance edits continue and transient failures remain retryable.
 - Video recognition can include audio transcription when `VIDEO_TRANSCRIBE_AUDIO=true` and a transcriber is configured.
 - Long summaries/questions are chunked before model calls; final summaries merge partials.
 - `/summary` takes an eligible raw snapshot, then runs a strict joke selector in a second acquisition of the existing shared `gpu_lock`; awards are committed atomically only after that lock is released. `/compare` never selects or awards jokes.
 - With `AUTONOMOUS_JOKES_ENABLED=true`, a background worker creates 50-message or aged 5-49-message blocks after 3 days; `/summary` becomes read-only for awards. Shadow mode persists results without points or Telegram notifications.
-- The autonomous worker shares `gpu_lock`, acquires it for one selector batch at a time, and uses SQLite leases for restart recovery. It cannot recover Telegram history unavailable to the Bot API.
+- The autonomous worker shares `gpu_lock` and uses bounded warm judge sessions (8 calls / soft 120s), yielding between sessions without discarding tournament progress. Scheduled runs default to 6h / 4 jobs; SQLite admission survives restart, and outbox polling remains independent. Short 50-message blocks fit one selection within the existing character budget, then qualification. Awards commit outside the GPU lock. It cannot recover Telegram history unavailable to the Bot API.
+- A separate durable `validation_failures` counter quarantines a joke job after 3 malformed results; `quarantined_at` excludes automatic claims while preserving the legacy retry status and source block. Transient errors do not consume that limit; new counters start at zero on upgrade.
 - Jobs and outbox claims apply the current `ALLOWED_CHAT_IDS` and joke-disabled chat policy; excluded work stays paused without losing its durable state. Activation and backfill failures are retried in the worker loop.
+- Joke finalists require a separate source-grounded qualification with an exact visible quote, a supported humour mechanism and no missing external context. Rough/short jokes remain eligible; invalid qualification retries without points and valid rejection yields no joke.
+- Award notices expire after `AUTONOMOUS_JOKE_ANNOUNCEMENT_MAX_AGE` (default 24h from award commitment), without changing the ledger or balances. Fresh notices get priority; up to ten expired notices are retired per pass, and notices state the original credit time. Current access/shadow/action-pause policies are preserved.
+- `AUTONOMOUS_JOKE_ANNOUNCE_BACKLOG=false` prevents startup catch-up bursts: pre-worker-start award notices are skipped even within the age window. New awards after startup can be announced; the durable activation cutoff and earned points are unaffected.
+- `AUTONOMOUS_JOKE_ANNOUNCEMENT_MIN_INTERVAL=12h` caps automatic notices per chat (one per half day). SQLite announcement state atomically reserves attempts and tracks confirmed sends; cooldown survives restart/upgrade and uncertain sends. Rate-limited notices defer without changing points or blocking other chats.
 - Bot balances use stable `id:<bot_id>` keys; aliases are display-only. `/casino bot` and explicit self-addressed casino requests debit that bot balance.
 - `/top` and the pinned `Топ балансов` reflect current spendable balances after awards, bets, payouts, and refunds. Only a confirmed Telegram not-found error recreates the pinned message.
 - Mentioning the bot in a message triggers the same contextual answer flow as `/question` using the default period.
@@ -136,7 +155,7 @@ SQLite tables are initialized in `MessageStore.init()`:
 
 ## Product Roadmap
 
-`relay-assistant-bot-doc/00 Feature Roadmap.md` links implemented Features 01-05, pre-merge stabilization, and draft Features 06-12: voice generation, chat search, documents/files, social videos, reactions, proactive messages, and product onboarding/GUI/provider modularity. Draft commands, settings, metrics, and architecture are proposals, not current runtime capabilities. Implement them only when requested.
+`relay-assistant-bot-doc/00 Feature Roadmap.md` links implemented Features 01-05, pre-merge stabilization, Feature 06 runtime MVP (manual smoke pending), and draft Features 07-12: chat search, documents/files, social videos, reactions, proactive messages, and product onboarding/GUI/provider modularity. Draft commands, settings, metrics, and architecture are proposals, not current runtime capabilities. Implement them only when requested.
 
 `relay-assistant-bot-doc/01 Product Vision.md` is the product source of truth: community-first entertainment plus useful assistance, evolving into configurable chat personas, skills, voices, initiative, and editable introductory prompts. Formal work use is one preset. Profile/prompt editing and meeting/debate assistance remain future designs; preserve current runtime contracts until explicitly implemented.
 
@@ -149,9 +168,11 @@ Use `.env.example` as the source of truth for documented environment variables. 
 - Ollama generation: `OLLAMA_TIMEOUT_SECONDS`, `OLLAMA_KEEP_ALIVE`, `OLLAMA_UNLOAD_AFTER_TASK`, `OLLAMA_NUM_CTX`, `OLLAMA_NUM_PREDICT`.
 - Storage/logs: `DATABASE_PATH`, `LOG_FILE`, `RESPONSE_LOG_FILE`.
 - Voice: `TRANSCRIBE_VOICE`, `WHISPER_MODEL`, `WHISPER_DEVICE`, `WHISPER_COMPUTE_TYPE`, `WHISPER_LANGUAGE`, `MAX_VOICE_SECONDS`, `TRANSCRIPTION_FORMAT_*`.
+- TTS: `TTS_ENABLED`, `TTS_PROVIDER`, `TTS_DEFAULT_VOICE`, `TTS_LOCAL_VOICES_DIR`, `TTS_OUTPUT_DIR`, `TTS_PYTHON_PATH`, `TTS_COSYVOICE_UPSTREAM_DIR`, `TTS_MODEL_DIR`, `TTS_MAX_TEXT_CHARS`, `TTS_MAX_AUDIO_SECONDS`, `TTS_TIMEOUT_SECONDS`, `TTS_ENCODING_TIMEOUT_SECONDS`, `TTS_UPLOAD_TIMEOUT_SECONDS`.
 - Image/video: `IMAGE_RECOGNITION_MODEL`, `VIDEO_RECOGNITION_MODEL`, frame limits, size/duration limits, and download directories.
 - Summary limits: `MAX_MESSAGE_CHARS`, `MAX_SUMMARY_INPUT_CHARS`, `CHUNK_CHARS`, `DEFAULT_SUMMARY_PERIOD`.
 - Memory settings in code: `MEMORY_ENABLED`, `MEMORY_RECENT_PERIOD`, `MEMORY_CHUNK_CHARS`, `MEMORY_MAX_BLOCKS`, `MEMORY_SEARCH_LIMIT`.
+- Profile refresh: `PROFILE_MODEL`, `PROFILE_BATCH_CHARS`, `PROFILE_BATCH_MESSAGES`, `PROFILE_NUM_PREDICT`, `PROFILE_TIMEOUT_SECONDS`, `PROFILE_REFRESH_INTERVAL_SECONDS`.
 
 ## Common Debug Entry Points
 

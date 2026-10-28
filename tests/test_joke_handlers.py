@@ -18,10 +18,16 @@ class RecordingLock:
         self.events = events
 
     async def __aenter__(self) -> None:
+        await self.acquire()
+
+    async def acquire(self) -> None:
         await self._lock.acquire()
         self.events.append("lock:acquire")
 
     async def __aexit__(self, *_: object) -> None:
+        self.release()
+
+    def release(self) -> None:
         self.events.append("lock:release")
         self._lock.release()
 

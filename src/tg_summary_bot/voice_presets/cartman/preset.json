@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "id": "cartman",
+  "display_name": "Картман",
+  "reference": "reference.wav",
+  "transcript": "Если ты вдруг не заметил, мы пока работаем в убыток. Мы продаем недостаточно, чтобы окупиться. Мои дилеры держат меня за яйца. Все стоит денег, Баттерс. Вейпы, жидкость, даже плащ твой. Мы не можем тормозить работу, понял?",
+  "language": "ru",
+  "post_processing": {"speed": 1.0, "pitch_semitones": 0, "preserve_formants": true}
+}

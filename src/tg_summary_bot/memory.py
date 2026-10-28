@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -14,6 +15,8 @@ from tg_summary_bot.storage import (
     ChatParticipantFact,
     MessageStore,
     StoredMessage,
+    participant_key,
+    profile_message_line,
 )
 
 
@@ -42,31 +45,18 @@ FACT_TYPES = {
 TEMPORARY_FACT_TYPES = {"task", "temporary_state"}
 ROLLUP_GROUP_SIZE = 8
 PROFILE_CHARS_PER_CONTEXT_TOKEN = 3
-PROFILE_CHUNK_MIN_CHARS = 3500
-PROFILE_CHUNK_MAX_CHARS = 9000
 
 
 class MemoryCompressionError(RuntimeError):
     pass
 
 
-def participant_key(sender_id: int | None, sender_name: str) -> str:
-    if sender_id is not None:
-        return f"id:{sender_id}"
-    normalized = re.sub(r"[^\wа-яА-ЯёЁ]+", "_", sender_name.strip().lower()).strip("_")
-    return f"name:{normalized or 'unknown'}"
+class ProfileExtractionError(RuntimeError):
+    """A content-free failure; leave the durable profile cursor unchanged."""
 
 
 def _render_messages(messages: list[StoredMessage]) -> str:
-    lines: list[str] = []
-    for msg in messages:
-        reply = f" reply_to={msg.reply_to_message_id}" if msg.reply_to_message_id else ""
-        key = participant_key(msg.sender_id, msg.sender_name)
-        lines.append(
-            f"[{msg.created_at} #{msg.message_id}{reply} sender_key={key}] "
-            f"{msg.sender_name}: {msg.text}"
-        )
-    return "\n".join(lines)
+    return "\n".join(profile_message_line(message) for message in messages)
 
 
 def _json_object(text: str) -> dict[str, object] | None:
@@ -151,10 +141,10 @@ def _empty_fact_stats() -> dict[str, int]:
 
 
 def _profile_chunk_chars(settings: Settings, memory_chunk_chars: int) -> int:
-    ctx_based_chars = settings.ollama_num_ctx * PROFILE_CHARS_PER_CONTEXT_TOKEN // 4
+    ctx_based_chars = min(settings.ollama_num_ctx, 4096) * PROFILE_CHARS_PER_CONTEXT_TOKEN // 4
     return max(
-        PROFILE_CHUNK_MIN_CHARS,
-        min(memory_chunk_chars, PROFILE_CHUNK_MAX_CHARS, ctx_based_chars),
+        512,
+        min(memory_chunk_chars, getattr(settings, "profile_batch_chars", 2000), ctx_based_chars),
     )
 
 
@@ -259,9 +249,13 @@ def _profile_lines(facts: list[ChatParticipantFact], *, limit: int = 18) -> list
 
 
 class ChatMemory:
-    def __init__(self, store: MessageStore, llm: LLMClient, settings: Settings) -> None:
+    def __init__(self, store: MessageStore, llm: LLMClient, settings: Settings,
+                 *, profile_llm: LLMClient | None = None) -> None:
         self.store = store
         self.llm = llm
+        self.profile_llm = profile_llm or llm
+        self.profile_batch_messages = getattr(settings, "profile_batch_messages", 8)
+        self.profile_timeout_seconds = getattr(settings, "profile_timeout_seconds", 60)
         self.recent_period = parse_period(settings.memory_recent_period)
         self.chunk_chars = min(settings.memory_chunk_chars, settings.chunk_chars)
         if self.chunk_chars < settings.memory_chunk_chars:
@@ -323,6 +317,7 @@ class ChatMemory:
                 period_end,
             )
 
+    @opik_track(name="profile.refresh", create_duplicate_root_span=True)
     async def ensure_recent_profiles_current(
         self,
         chat_id: int,
@@ -335,41 +330,25 @@ class ChatMemory:
         now = now.astimezone(timezone.utc)
 
         recent_start = self.recent_since(now).isoformat()
-        processed = await self.store.get_profile_processed_until(chat_id)
-        after = max(processed, recent_start) if processed else recent_start
-        saved_total = 0
-
-        while True:
-            messages = await self.store.get_profile_message_chunk(
-                chat_id=chat_id,
-                after=after,
-                before=now,
-                limit_chars=self.profile_chunk_chars,
-            )
-            if not messages:
-                return saved_total
-
-            stats = await self._extract_participant_facts(chat_id, messages)
-            if stats["invalid_json"]:
-                logging.warning(
-                    "Profile fact extraction returned invalid JSON chat_id=%s messages=%s period=%s..%s",
-                    chat_id,
-                    len(messages),
-                    messages[0].created_at,
-                    messages[-1].created_at,
-                )
-                return saved_total
-            saved_total += stats["saved"]
-            after = messages[-1].created_at
-            await self.store.save_profile_processed_until(chat_id, after)
-            logging.info(
-                "Chat profile facts extracted chat_id=%s messages=%s saved=%s period=%s..%s",
-                chat_id,
-                len(messages),
-                stats["saved"],
-                messages[0].created_at,
-                messages[-1].created_at,
-            )
+        update_opik_span_metadata({"chat_id": chat_id, "profile_batch_chars": self.profile_chunk_chars,
+                                  "profile_batch_messages": self.profile_batch_messages})
+        cursor = await self.store.get_profile_cursor(chat_id)
+        after = max(cursor.created_at, recent_start) if cursor else recent_start
+        messages = await self.store.get_profile_message_chunk(
+            chat_id=chat_id, after=after, before=now,
+            after_message_id=cursor.message_id if cursor and after == cursor.created_at else None,
+            limit_chars=self.profile_chunk_chars, limit_messages=self.profile_batch_messages,
+        )
+        if not messages:
+            update_opik_span_metadata({"profile_status": "idle", "chat_id": chat_id})
+            return 0
+        # One bounded model call per refresh, never a whole backlog under one lock.
+        stats = await self._extract_participant_facts(chat_id, messages)
+        await self.store.save_profile_processed_until(chat_id, messages[-1].created_at, messages[-1].message_id)
+        update_opik_span_metadata({"profile_status": "succeeded", "chat_id": chat_id,
+                                  "message_count": len(messages), "facts_saved": stats["saved"]})
+        logging.info("Chat profile batch extracted chat_id=%s messages=%s saved=%s", chat_id, len(messages), stats["saved"])
+        return stats["saved"]
 
     async def blocks_for_summary(
         self,
@@ -549,6 +528,9 @@ class ChatMemory:
 
     async def unload(self) -> None:
         await self.llm.unload()
+
+    async def unload_profiles(self) -> None:
+        await self.profile_llm.unload()
 
     def blocks_as_messages(self, blocks: list[ChatMemoryBlock]) -> list[StoredMessage]:
         messages: list[StoredMessage] = []
@@ -761,9 +743,8 @@ participant_facts добавляй только с точным participant_key 
   "participant_facts": [
     {{
       "participant_key": "точный sender_key участника",
-      "participant_name": "имя участника",
       "fact_type": "role|responsibility|project|preference|constraint|task|temporary_state|skill|relationship|other",
-      "fact": "информативный атомарный факт в 1-2 предложениях",
+      "fact": "один атомарный факт, до 120 символов",
       "source_message_ids": [123],
       "confidence": "high|medium",
       "expires_after_days": 30
@@ -772,6 +753,8 @@ participant_facts добавляй только с точным participant_key 
 }}
 
 Правила:
+- выбери не более ОДНОГО самого полезного факта для всего блока, не перечисляй участников;
+- верни компактный завершённый JSON; source_message_ids — не более трёх ID;
 - сохраняй только факты, явно подтвержденные сообщениями;
 - fact должен быть понятным без исходного сообщения, не короче короткой фразы;
 - participant_key должен точно совпадать с sender_key из сообщения;
@@ -784,13 +767,16 @@ participant_facts добавляй только с точным participant_key 
 Сообщения:
 {rendered}
 """.strip()
-        response = await self.llm.complete(
-            system=MEMORY_SYSTEM_PROMPT,
-            user=user,
-            response_format="json",
-        )
+        try:
+            response = await asyncio.wait_for(self.profile_llm.complete(
+                system=MEMORY_SYSTEM_PROMPT, user=user, response_format="json",
+            ), timeout=self.profile_timeout_seconds)
+        except asyncio.TimeoutError as exc:
+            update_opik_span_metadata({"profile_status": "failed", "profile_failure": "timeout"})
+            raise ProfileExtractionError("profile_timeout") from exc
         data = _json_object(response)
-        if not data:
+        if (not data or not isinstance(data.get("participant_facts"), list)
+                or any(not isinstance(fact, dict) for fact in data["participant_facts"])):
             update_opik_span_metadata(
                 {
                     "json_valid": False,
@@ -799,10 +785,9 @@ participant_facts добавляй только с точным participant_key 
                     "participant_facts_saved": 0,
                 }
             )
-            stats = _empty_fact_stats()
-            stats["invalid_json"] = 1
-            return stats
+            raise ProfileExtractionError("profile_invalid_json")
 
+        data["participant_facts"] = data["participant_facts"][:1]
         stats = await self._save_participant_facts(chat_id, data, messages)
         update_opik_span_metadata(
             {
