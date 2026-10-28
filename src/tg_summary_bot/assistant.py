@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from tg_summary_bot.llm import LLMClient
-from tg_summary_bot.observability import opik_track, update_opik_span_metadata
+from tg_summary_bot.observability import trace, update_span_metadata
 from tg_summary_bot.storage import StoredMessage
 
 
@@ -48,7 +48,7 @@ class ChatAssistant:
         self.llm = llm
         self.chunk_chars = chunk_chars
 
-    @opik_track(name="question.ask")
+    @trace(name="question.ask")
     async def ask(
         self,
         messages: list[StoredMessage],
@@ -62,7 +62,7 @@ class ChatAssistant:
 
         rendered = _render_messages(messages)
         chunks = _split_text(rendered, self.chunk_chars)
-        update_opik_span_metadata(
+        update_span_metadata(
             {
                 "period_label": period_label,
                 "message_count": len(messages),
@@ -96,7 +96,7 @@ class ChatAssistant:
     async def unload(self) -> None:
         await self.llm.unload()
 
-    @opik_track(name="question.extract_context")
+    @trace(name="question.extract_context")
     async def _extract_relevant_context(
         self,
         chunk: str,
@@ -106,7 +106,7 @@ class ChatAssistant:
         chunk_index: int,
         chunk_count: int,
     ) -> str:
-        update_opik_span_metadata(
+        update_span_metadata(
             {
                 "period_label": period_label,
                 "chunk_index": chunk_index,
@@ -129,7 +129,7 @@ class ChatAssistant:
 """.strip()
         return await self.llm.complete(system=CHAT_SYSTEM_PROMPT, user=user)
 
-    @opik_track(name="question.answer")
+    @trace(name="question.answer")
     async def _answer_from_context(
         self,
         context: str,
@@ -138,7 +138,7 @@ class ChatAssistant:
         *,
         bot_names: list[str] | None,
     ) -> str:
-        update_opik_span_metadata(
+        update_span_metadata(
             {
                 "period_label": period_label,
                 "context_chars": len(context),

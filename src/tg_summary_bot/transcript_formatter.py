@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 
 from tg_summary_bot.llm import LLMClient
-from tg_summary_bot.observability import opik_track, update_opik_span_metadata
+from tg_summary_bot.observability import trace, update_span_metadata
 
 
 TRANSCRIPT_FORMAT_PROMPT_VERSION = "v4-no-russian-translation"
@@ -58,7 +58,7 @@ class TranscriptFormatter:
     def cache_key(self) -> str:
         return f"transcript_format={TRANSCRIPT_FORMAT_PROMPT_VERSION}:{self.model_name}"
 
-    @opik_track(name="transcript.format")
+    @trace(name="transcript.format")
     async def format(self, transcript: str) -> str:
         text = transcript.strip()
         if not text:
@@ -68,7 +68,7 @@ class TranscriptFormatter:
                 f"Transcript is too long to format: {len(text)} chars. "
                 f"Limit: {self.max_chars} chars."
             )
-        update_opik_span_metadata(
+        update_span_metadata(
             {
                 "model": self.model_name,
                 "transcript_chars": len(text),
@@ -90,7 +90,7 @@ class TranscriptFormatter:
             return await self.translate_to_russian(text)
         return formatted
 
-    @opik_track(name="transcript.translate", type="llm")
+    @trace(name="transcript.translate", type="llm")
     async def translate_to_russian(self, transcript: str) -> str:
         text = transcript.strip()
         if not text:
@@ -100,7 +100,7 @@ class TranscriptFormatter:
                 f"Transcript is too long to translate: {len(text)} chars. "
                 f"Limit: {self.max_chars} chars."
             )
-        update_opik_span_metadata(
+        update_span_metadata(
             {
                 "model": self.model_name,
                 "transcript_chars": len(text),

@@ -8,7 +8,7 @@ from pathlib import Path
 import httpx
 
 from tg_summary_bot.config import Settings
-from tg_summary_bot.observability import opik_track, update_opik_llm_usage, update_opik_span_metadata
+from tg_summary_bot.observability import trace, update_llm_usage, update_span_metadata
 
 
 VIDEO_RECOGNITION_SYSTEM_PROMPT = """
@@ -67,9 +67,9 @@ class VideoRecognizer:
             f"width={self.frame_max_width}|ctx={self.num_ctx}|predict={self.num_predict}"
         )
 
-    @opik_track(name="video.recognize")
+    @trace(name="video.recognize")
     async def recognize(self, video_path: Path, *, message_id: int, duration: int | None) -> str:
-        update_opik_span_metadata(
+        update_span_metadata(
             {
                 "model": self.model,
                 "message_id": message_id,
@@ -119,9 +119,9 @@ class VideoRecognizer:
             raise RuntimeError(f"video frames still exceed context after compression: {last_error}") from last_error
         raise RuntimeError("ffmpeg did not extract any video frames")
 
-    @opik_track(name="video.vision", type="llm")
+    @trace(name="video.vision", type="llm")
     async def _complete_with_images(self, images: list[str], *, frame_max_width: int) -> str:
-        update_opik_span_metadata(
+        update_span_metadata(
             {
                 "provider": "ollama",
                 "model": self.model,
@@ -172,7 +172,7 @@ class VideoRecognizer:
         eval_duration = (data.get("eval_duration") or 0) / 1_000_000_000
         tokens_per_second = eval_count / eval_duration if eval_duration else 0
         content = str(data.get("response", "")).strip()
-        update_opik_llm_usage(
+        update_llm_usage(
             provider="ollama",
             model=self.model,
             usage={

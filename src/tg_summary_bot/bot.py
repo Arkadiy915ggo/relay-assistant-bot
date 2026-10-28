@@ -39,11 +39,14 @@ from tg_summary_bot.meme_generator import MemeGenerator
 from tg_summary_bot.observability import (
     OperationOutcome,
     log_operation_outcome,
-    opik_track,
-    opik_stage,
-    opik_operation,
+    trace,
+    trace_stage,
+    trace_operation,
+    configure_tracing,
+    close_tracing,
+    tracing_status,
     traced_gpu_lock,
-    update_opik_span_metadata,
+    update_span_metadata,
 )
 from tg_summary_bot.periods import format_period, parse_period
 from tg_summary_bot.storage import CasinoSpin, CasinoSpinResult, MessageStore, PointBalance, StoredImage, StoredVideo
@@ -1021,7 +1024,7 @@ async def create_dispatcher(
                              *, persist_text: bool) -> OperationOutcome:
         try:
             async with speech_synthesizer.synthesize(text, preset, gpu_lock) as result:
-                with opik_stage("speech.upload", {"voice_id": preset.id, "audio_duration_s": result.duration}):
+                with trace_stage("speech.upload", {"voice_id": preset.id, "audio_duration_s": result.duration}):
                     response = await asyncio.wait_for(
                         message.reply_voice(FSInputFile(result.path),
                                             request_timeout=settings.tts_upload_timeout_seconds),
@@ -1032,7 +1035,7 @@ async def create_dispatcher(
                 if persist_text:
                     try:
                         bot_id, name = sender_name(response)
-                        with opik_stage("speech.persist"):
+                        with trace_stage("speech.persist"):
                             await store.save_message(
                                 chat_id=message.chat.id, message_id=response.message_id,
                                 chat_type=str(message.chat.type), sender_id=bot_id, sender_name=name,
@@ -1160,14 +1163,14 @@ async def create_dispatcher(
             model=resolved_intent_router_model(settings),
         )
 
-    @opik_operation(name="telegram.command")
+    @trace_operation(name="telegram.command")
     async def execute_slash_operation(
         message: Message,
         operation: str,
         action: Awaitable[OperationOutcome | None],
     ) -> OperationOutcome:
         started = time.perf_counter()
-        update_opik_span_metadata({"chat_id": message.chat.id, "message_id": message.message_id,
+        update_span_metadata({"chat_id": message.chat.id, "message_id": message.message_id,
                                   "operation": operation, "invocation": "slash"}, name=f"telegram.{operation}")
         try:
             result = await action
@@ -1402,9 +1405,10 @@ async def create_dispatcher(
             f"ollama_timeout_seconds: `{settings.ollama_timeout_seconds}`\n"
             f"ollama_num_ctx: `{settings.ollama_num_ctx}`\n"
             f"ollama_num_predict: `{settings.ollama_num_predict}`\n"
-            f"opik_enabled: `{settings.opik_enabled}`\n"
-            f"opik_project_name: `{settings.opik_project_name}`\n"
-            f"opik_capture_content: `{settings.opik_capture_content}`\n"
+            f"tracing_status: `{tracing_status().state}`\n"
+            f"tracing_backend: `{tracing_status().backend or 'none'}`\n"
+            f"tracing_project_name: `{tracing_status().project_name}`\n"
+            f"tracing_capture_content: `{tracing_status().capture_content}`\n"
             f"autonomous_jokes_enabled: `{settings.autonomous_jokes_enabled}`\n"
             f"autonomous_jokes_shadow_mode: `{settings.autonomous_jokes_shadow_mode}`\n"
             f"autonomous_jokes_run_interval: `{settings.autonomous_jokes_run_interval}`\n"
@@ -1428,6 +1432,7 @@ async def create_dispatcher(
             f"transcribe_voice: `{settings.transcribe_voice}`\n"
             f"whisper_model: `{settings.whisper_model}`\n"
             f"whisper_device: `{settings.whisper_device}`\n"
+            f"whisper_local_files_only: `{getattr(settings, 'whisper_local_files_only', True)}`\n"
             f"transcription_format_enabled: `{settings.transcription_format_enabled}`\n"
             f"transcription_format_provider: `{settings.transcription_format_provider}`\n"
             f"transcription_format_model: `{settings.transcription_format_model}`\n"
@@ -1828,7 +1833,7 @@ async def create_dispatcher(
             except Exception:  # noqa: BLE001
                 selector_status = "error"
                 logging.exception("Joke selection failed chat_id=%s", message.chat.id)
-        update_opik_span_metadata(
+        update_span_metadata(
             {
                 "joke_snapshot_boundary": (
                     f"{snapshot_boundary.created_at}:{snapshot_boundary.message_id}"
@@ -1987,7 +1992,7 @@ async def create_dispatcher(
                         bot_names=[item.alias for item in aliases],
                     )
                 finally:
-                    with opik_stage("question.unload"):
+                    with trace_stage("question.unload"):
                         if use_memory and chat_memory:
                             await chat_memory.unload()
                         await chat_assistant.unload()
@@ -2014,11 +2019,11 @@ async def create_dispatcher(
         )
         text = f"**Answer for {format_period(period_raw)}**\n{answer}"
         parts = split_telegram_text(text)
-        with opik_stage("question.text_delivery"):
+        with trace_stage("question.text_delivery"):
             await edit_text_logged(wait_message, parts[0], source_message=message)
             for part in parts[1:]:
                 await (reply_logged if reply_to_source else answer_logged)(message, part)
-        with opik_stage("question.persist"):
+        with trace_stage("question.persist"):
             persisted = await try_save_final_assistant_answer(settings, store, wait_message, text)
         failures = [] if persisted else ["context_persistence_failed"]
         speech_metadata: dict[str, object] | None = {"voice_id": voice_preset.id} if voice_preset else None
@@ -2585,7 +2590,7 @@ async def create_dispatcher(
     async def meme_command(message: Message, bot: Bot) -> None:
         await execute_slash_operation(message, "meme", run_meme(message, bot))
 
-    @opik_track(name="video.process")
+    @trace(name="video.process")
     async def recognize_video_source(
         *,
         video: StoredVideo,
@@ -2598,7 +2603,7 @@ async def create_dispatcher(
     ) -> OperationOutcome:
         if not is_allowed(settings, request_message.chat.id):
             return OperationOutcome("video", "rejected", "access_denied")
-        update_opik_span_metadata(
+        update_span_metadata(
             {
                 "chat_id": request_message.chat.id,
                 "message_id": video.message_id,
@@ -2661,7 +2666,7 @@ async def create_dispatcher(
             cache_key=cache_key,
         )
         if cached and cached.result.strip():
-            update_opik_span_metadata({"cache_hit": True})
+            update_span_metadata({"cache_hit": True})
             wait_message = (
                 await reply_logged(request_message, "Recognizing video...") if routed else None
             )
@@ -2707,7 +2712,7 @@ async def create_dispatcher(
                 response_message_id=response_message_id,
             )
 
-        update_opik_span_metadata({"cache_hit": False})
+        update_span_metadata({"cache_hit": False})
 
         status_text = (
             f"Recognizing video #{video.message_id} "
@@ -3208,7 +3213,7 @@ async def create_dispatcher(
                 source_message=request_message,
             )
 
-    @opik_track(name="audio.process")
+    @trace(name="audio.process")
     async def transcribe_audio_source(
         source_message: Message,
         bot: Bot,
@@ -3224,7 +3229,7 @@ async def create_dispatcher(
             if notify_disabled:
                 await reply_logged(request_message, "Это голосовое сообщение самого бота. Повторное распознавание не требуется.")
             return
-        update_opik_span_metadata(
+        update_span_metadata(
             {
                 "chat_id": request_message.chat.id,
                 "message_id": source_message.message_id,
@@ -3831,6 +3836,14 @@ async def download_audio_message(
 async def main() -> None:
     settings = load_settings()
     setup_logging(settings)
+    await configure_tracing(settings)
+    try:
+        await run_bot(settings)
+    finally:
+        await close_tracing()
+
+
+async def run_bot(settings: Settings) -> None:
     store = MessageStore(settings.database_path)
     await store.init()
     startup_cutoff = datetime.now(timezone.utc)

@@ -2,14 +2,13 @@ from __future__ import annotations
 
 import logging
 from abc import ABC, abstractmethod
-from collections.abc import Awaitable, Callable
 from typing import Any
 
 import httpx
 from openai import AsyncOpenAI
 
 from tg_summary_bot.config import Settings
-from tg_summary_bot.observability import configure_opik_tracing, update_opik_llm_usage
+from tg_summary_bot.observability import trace_stage, tracing_status, update_llm_usage
 
 
 class LLMClient(ABC):
@@ -34,7 +33,6 @@ class OpenAIClient(LLMClient):
         model: str,
         *,
         base_url: str = "",
-        opik_project_name: str = "",
     ) -> None:
         if not api_key and not base_url:
             raise RuntimeError("OPENAI_API_KEY is required for LLM_PROVIDER=openai")
@@ -42,19 +40,6 @@ class OpenAIClient(LLMClient):
         self.model = model
         self.last_usage: dict[str, int] = {}
         self.last_metadata: dict[str, Any] = {}
-        if opik_project_name:
-            self.client = self._track_openai_client(self.client, opik_project_name)
-
-    @staticmethod
-    def _track_openai_client(client: AsyncOpenAI, project_name: str) -> AsyncOpenAI:
-        try:
-            from opik.integrations.openai import track_openai
-        except ImportError as exc:
-            raise RuntimeError(
-                "OPIK_ENABLED=true requires the opik OpenAI integration. "
-                "Install it with: ./run.sh install-opik"
-            ) from exc
-        return track_openai(client, project_name=project_name, provider="openai")
 
     async def complete(
         self,
@@ -217,58 +202,16 @@ class OllamaClient(LLMClient):
         logging.info("Ollama model unloaded model=%s", self.model)
 
 
-class OpikLLMClient(LLMClient):
+class TracedLLMClient(LLMClient):
     def __init__(
         self,
         wrapped: LLMClient,
         *,
         provider: str,
-        project_name: str,
-        capture_content: bool,
     ) -> None:
         self.wrapped = wrapped
         self.provider = provider
         self.model = getattr(wrapped, "model", "")
-        self.project_name = project_name
-        self.capture_content = capture_content
-        self._tracked_complete = self._build_tracked_complete()
-
-    def _build_tracked_complete(self) -> Callable[[str, str, str | None], Awaitable[str]]:
-        try:
-            import opik
-        except ImportError as exc:
-            raise RuntimeError(
-                "OPIK_ENABLED=true requires the opik package. "
-                "Install it with: ./run.sh install-opik"
-            ) from exc
-
-        span_name = f"llm.{self.provider}.{self.model}" if self.model else f"llm.{self.provider}"
-
-        @opik.track(
-            name=span_name,
-            type="llm",
-            project_name=self.project_name or None,
-            metadata={"provider": self.provider, "model": self.model},
-            capture_input=self.capture_content,
-            capture_output=self.capture_content,
-            create_duplicate_root_span=False,
-        )
-        async def tracked_complete(system: str, user: str, response_format: str | None) -> str:
-            result = await self.wrapped.complete(
-                system=system,
-                user=user,
-                response_format=response_format,
-            )
-            metadata = dict(getattr(self.wrapped, "last_metadata", {}) or {})
-            update_opik_llm_usage(
-                provider=self.provider,
-                model=self.model,
-                usage=getattr(self.wrapped, "last_usage", {}) or {},
-                metadata=metadata,
-            )
-            return result
-
-        return tracked_complete
 
     async def complete(
         self,
@@ -277,7 +220,17 @@ class OpikLLMClient(LLMClient):
         user: str,
         response_format: str | None = None,
     ) -> str:
-        return await self._tracked_complete(system, user, response_format)
+        with trace_stage(f"llm.{self.provider}.{self.model}", type="llm") as span:
+            if span is not None and tracing_status().capture_content:
+                span.input = {"system": system, "user": user, "response_format": response_format}
+            result = await self.wrapped.complete(system=system, user=user,
+                                                 response_format=response_format)
+            update_llm_usage(provider=self.provider, model=self.model,
+                             usage=getattr(self.wrapped, "last_usage", {}),
+                             metadata=getattr(self.wrapped, "last_metadata", {}))
+            if span is not None and tracing_status().capture_content:
+                span.output = {"text": result}
+            return result
 
     async def unload(self) -> None:
         await self.wrapped.unload()
@@ -292,27 +245,13 @@ def build_llm_client(
     num_predict: int | None = None,
 ) -> LLMClient:
     provider = provider or settings.resolved_llm_provider
-    configure_opik_tracing(
-        enabled=settings.opik_enabled,
-        project_name=settings.opik_project_name,
-    )
     if provider == "openai":
-        use_openai_integration = settings.opik_enabled and settings.opik_capture_content
         client: LLMClient = OpenAIClient(
             settings.openai_api_key,
             model or settings.openai_model,
             base_url=settings.openai_base_url,
-            opik_project_name=settings.opik_project_name if use_openai_integration else "",
         )
-        if settings.opik_enabled and not use_openai_integration:
-            return OpikLLMClient(
-                client,
-                provider=provider,
-                project_name=settings.opik_project_name,
-                capture_content=settings.opik_capture_content,
-            )
-        return client
-    if provider == "ollama":
+    elif provider == "ollama":
         client = OllamaClient(
             settings.ollama_base_url,
             model or settings.ollama_model,
@@ -322,12 +261,6 @@ def build_llm_client(
             num_ctx or settings.ollama_num_ctx,
             num_predict or settings.ollama_num_predict,
         )
-        if settings.opik_enabled:
-            return OpikLLMClient(
-                client,
-                provider=provider,
-                project_name=settings.opik_project_name,
-                capture_content=settings.opik_capture_content,
-            )
-        return client
-    raise RuntimeError(f"Unsupported LLM provider: {provider}")
+    else:
+        raise RuntimeError(f"Unsupported LLM provider: {provider}")
+    return TracedLLMClient(client, provider=provider) if tracing_status().active else client

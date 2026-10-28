@@ -7,7 +7,29 @@ import time
 from pathlib import Path
 
 from tg_summary_bot.config import Settings
-from tg_summary_bot.observability import opik_track, update_opik_span_metadata
+from tg_summary_bot.observability import trace, update_span_metadata
+
+
+def resolve_whisper_model(model_name: str, *, local_files_only: bool) -> str:
+    """Resolve a complete cached snapshot without allowing tokenizer fallbacks online."""
+    if not local_files_only:
+        return model_name
+    from faster_whisper.utils import download_model
+    try:
+        directory = Path(model_name)
+        if not directory.is_dir():
+            directory = Path(download_model(model_name, local_files_only=True))
+        # WhisperModel would otherwise call Tokenizer.from_pretrained() online.
+        for name in ("model.bin", "config.json", "tokenizer.json"):
+            if not (directory / name).is_file() or (directory / name).stat().st_size == 0:
+                raise FileNotFoundError(name)
+    except Exception:
+        raise RuntimeError(
+            "Whisper model is missing or incomplete locally. Prepare it explicitly with "
+            "./run.sh download-whisper <model>, or set WHISPER_MODEL to a complete local directory. "
+            "WHISPER_LOCAL_FILES_ONLY=false permits automatic downloads."
+        ) from None
+    return str(directory)
 
 
 class FasterWhisperTranscriber:
@@ -16,10 +38,11 @@ class FasterWhisperTranscriber:
         self.device = settings.whisper_device
         self.compute_type = settings.whisper_compute_type
         self.language = settings.whisper_language or None
+        self.local_files_only = settings.whisper_local_files_only
 
-    @opik_track(name="audio.transcribe")
+    @trace(name="audio.transcribe")
     async def transcribe(self, audio_path: Path) -> str:
-        update_opik_span_metadata(
+        update_span_metadata(
             {
                 "model": self.model_name,
                 "device": self.device,
@@ -29,7 +52,7 @@ class FasterWhisperTranscriber:
             }
         )
         text = await asyncio.to_thread(self._transcribe_sync, audio_path)
-        update_opik_span_metadata({"output_chars": len(text)})
+        update_span_metadata({"output_chars": len(text)})
         return text
 
     def _transcribe_sync(self, audio_path: Path) -> str:
@@ -42,9 +65,10 @@ class FasterWhisperTranscriber:
 
         started = time.perf_counter()
         model = WhisperModel(
-            self.model_name,
+            resolve_whisper_model(self.model_name, local_files_only=self.local_files_only),
             device=self.device,
             compute_type=self.compute_type,
+            local_files_only=self.local_files_only,
         )
         try:
             segments, info = model.transcribe(
@@ -71,3 +95,20 @@ class FasterWhisperTranscriber:
         finally:
             del model
             gc.collect()
+
+
+def main() -> None:
+    """Explicit network-enabled model preparation; does not load bot configuration."""
+    import argparse
+    parser = argparse.ArgumentParser(description="Download a Whisper model for offline use")
+    parser.add_argument("model", help="Whisper size (e.g. small or large-v3) or Hugging Face model ID")
+    args = parser.parse_args()
+    try:
+        from faster_whisper.utils import download_model
+    except ImportError:
+        parser.exit(1, "Install voice dependencies first: ./run.sh install-voice\n")
+    print(download_model(args.model, local_files_only=False))
+
+
+if __name__ == "__main__":
+    main()

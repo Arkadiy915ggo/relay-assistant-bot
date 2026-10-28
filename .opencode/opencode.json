@@ -1,13 +1,5 @@
 {
   "$schema": "https://opencode.ai/config.json",
-  "mcp": {
-    "opik-mcp": {
-      "type": "local",
-      "command": ["/usr/bin/python3", "/home/arkadiy915/Repos/Personal/relay-assistant-bot/.opencode/opik_mcp.py"],
-      "enabled": true,
-      "timeout": 120000
-    }
-  },
   "plugin": [
     "plugins/graphify.js"
   ]

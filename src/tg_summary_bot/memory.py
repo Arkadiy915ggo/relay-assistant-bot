@@ -8,7 +8,7 @@ from datetime import datetime, timedelta, timezone
 
 from tg_summary_bot.config import Settings
 from tg_summary_bot.llm import LLMClient
-from tg_summary_bot.observability import opik_track, update_opik_span_metadata
+from tg_summary_bot.observability import trace, update_span_metadata
 from tg_summary_bot.periods import parse_period
 from tg_summary_bot.storage import (
     ChatMemoryBlock,
@@ -317,7 +317,7 @@ class ChatMemory:
                 period_end,
             )
 
-    @opik_track(name="profile.refresh", create_duplicate_root_span=True)
+    @trace(name="profile.refresh")
     async def ensure_recent_profiles_current(
         self,
         chat_id: int,
@@ -330,7 +330,7 @@ class ChatMemory:
         now = now.astimezone(timezone.utc)
 
         recent_start = self.recent_since(now).isoformat()
-        update_opik_span_metadata({"chat_id": chat_id, "profile_batch_chars": self.profile_chunk_chars,
+        update_span_metadata({"chat_id": chat_id, "profile_batch_chars": self.profile_chunk_chars,
                                   "profile_batch_messages": self.profile_batch_messages})
         cursor = await self.store.get_profile_cursor(chat_id)
         after = max(cursor.created_at, recent_start) if cursor else recent_start
@@ -340,12 +340,12 @@ class ChatMemory:
             limit_chars=self.profile_chunk_chars, limit_messages=self.profile_batch_messages,
         )
         if not messages:
-            update_opik_span_metadata({"profile_status": "idle", "chat_id": chat_id})
+            update_span_metadata({"profile_status": "idle", "chat_id": chat_id})
             return 0
         # One bounded model call per refresh, never a whole backlog under one lock.
         stats = await self._extract_participant_facts(chat_id, messages)
         await self.store.save_profile_processed_until(chat_id, messages[-1].created_at, messages[-1].message_id)
-        update_opik_span_metadata({"profile_status": "succeeded", "chat_id": chat_id,
+        update_span_metadata({"profile_status": "succeeded", "chat_id": chat_id,
                                   "message_count": len(messages), "facts_saved": stats["saved"]})
         logging.info("Chat profile batch extracted chat_id=%s messages=%s saved=%s", chat_id, len(messages), stats["saved"])
         return stats["saved"]
@@ -561,10 +561,10 @@ class ChatMemory:
             reply_to_message_id=None,
         )
 
-    @opik_track(name="memory.compress")
+    @trace(name="memory.compress")
     async def _compress_messages(self, messages: list[StoredMessage]) -> dict[str, object]:
         rendered = _render_messages(messages)
-        update_opik_span_metadata(
+        update_span_metadata(
             {
                 "message_count": len(messages),
                 "input_chars": len(rendered),
@@ -632,7 +632,7 @@ participant_facts добавляй только с точным participant_key 
             )
             data = _json_object(response)
             if not data:
-                update_opik_span_metadata(
+                update_span_metadata(
                     {
                         "json_valid": False,
                         "failed_attempt": attempt,
@@ -651,7 +651,7 @@ participant_facts добавляй только с точным participant_key 
                 _validate_memory_data(data, message_count=len(messages))
             except MemoryCompressionError as exc:
                 last_error = str(exc)
-                update_opik_span_metadata(
+                update_span_metadata(
                     {
                         "json_valid": True,
                         "rejected_attempt": attempt,
@@ -662,7 +662,7 @@ participant_facts добавляй только с точным participant_key 
                 )
                 logging.warning("Memory compression rejected JSON response attempt=%s: %s", attempt, exc)
                 continue
-            update_opik_span_metadata(
+            update_span_metadata(
                 {
                     "json_valid": True,
                     "attempts": attempt,
@@ -675,7 +675,7 @@ participant_facts добавляй только с точным participant_key 
             "Increase OLLAMA_NUM_CTX, lower MEMORY_CHUNK_CHARS, or restart Ollama before rebuilding memory."
         )
 
-    @opik_track(name="memory.rollup")
+    @trace(name="memory.rollup")
     async def _compress_blocks(
         self,
         blocks: list[ChatMemoryBlock],
@@ -683,7 +683,7 @@ participant_facts добавляй только с точным participant_key 
         target_level: str,
     ) -> dict[str, object]:
         rendered = "\n\n---\n\n".join(_block_text(block) for block in blocks)
-        update_opik_span_metadata(
+        update_span_metadata(
             {
                 "block_count": len(blocks),
                 "input_chars": len(rendered),
@@ -721,14 +721,14 @@ participant_facts добавляй только с точным participant_key 
         data["summary"] = str(data.get("summary") or response[:2500]).strip()[:2500]
         return data
 
-    @opik_track(name="profile.extract")
+    @trace(name="profile.extract")
     async def _extract_participant_facts(
         self,
         chat_id: int,
         messages: list[StoredMessage],
     ) -> dict[str, int]:
         rendered = _render_messages(messages)
-        update_opik_span_metadata(
+        update_span_metadata(
             {
                 "message_count": len(messages),
                 "input_chars": len(rendered),
@@ -772,12 +772,12 @@ participant_facts добавляй только с точным participant_key 
                 system=MEMORY_SYSTEM_PROMPT, user=user, response_format="json",
             ), timeout=self.profile_timeout_seconds)
         except asyncio.TimeoutError as exc:
-            update_opik_span_metadata({"profile_status": "failed", "profile_failure": "timeout"})
+            update_span_metadata({"profile_status": "failed", "profile_failure": "timeout"})
             raise ProfileExtractionError("profile_timeout") from exc
         data = _json_object(response)
         if (not data or not isinstance(data.get("participant_facts"), list)
                 or any(not isinstance(fact, dict) for fact in data["participant_facts"])):
-            update_opik_span_metadata(
+            update_span_metadata(
                 {
                     "json_valid": False,
                     "invalid_output_chars": len(response),
@@ -788,7 +788,7 @@ participant_facts добавляй только с точным participant_key 
             raise ProfileExtractionError("profile_invalid_json")
 
         stats = await self._save_participant_facts(chat_id, data, messages, max_saved=1)
-        update_opik_span_metadata(
+        update_span_metadata(
             {
                 "json_valid": True,
                 "participant_facts_returned": stats["returned"],
@@ -930,14 +930,14 @@ participant_facts добавляй только с точным participant_key 
         scored.sort(key=lambda item: (item[0], item[1].period_end), reverse=True)
         return [block for _, block in scored]
 
-    @opik_track(name="memory.rerank")
+    @trace(name="memory.rerank")
     async def _rerank_blocks(self, blocks: list[ChatMemoryBlock], query: str) -> list[ChatMemoryBlock]:
         if len(blocks) <= self.search_limit:
             return blocks
         rendered = "\n\n".join(
             f"block_id={block.block_id}\n{_block_text(block)[:1200]}" for block in blocks
         )
-        update_opik_span_metadata(
+        update_span_metadata(
             {
                 "candidate_count": len(blocks),
                 "query_chars": len(query),

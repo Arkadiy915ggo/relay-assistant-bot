@@ -1,26 +1,149 @@
+"""Local operation logging and an opt-in, provider-neutral tracing interface.
+
+No exporter is imported until both explicit activation and a key are present.
+Exporters receive completed records; they never wrap or re-run application code.
+"""
 from __future__ import annotations
 
+import asyncio
 import functools
 import json
 import logging
 import time
+from collections.abc import Awaitable, Callable, Iterator
 from contextlib import asynccontextmanager, contextmanager
-from collections.abc import Awaitable, Callable
 from contextvars import ContextVar
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Literal, TypeVar, cast
+from importlib.metadata import entry_points
+from typing import Any, Literal, Protocol, TypeVar, cast
+
+from tg_summary_bot.config import Settings
 
 
-_opik_enabled = False
-_opik_project_name = ""
-_trace_depth: ContextVar[int] = ContextVar("opik_trace_depth", default=0)
-_llm_usage_totals: ContextVar[dict[str, int] | None] = ContextVar(
-    "opik_llm_usage_totals",
-    default=None,
-)
+@dataclass(frozen=True)
+class TraceOptions:
+    backend: str
+    project_name: str
+    api_key: str = field(repr=False)
+    workspace: str = ""
+    endpoint: str = ""
+    capture_content: bool = False
 
+
+@dataclass(frozen=True)
+class TracingStatus:
+    state: str = "disabled"
+    backend: str = ""
+    project_name: str = ""
+    capture_content: bool = False
+
+    @property
+    def active(self) -> bool:
+        return self.state == "active"
+
+
+@dataclass
+class SpanRecord:
+    id: str
+    trace_id: str
+    parent_span_id: str | None
+    name: str
+    type: str
+    start_time: datetime
+    end_time: datetime | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+    input: dict[str, Any] | None = None
+    output: dict[str, Any] | None = None
+    error_info: dict[str, str] | None = None
+    usage: dict[str, int] | None = None
+    provider: str | None = None
+    model: str | None = None
+    tags: list[str] = field(default_factory=list)
+
+
+class TraceBackend(Protocol):
+    def new_id(self) -> str: ...
+    def record_span(self, record: SpanRecord) -> None: ...
+    async def aclose(self) -> None: ...
+
+
+_backend: TraceBackend | None = None
+_status = TracingStatus()
+_current_span: ContextVar[SpanRecord | None] = ContextVar("current_span", default=None)
+_root_span: ContextVar[SpanRecord | None] = ContextVar("root_span", default=None)
 F = TypeVar("F", bound=Callable[..., Awaitable[Any]])
+
+
+def inspect_tracing(settings: Settings) -> TracingStatus:
+    """Diagnose configuration without importing an exporter or its SDK."""
+    state = "disabled"
+    if settings.tracing_enabled:
+        if not settings.tracing_api_key.strip():
+            state = "missing_api_key"
+        else:
+            try:
+                entries = entry_points(group="tg_summary_bot.observability", name=settings.tracing_backend)
+                state = "configured" if entries else "missing_backend"
+            except Exception:
+                state = "discovery_failed"
+    return TracingStatus(state, settings.tracing_backend, settings.tracing_project_name,
+                         settings.tracing_capture_content)
+
+
+def tracing_status() -> TracingStatus:
+    return _status
+
+
+def disable_tracing(reason: str = "backend_error") -> None:
+    global _status
+    if _status.active:
+        _status = TracingStatus(reason, _status.backend, _status.project_name,
+                                _status.capture_content)
+        # Never log raw provider errors, endpoints or credentials.
+        logging.warning("Tracing disabled: %s", reason)
+
+
+async def configure_tracing(settings: Settings) -> TracingStatus:
+    """Called once at startup, independently of the number of model clients."""
+    global _backend, _status
+    await close_tracing()
+    _status = inspect_tracing(settings)
+    if _status.state != "configured":
+        if settings.tracing_enabled:
+            logging.warning("Tracing disabled: %s", _status.state)
+        return _status
+    try:
+        entries = entry_points(group="tg_summary_bot.observability", name=settings.tracing_backend)
+        if len(entries) != 1:
+            raise RuntimeError("ambiguous_backend")
+        factory = next(iter(entries)).load()
+        options = TraceOptions(
+            backend=settings.tracing_backend, project_name=settings.tracing_project_name,
+            api_key=settings.tracing_api_key.strip(), workspace=settings.tracing_workspace,
+            endpoint=settings.tracing_endpoint, capture_content=settings.tracing_capture_content,
+        )
+        _backend = await factory(options, disable_tracing)
+    except Exception:
+        _status = TracingStatus("initialization_failed", _status.backend,
+                                _status.project_name, _status.capture_content)
+        logging.warning("Tracing disabled: initialization_failed")
+    else:
+        _status = TracingStatus("active", _status.backend, _status.project_name,
+                                _status.capture_content)
+    return _status
+
+
+async def close_tracing() -> TracingStatus:
+    global _backend, _status
+    backend, _backend = _backend, None
+    if backend is not None:
+        try:
+            await asyncio.wait_for(backend.aclose(), timeout=5)
+        except Exception:
+            disable_tracing("shutdown_failed")
+    final_status, _status = _status, TracingStatus()
+    return final_status
 
 
 @dataclass(frozen=True)
@@ -63,177 +186,105 @@ def log_operation_outcome(
         **metadata,
     }
     logging.getLogger("tg_summary_bot.operations").info(json.dumps(event, ensure_ascii=False))
-    update_opik_span_metadata({key: value for key, value in event.items() if key != "created_at"})
-    if _opik_enabled:
-        try:
-            import opik
-            opik.opik_context.update_current_trace(metadata={key: value for key, value in event.items() if key != "created_at"})
-        except Exception:
-            pass
+    safe_metadata = {key: value for key, value in event.items() if key != "created_at"}
+    update_span_metadata(safe_metadata)
+    root = _root_span.get()
+    if root is not None:
+        root.metadata.update(safe_metadata)
 
 
-def configure_opik_tracing(*, enabled: bool, project_name: str) -> None:
-    global _opik_enabled, _opik_project_name
-    _opik_enabled = enabled
-    _opik_project_name = project_name
+def get_current_span() -> SpanRecord | None:
+    return _current_span.get()
 
 
-def opik_track(
-    *,
-    name: str,
-    type: str = "general",
-    capture_input: bool = False,
-    capture_output: bool = False,
-    create_duplicate_root_span: bool = False,
-) -> Callable[[F], F]:
-    def decorator(func: F) -> F:
-        tracked_func: F | None = None
-        tracked_project_name: str | None = None
-
-        @functools.wraps(func)
-        async def wrapper(*args: Any, **kwargs: Any) -> Any:
-            nonlocal tracked_func, tracked_project_name
-            if not _opik_enabled:
-                return await func(*args, **kwargs)
-
-            if tracked_func is None or tracked_project_name != _opik_project_name:
-                try:
-                    import opik
-                except ImportError:
-                    return await func(*args, **kwargs)
-
-                tracked_func = cast(
-                    F,
-                    opik.track(
-                        name=name,
-                        type=type,
-                        project_name=_opik_project_name or None,
-                        capture_input=capture_input,
-                        capture_output=capture_output,
-                        create_duplicate_root_span=create_duplicate_root_span,
-                    )(func),
-                )
-                tracked_project_name = _opik_project_name
-
-            depth = _trace_depth.get()
-            depth_token = _trace_depth.set(depth + 1)
-            totals_token = None
-            if depth == 0:
-                totals_token = _llm_usage_totals.set(
-                    {
-                        "call_count": 0,
-                        "prompt_tokens": 0,
-                        "completion_tokens": 0,
-                        "total_tokens": 0,
-                    }
-                )
-            try:
-                return await tracked_func(*args, **kwargs)
-            finally:
-                _trace_depth.reset(depth_token)
-                if totals_token is not None:
-                    _llm_usage_totals.reset(totals_token)
-
-        return cast(F, wrapper)
-
-    return decorator
-
-
-class HandledOperationError(RuntimeError):
-    def __init__(self, outcome: OperationOutcome) -> None:
-        super().__init__(outcome.reason)
-        self.outcome = outcome
-
-
-def opik_operation(*, name: str):
-    """Record handled partial/failure outcomes as trace errors, without re-failing the handler.
-
-    Opik's decorator finalization overwrites manually-set root error_info on a normal
-    return. A content-free sentinel passes through that decorator, then is consumed here.
-    """
-    def decorator(func):
-        # A real root span anchors nested spans. A trace-only root is popped by
-        # this SDK when its first parentless child completes, orphaning later work.
-        @opik_track(name=name, create_duplicate_root_span=True)
-        async def tracked(*args, **kwargs):
-            outcome = await func(*args, **kwargs)
-            if _opik_enabled and outcome.status in {"failed", "partial"}:
-                raise HandledOperationError(outcome)
-            return outcome
-
-        @functools.wraps(func)
-        async def wrapper(*args, **kwargs):
-            try:
-                return await tracked(*args, **kwargs)
-            except HandledOperationError as exc:
-                return exc.outcome
-        return wrapper
-    return decorator
-
-
-def update_opik_span_metadata(metadata: dict[str, Any], *, name: str | None = None) -> None:
-    if not _opik_enabled:
-        return
-    try:
-        import opik
-    except ImportError:
-        return
-    span_updated = False
-    try:
-        opik.opik_context.update_current_span(metadata=metadata, name=name)
+def update_span_metadata(metadata: dict[str, Any], *, name: str | None = None) -> None:
+    span = _current_span.get()
+    if span is not None:
+        span.metadata.update(metadata)
         if name:
-            opik.opik_context.update_current_trace(name=name, metadata=metadata)
-        span_updated = True
-    except Exception:
-        pass
-    if span_updated:
-        return
-    try:
-        opik.opik_context.update_current_trace(metadata=metadata, name=name)
-    except Exception:
-        return
+            span.name = name
+            root = _root_span.get()
+            if root is not None:
+                root.name = name
+                root.metadata.update(metadata)
 
 
 @contextmanager
-def opik_stage(name: str, metadata: dict[str, Any] | None = None):
-    """Content-free orchestration timing; never attach speech, paths or raw exceptions."""
+def trace_stage(
+    name: str, metadata: dict[str, Any] | None = None, *, type: str = "general",
+) -> Iterator[SpanRecord | None]:
+    """Measure a stage; export failures never alter the application outcome."""
     started = time.perf_counter()
-    manager = None
+    backend = _backend if _status.active else None
+    parent = _current_span.get()
     span = None
-    failed = False
-    if _opik_enabled:
+    if backend is not None:
         try:
-            import opik
-            manager = opik.start_as_current_span(name=name, project_name=_opik_project_name or None,
-                                                 metadata=metadata or {})
-            span = manager.__enter__()
+            span = SpanRecord(
+                id=backend.new_id(), trace_id=parent.trace_id if parent else backend.new_id(),
+                parent_span_id=parent.id if parent else None, name=name, type=type,
+                start_time=datetime.now(timezone.utc), metadata=dict(metadata or {}),
+            )
         except Exception:
-            manager = None
+            disable_tracing()
+    # Isolate untraced children too, rather than mutating a parent's record.
+    span_token = _current_span.set(span)
+    root_token = _root_span.set(span) if parent is None else None
+    failed = False
     try:
-        yield
+        yield span
     except BaseException as exc:
         failed = True
         if span is not None:
-            span.error_info = {"exception_type": type(exc).__name__, "message": f"{name}_failed", "traceback": ""}
+            span.error_info = {"exception_type": exc.__class__.__name__,
+                               "message": f"{name}_failed", "traceback": ""}
         raise
     finally:
         elapsed_ms = round((time.perf_counter() - started) * 1000, 1)
+        _current_span.reset(span_token)
+        if root_token is not None:
+            _root_span.reset(root_token)
         if span is not None:
-            span.metadata = {**(metadata or {}), **(span.metadata or {}), "elapsed_ms": elapsed_ms,
-                             "stage_status": "failed" if failed else "succeeded"}
-        if manager is not None:
-            try:
-                manager.__exit__(None, None, None)
-            except Exception:
-                pass
+            span.end_time = datetime.now(timezone.utc)
+            span.metadata.update(elapsed_ms=elapsed_ms,
+                                 stage_status="failed" if span.error_info else "succeeded")
+            if _status.active and backend is _backend:
+                try:
+                    backend.record_span(span)
+                except Exception:
+                    disable_tracing()
         if name.startswith("speech."):
             logging.info("Speech stage=%s elapsed_ms=%s status=%s", name, elapsed_ms,
                          "failed" if failed else "succeeded")
 
 
+def trace(*, name: str, type: str = "general") -> Callable[[F], F]:
+    def decorator(func: F) -> F:
+        @functools.wraps(func)
+        async def wrapper(*args: Any, **kwargs: Any) -> Any:
+            with trace_stage(name, type=type):
+                return await func(*args, **kwargs)
+        return cast(F, wrapper)
+    return decorator
+
+
+def trace_operation(*, name: str) -> Callable[[F], F]:
+    def decorator(func: F) -> F:
+        @functools.wraps(func)
+        async def wrapper(*args: Any, **kwargs: Any) -> Any:
+            with trace_stage(name) as span:
+                outcome = await func(*args, **kwargs)
+                if span is not None and outcome.status in {"failed", "partial"}:
+                    span.error_info = {"exception_type": "HandledOperationError",
+                                       "message": outcome.reason, "traceback": ""}
+                return outcome
+        return cast(F, wrapper)
+    return decorator
+
+
 @asynccontextmanager
 async def traced_gpu_lock(lock, operation: str):
-    with opik_stage(f"{operation}.gpu_wait"):
+    with trace_stage(f"{operation}.gpu_wait"):
         await lock.acquire()
     try:
         yield
@@ -241,106 +292,35 @@ async def traced_gpu_lock(lock, operation: str):
         lock.release()
 
 
-def update_opik_llm_usage(
-    *,
-    provider: str,
-    model: str,
-    usage: dict[str, int] | None,
+def update_llm_usage(
+    *, provider: str, model: str, usage: dict[str, int] | None,
     metadata: dict[str, Any] | None = None,
 ) -> None:
-    if not _opik_enabled:
+    span, root = _current_span.get(), _root_span.get()
+    if span is None:
         return
-    try:
-        import opik
-    except ImportError:
-        return
-
-    normalized_usage = _normalize_usage(usage or {})
-    span_metadata = {
-        "provider": provider,
-        "model": model,
-        **(metadata or {}),
-    }
-    if normalized_usage:
-        span_metadata.update(
-            {
-                "prompt_tokens": normalized_usage["prompt_tokens"],
-                "completion_tokens": normalized_usage["completion_tokens"],
-                "total_tokens": normalized_usage["total_tokens"],
-            }
-        )
-
-    try:
-        opik.opik_context.update_current_span(
-            metadata=span_metadata,
-            usage=normalized_usage or None,
-            provider=provider,
-            model=model or None,
-        )
-    except Exception:
-        pass
-
-    trace_metadata: dict[str, Any] = {
-        "llm_last_provider": provider,
-        "llm_last_model": model,
-    }
-    for key in (
-        "num_ctx",
-        "num_predict",
-        "total_duration_s",
-        "eval_duration_s",
-        "eval_tokens_per_second",
-        "output_chars",
-        "ctx_saturated",
-        "output_too_short",
-    ):
-        if metadata and key in metadata:
-            trace_metadata[f"llm_last_{key}"] = metadata[key]
-    totals = _llm_usage_totals.get()
-    if normalized_usage and totals is not None:
-        totals["call_count"] += 1
-        totals["prompt_tokens"] += normalized_usage["prompt_tokens"]
-        totals["completion_tokens"] += normalized_usage["completion_tokens"]
-        totals["total_tokens"] += normalized_usage["total_tokens"]
-        trace_metadata.update(
-            {
-                "llm_call_count": totals["call_count"],
-                "llm_prompt_tokens": totals["prompt_tokens"],
-                "llm_completion_tokens": totals["completion_tokens"],
-                "llm_total_tokens": totals["total_tokens"],
-            }
-        )
-    elif normalized_usage:
-        trace_metadata.update(
-            {
-                "llm_call_count": 1,
-                "llm_prompt_tokens": normalized_usage["prompt_tokens"],
-                "llm_completion_tokens": normalized_usage["completion_tokens"],
-                "llm_total_tokens": normalized_usage["total_tokens"],
-            }
-        )
-
-    try:
-        opik.opik_context.update_current_trace(metadata=trace_metadata)
-    except Exception:
-        return
+    normalized = _normalize_usage(usage or {})
+    span.provider, span.model = provider, model
+    span.usage = normalized or None
+    span.metadata.update({"provider": provider, "model": model, **(metadata or {}), **normalized})
+    if root is not None:
+        root.metadata.update(llm_last_provider=provider, llm_last_model=model)
+        for key in ("num_ctx", "num_predict", "total_duration_s", "eval_duration_s",
+                    "eval_tokens_per_second", "output_chars", "ctx_saturated", "output_too_short"):
+            if metadata and key in metadata:
+                root.metadata[f"llm_last_{key}"] = metadata[key]
+        if normalized:
+            root.metadata["llm_call_count"] = root.metadata.get("llm_call_count", 0) + 1
+            for key, value in normalized.items():
+                total_key = f"llm_{key}"
+                root.metadata[total_key] = root.metadata.get(total_key, 0) + value
 
 
 def _normalize_usage(usage: dict[str, int]) -> dict[str, int]:
-    prompt_tokens = _int_usage_value(usage.get("prompt_tokens") or usage.get("input_tokens"))
-    completion_tokens = _int_usage_value(
-        usage.get("completion_tokens") or usage.get("output_tokens")
-    )
-    total_tokens = _int_usage_value(usage.get("total_tokens"))
-    if not total_tokens and (prompt_tokens or completion_tokens):
-        total_tokens = prompt_tokens + completion_tokens
-    if not (prompt_tokens or completion_tokens or total_tokens):
-        return {}
-    return {
-        "prompt_tokens": prompt_tokens,
-        "completion_tokens": completion_tokens,
-        "total_tokens": total_tokens,
-    }
+    prompt = _int_usage_value(usage.get("prompt_tokens") or usage.get("input_tokens"))
+    completion = _int_usage_value(usage.get("completion_tokens") or usage.get("output_tokens"))
+    total = _int_usage_value(usage.get("total_tokens")) or prompt + completion
+    return {"prompt_tokens": prompt, "completion_tokens": completion, "total_tokens": total} if total else {}
 
 
 def _int_usage_value(value: object) -> int:

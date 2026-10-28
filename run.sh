@@ -9,12 +9,14 @@ usage() {
   cat <<'EOF'
 Usage:
   ./run.sh install   Create .venv and install dependencies
-  ./run.sh install-opik
-                     Create .venv and install Opik tracing dependencies
+  ./run.sh install-dev
+                     Install bot and separate optional development tracing package
   ./run.sh install-voice
                      Create .venv and install CPU voice transcription dependencies
   ./run.sh install-voice-cuda
-                       Create .venv and install CUDA voice transcription dependencies
+                        Create .venv and install CUDA voice transcription dependencies
+  ./run.sh download-whisper <model>
+                      Explicitly download a Whisper model for local-only runtime use
   ./run.sh install-tts-cosyvoice3
                       Install separate Python 3.10 TTS environment, upstream and model (~5 GB)
   ./run.sh doctor    Check local config, Ollama, models, ffmpeg, and Whisper
@@ -61,10 +63,10 @@ case "$COMMAND" in
     .venv/bin/python -m pip install --upgrade pip
     .venv/bin/python -m pip install -e .
     ;;
-  install-opik)
+  install-dev)
     python3 -m venv .venv
     .venv/bin/python -m pip install --upgrade pip
-    .venv/bin/python -m pip install -e '.[opik]'
+    .venv/bin/python -m pip install -e . -e ./dev/opik
     ;;
   install-voice)
     python3 -m venv .venv
@@ -78,6 +80,14 @@ case "$COMMAND" in
     ;;
   install-tts-cosyvoice3)
     bash scripts/install_tts_cosyvoice3.sh
+    ;;
+  download-whisper)
+    ensure_venv
+    if [ -z "${2:-}" ]; then
+      echo "Usage: ./run.sh download-whisper <model>, for example: small or large-v3"
+      exit 1
+    fi
+    .venv/bin/python -m tg_summary_bot.transcriber "$2"
     ;;
   doctor)
     ensure_venv

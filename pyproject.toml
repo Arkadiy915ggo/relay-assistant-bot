@@ -14,9 +14,6 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-opik = [
-    "opik>=2,<3",
-]
 voice = [
     "faster-whisper>=1.1,<2",
 ]

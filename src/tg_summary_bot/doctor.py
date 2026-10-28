@@ -9,6 +9,8 @@ import sys
 import httpx
 
 from tg_summary_bot.config import load_settings
+from tg_summary_bot.observability import inspect_tracing
+from tg_summary_bot.transcriber import resolve_whisper_model
 from tg_summary_bot.voice_presets import VoiceRegistry
 from tg_summary_bot.speech_synthesizer import COSYVOICE_MODEL_FILES, SpeechSynthesizer
 
@@ -80,6 +82,14 @@ def main() -> int:
     _ok(".env loaded and TELEGRAM_BOT_TOKEN is set")
     provider = settings.resolved_llm_provider
     _ok(f"LLM provider: {provider}")
+    if settings.llm_provider == "auto":
+        _ok("LLM_PROVIDER=auto selects OpenAI when OPENAI_API_KEY is present; use ollama to force local text generation")
+    tracing = inspect_tracing(settings)
+    if tracing.state in {"disabled", "configured"}:
+        _ok(f"Tracing: {tracing.state} (diagnosis only; no SDK import or network check)")
+    else:
+        _warn(f"Tracing disabled: {tracing.state}; developer setup: ./run.sh install-dev")
+        warnings += 1
 
     system = platform.system().lower()
     if system == "darwin":
@@ -166,6 +176,17 @@ def main() -> int:
     if settings.transcribe_voice or settings.video_transcribe_audio:
         if importlib.util.find_spec("faster_whisper"):
             _ok("faster-whisper is installed")
+            if settings.whisper_local_files_only:
+                try:
+                    resolve_whisper_model(settings.whisper_model, local_files_only=True)
+                except RuntimeError as exc:
+                    _warn(str(exc))
+                    warnings += 1
+                else:
+                    _ok("Whisper model/tokenizer available locally; runtime downloads disabled")
+            else:
+                _warn("WHISPER_LOCAL_FILES_ONLY=false permits runtime Hugging Face requests")
+                warnings += 1
         else:
             _fail("faster-whisper is not installed. Run: ./run.sh install-voice")
             errors += 1

@@ -18,3 +18,4 @@ relay-assistant-bot-doc/.obsidian/
 /voices/local/
 /tts/
 /build/
+/dev/*/build/

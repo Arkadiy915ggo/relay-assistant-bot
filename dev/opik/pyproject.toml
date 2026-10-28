@@ -1,0 +1,21 @@
+[project]
+name = "relay-assistant-bot-opik"
+version = "0.1.0"
+description = "Opt-in development tracing exporter for relay-assistant-bot"
+requires-python = ">=3.11"
+dependencies = [
+    "telegram-summary-bot>=0.1,<0.2",
+    # The adapter uses the generated async REST client, not SDK background trackers.
+    "opik==2.1.15",
+    "uuid6>=2024.7.10,<2027",
+]
+
+[project.entry-points."tg_summary_bot.observability"]
+opik = "relay_bot_opik:create_backend"
+
+[build-system]
+requires = ["setuptools>=70"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]

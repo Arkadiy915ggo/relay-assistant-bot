@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import timedelta
 from pathlib import Path
 
@@ -126,9 +126,6 @@ class Settings:
     wiki_timeout_seconds: int
     wiki_max_results: int
     wiki_user_agent: str
-    opik_enabled: bool
-    opik_project_name: str
-    opik_capture_content: bool
     autonomous_jokes_enabled: bool
     autonomous_jokes_shadow_mode: bool
     autonomous_jokes_block_messages: int
@@ -169,6 +166,14 @@ class Settings:
     autonomous_jokes_session_max_calls: int = 8
     autonomous_jokes_session_max_seconds: int = 120
     autonomous_jokes_max_validation_failures: int = 3
+    whisper_local_files_only: bool = True
+    tracing_enabled: bool = False
+    tracing_backend: str = "opik"
+    tracing_project_name: str = "telegram-summary-bot"
+    tracing_capture_content: bool = False
+    tracing_api_key: str = field(default="", repr=False)
+    tracing_workspace: str = ""
+    tracing_endpoint: str = ""
 
     @property
     def resolved_llm_provider(self) -> str:
@@ -300,9 +305,16 @@ def load_settings() -> Settings:
             os.getenv("WIKI_USER_AGENT", DEFAULT_WIKI_USER_AGENT).strip()
             or DEFAULT_WIKI_USER_AGENT
         ),
-        opik_enabled=_bool(os.getenv("OPIK_ENABLED", "false")),
-        opik_project_name=os.getenv("OPIK_PROJECT_NAME", "telegram-summary-bot").strip(),
-        opik_capture_content=_bool(os.getenv("OPIK_CAPTURE_CONTENT", "true"), default=True),
+        # Legacy names remain readable for existing development environments.
+        # Only an explicit environment key counts; SDK home configuration cannot enable tracing.
+        tracing_enabled=_bool(os.getenv("TRACING_ENABLED", os.getenv("OPIK_ENABLED", "false"))),
+        tracing_backend=os.getenv("TRACING_BACKEND", "opik").strip(),
+        tracing_project_name=os.getenv("TRACING_PROJECT_NAME", os.getenv("OPIK_PROJECT_NAME", "telegram-summary-bot")).strip(),
+        tracing_capture_content=_bool(os.getenv("TRACING_CAPTURE_CONTENT", os.getenv("OPIK_CAPTURE_CONTENT", "false"))),
+        tracing_api_key=os.getenv("TRACING_API_KEY", os.getenv("OPIK_API_KEY", "")).strip(),
+        tracing_workspace=os.getenv("TRACING_WORKSPACE", os.getenv("OPIK_WORKSPACE", "")).strip(),
+        tracing_endpoint=os.getenv("TRACING_ENDPOINT", os.getenv("OPIK_URL_OVERRIDE", "")).strip().rstrip("/"),
+        whisper_local_files_only=_bool(os.getenv("WHISPER_LOCAL_FILES_ONLY", "true"), default=True),
         autonomous_jokes_enabled=_bool(os.getenv("AUTONOMOUS_JOKES_ENABLED", "false")),
         autonomous_jokes_shadow_mode=_bool(os.getenv("AUTONOMOUS_JOKES_SHADOW_MODE", "true"), default=True),
         autonomous_jokes_block_messages=block_messages,
