@@ -117,6 +117,51 @@ class ProfileBatchTests(unittest.IsolatedAsyncioTestCase):
         facts = await self.store.get_participant_facts(chat_id=1, limit=10)
         self.assertEqual(json.loads(facts[0].source_message_ids), [1])
 
+    async def test_rejected_first_candidate_does_not_hide_valid_profile_fact(self):
+        rejected = [
+            {},
+            {"fact": "Коротко"},
+            {"source_message_ids": [999]},
+            {"confidence": "low"},
+            {"participant_key": "id:999"},
+        ]
+        for message_id, changes in enumerate(rejected, start=1):
+            with self.subTest(changes=changes):
+                await self.save(message_id, f"Я отвечаю за проект {message_id} и документацию.")
+                valid = {"participant_key": "id:7", "fact_type": "responsibility",
+                         "fact": f"Отвечает за проект {message_id} и документацию.",
+                         "source_message_ids": [message_id], "confidence": "high"}
+                first = {**valid, **changes} if changes else {}
+                self.llm.complete.return_value = json.dumps({"participant_facts": [first, valid]})
+                self.assertEqual(await self.memory.ensure_recent_profiles_current(1, now=NOW), 1)
+                self.assertEqual((await self.store.get_profile_cursor(1)).message_id, message_id)
+                self.assertEqual(await self.store.count_participant_facts(1), message_id)
+                calls = self.llm.complete.await_count
+                self.assertEqual(await self.memory.ensure_recent_profiles_current(1, now=NOW), 0)
+                self.assertEqual(self.llm.complete.await_count, calls)
+
+    async def test_profile_refresh_saves_only_one_valid_fact(self):
+        await self.save(1, "Я отвечаю за проект и документацию.")
+        facts = [{"participant_key": "id:7", "fact_type": "responsibility", "fact": text,
+                  "source_message_ids": [1], "confidence": "high"}
+                 for text in ("Отвечает за проект.", "Готовит документацию.")]
+        self.llm.complete.return_value = json.dumps({"participant_facts": [{}, *facts]})
+        self.assertEqual(await self.memory.ensure_recent_profiles_current(1, now=NOW), 1)
+        saved = await self.store.get_participant_facts(chat_id=1, limit=10)
+        self.assertEqual([fact.fact_text for fact in saved], [facts[0]["fact"]])
+
+    async def test_memory_fact_persistence_keeps_multiple_valid_facts(self):
+        await self.save(1, "Я отвечаю за проект и документацию.")
+        messages = await self.store.get_messages_since(
+            chat_id=1, since=NOW - timedelta(hours=1), limit_chars=2000,
+        )
+        facts = [{"participant_key": "id:7", "fact_type": "responsibility", "fact": text,
+                  "source_message_ids": [1], "confidence": "high"}
+                 for text in ("Отвечает за проект.", "Готовит документацию.")]
+        stats = await self.memory._save_participant_facts(1, {"participant_facts": facts}, messages)
+        self.assertEqual(stats["saved"], 2)
+        self.assertEqual(await self.store.count_participant_facts(1), 2)
+
     async def test_migration_preserves_legacy_timestamp_checkpoint(self):
         path = Path(self.temporary.name) / "legacy.sqlite3"
         with closing(sqlite3.connect(path)) as db:

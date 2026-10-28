@@ -91,6 +91,38 @@ class RegistryTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             registry.resolve("anubarak", "broken")
 
+    def test_reference_sample_rate_and_duration_match_cosyvoice_limits(self):
+        cases = (
+            (8000, 8000, "reference_sample_rate_below_16000_hz"),
+            (15999, 15999, "reference_sample_rate_below_16000_hz"),
+            (16000, 16000 * 30, None),
+            (24000, 24000 * 30, None),
+            (24000, 24000 * 30 + 1, "reference_longer_than_30_seconds"),
+            (24000, 24000 * 31, "reference_longer_than_30_seconds"),
+            (48000, 48000, None),
+        )
+        for rate, frames, error in cases:
+            with self.subTest(rate=rate, frames=frames), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                directory = make_preset(root)
+                with wave.open(str(directory / "reference.wav"), "wb") as audio:
+                    audio.setparams((1, 2, rate, 0, "NONE", "not compressed"))
+                    audio.writeframes(b"\0\0" * frames)
+                registry = VoiceRegistry(root)
+                self.assertTrue({"anubarak", "cartman"}.issubset(registry.presets))
+                if error:
+                    with self.assertRaisesRegex(ValueError, error):
+                        load_preset(directory)
+                    self.assertNotIn("sample", registry.presets)
+                    self.assertIn(error, " ".join(registry.diagnostics))
+                    preset, fallback = registry.resolve("sample", "anubarak")
+                    self.assertEqual(preset.id, "anubarak")
+                    self.assertTrue(fallback)
+                else:
+                    self.assertEqual(load_preset(directory).id, "sample")
+                    self.assertIn("sample", registry.presets)
+                    self.assertFalse(registry.diagnostics)
+
     def test_cartman_bundled_reference_and_neutral_settings(self):
         registry = VoiceRegistry(Path("/nonexistent-local-voices"))
         preset, fallback = registry.resolve("cartman", "anubarak")

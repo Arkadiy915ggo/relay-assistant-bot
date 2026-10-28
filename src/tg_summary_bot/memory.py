@@ -787,8 +787,7 @@ participant_facts добавляй только с точным participant_key 
             )
             raise ProfileExtractionError("profile_invalid_json")
 
-        data["participant_facts"] = data["participant_facts"][:1]
-        stats = await self._save_participant_facts(chat_id, data, messages)
+        stats = await self._save_participant_facts(chat_id, data, messages, max_saved=1)
         update_opik_span_metadata(
             {
                 "json_valid": True,
@@ -810,6 +809,8 @@ participant_facts добавляй только с точным participant_key 
         chat_id: int,
         data: dict[str, object],
         messages: list[StoredMessage],
+        *,
+        max_saved: int | None = None,
     ) -> dict[str, int]:
         message_by_id = {message.message_id: message for message in messages if message.message_id > 0}
         stats = _empty_fact_stats()
@@ -869,6 +870,10 @@ participant_facts добавляй только с точным participant_key 
                 expires_at=_expires_at(fact_type, last_seen, raw),
             )
             stats["saved"] += 1
+            # Limit accepted facts, not raw candidates: rejected entries must not
+            # hide a later valid fact before the profile cursor advances.
+            if max_saved is not None and stats["saved"] >= max_saved:
+                break
         return stats
 
     async def _maintain_hierarchy(self, chat_id: int) -> None:

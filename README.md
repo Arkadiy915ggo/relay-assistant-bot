@@ -180,7 +180,12 @@ bot-wide default instead, set `TTS_DEFAULT_VOICE=cartman` and restart.
 
 Additional voices live in the fully ignored `voices/local/<directory>/` (or configured
 local root). Copy the bundled `preset.json` schema and provide an original PCM WAV
-reference with an exact transcript. IDs use lowercase ASCII letters/digits/underscore/
+reference with an exact transcript, sample rate **at least 16 kHz**, and duration
+**greater than zero and at most 30 seconds** (30 seconds is accepted). Incompatible
+references are excluded before synthesis, with `reference_sample_rate_below_16000_hz`
+or `reference_longer_than_30_seconds` in the registry diagnostics/startup or doctor output.
+Prepare a compatible WAV and restart to reload the library.
+IDs use lowercase ASCII letters/digits/underscore/
 hyphen; `reset` is reserved. Version 1 supports `ru/en/zh/ja/ko/de/fr/es/it`, speed
 0.5–2, pitch −12–12 semitones and boolean `preserve_formants`. References
 must resolve within the preset directory, including symlinks. Invalid and duplicate
@@ -250,6 +255,9 @@ It asks for at most one useful source-backed fact, using a separate profile clie
 with `PROFILE_NUM_PREDICT=256` for Ollama and a `PROFILE_TIMEOUT_SECONDS=60` request
 limit. `PROFILE_MODEL` optionally chooses an already-installed model; empty uses the
 main LLM model. These settings do not change ordinary answer generation.
+If the model returns several candidates, rejected entries are skipped before applying
+the limit: at most the first valid fact is saved, so an invalid first candidate cannot
+hide a later valid one. General memory compression keeps its existing multi-fact behavior.
 
 Profile work has a two-second foreground grace period, skips an already-busy GPU,
 coalesces overlapping requests per chat, and attempts at most once per

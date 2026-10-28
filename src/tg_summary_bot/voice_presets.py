@@ -10,6 +10,14 @@ from pathlib import Path
 from types import MappingProxyType
 
 
+REFERENCE_MIN_SAMPLE_RATE = 16000
+REFERENCE_MAX_SECONDS = 30
+
+
+class ReferenceAudioError(ValueError):
+    """Content-free diagnosis for references outside the CosyVoice input contract."""
+
+
 @dataclass(frozen=True)
 class VoicePreset:
     id: str
@@ -44,8 +52,13 @@ def load_preset(directory: Path) -> VoicePreset:
     if not reference.is_relative_to(root) or not reference.is_file():
         raise ValueError("reference escapes preset root")
     with wave.open(str(reference), "rb") as audio:
-        if audio.getnframes() <= 0 or audio.getframerate() <= 0:
+        frames, sample_rate = audio.getnframes(), audio.getframerate()
+        if frames <= 0 or sample_rate <= 0:
             raise ValueError("empty reference")
+        if sample_rate < REFERENCE_MIN_SAMPLE_RATE:
+            raise ReferenceAudioError("reference_sample_rate_below_16000_hz")
+        if frames > sample_rate * REFERENCE_MAX_SECONDS:
+            raise ReferenceAudioError("reference_longer_than_30_seconds")
     post = data.get("post_processing")
     if not isinstance(post, dict):
         raise ValueError("missing post_processing")
@@ -83,7 +96,8 @@ class VoiceRegistry:
                     preset = load_preset(directory)
                     candidates.setdefault(preset.id, []).append(preset)
                 except (OSError, EOFError, ValueError, TypeError, RuntimeError, wave.Error) as exc:
-                    diagnostics.append(f"{directory.name}: invalid preset ({type(exc).__name__})")
+                    reason = str(exc) if isinstance(exc, ReferenceAudioError) else type(exc).__name__
+                    diagnostics.append(f"{directory.name}: invalid preset ({reason})")
             for voice_id, group in candidates.items():
                 if len(group) != 1 or voice_id in presets:
                     diagnostics.append(f"{voice_id}: duplicate preset excluded")

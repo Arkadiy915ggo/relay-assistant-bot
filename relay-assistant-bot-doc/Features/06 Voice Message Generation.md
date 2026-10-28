@@ -127,6 +127,10 @@ voices/local/                     # весь каталог Git-ignored
 - Добавить `/voices/local/` в `.gitignore`. Local root configurable; `voices/local/` — default относительно корня установки, разрешаемый в абсолютный путь.
 - Допустимые preset IDs ограничить простой схемой (например, lowercase ASCII letters/digits/underscore/hyphen). `reset` зарезервирован.
 - Проверять JSON types/version, непустой transcript, supported language, bounded post-processing values и наличие reference.
+- Reference должен быть непустым PCM WAV с частотой от **16 kHz** и длительностью
+  **до 30 секунд включительно**. Несовместимый preset исключается из registry до
+  synthesis; в startup/doctor diagnostics выводится `reference_sample_rate_below_16000_hz`
+  или `reference_longer_than_30_seconds`. После подготовки совместимого WAV перезапустить бот.
 - Reference разрешать только внутри директории preset, включая проверку resolved symlink path. Не принимать произвольные user paths через команды.
 - Duplicate IDs между bundled/local presets не должны молча переопределять голос. Broken/duplicate local presets исключать с диагностикой; валидные bundled voices остаются доступны. Невалидный configured default делает TTS недоступным с понятной диагностикой.
 - Изменения library подхватываются после restart; hot reload не нужен для MVP.
@@ -153,6 +157,11 @@ Preset ID `cartman`, display name `Картман`, language `ru`, speed 1.0, pi
 ### Runtime-стабилизация после review логов и Opik
 
 Исправлена причина больших profile batches: limit учитывает полный rendered input с headers, а не только raw text. Defaults: 2000 chars / 8 messages, один полезный факт, отдельный profile client с Ollama output budget 256 tokens, request timeout 60 s. Refresh делает один batch, coalesces задачи по чату, ждёт foreground grace 2 s, пропускает busy GPU и использует cooldown 120 s. Invalid JSON/timeouts сохраняют checkpoint; новая nullable колонка `chat_profile_state.processed_message_id` позволяет безопасно разбивать одинаковые timestamps, не меняя legacy checkpoint.
+
+Лимит одного profile fact применяется после проверки кандидатов: пустой, слишком
+короткий, low-confidence или не подтверждённый источниками первый объект не скрывает
+следующий валидный. Сохраняется не более первого валидного факта, после чего batch
+получает checkpoint. Обычная memory compression по-прежнему может сохранять несколько фактов.
 
 Slash command traces охватывают весь voice operation, включая GPU wait, LLM/unload, text delivery, speech synthesis/encoding/validation/upload/persistence. Root span нужен для правильного nesting в используемом SDK; иначе первый parentless child закрывал trace и оставлял остальные stages orphaned. Handled partial/failure outcomes отмечаются error в Opik без повторной ошибки Telegram handler. Profile refresh trace отсоединён от foreground trace. Speech stage metadata не содержит исходного текста, файлов или raw provider exceptions.
 
