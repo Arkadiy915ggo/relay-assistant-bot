@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import asyncio
 import platform
 import shutil
 import sys
@@ -8,6 +9,8 @@ import sys
 import httpx
 
 from tg_summary_bot.config import load_settings
+from tg_summary_bot.voice_presets import VoiceRegistry
+from tg_summary_bot.speech_synthesizer import COSYVOICE_MODEL_FILES, SpeechSynthesizer
 
 
 def _ok(message: str) -> None:
@@ -126,6 +129,10 @@ def main() -> int:
         if not _check_optional_model(ollama_models, settings.intent_router_model, "Intent router"):
             warnings += 1
 
+    if settings.memory_enabled and settings.profile_model and provider == "ollama":
+        if not _check_optional_model(ollama_models, settings.profile_model, "Profile refresh"):
+            warnings += 1
+
     if settings.autonomous_joke_judge_model and settings.resolved_llm_provider == "ollama":
         if not _check_optional_model(ollama_models, settings.autonomous_joke_judge_model, "Autonomous joke judge"):
             warnings += 1
@@ -168,6 +175,40 @@ def main() -> int:
     else:
         _ok("Voice/video audio transcription is disabled")
 
+    registry = VoiceRegistry(settings.tts_local_voices_dir)
+    for diagnostic in registry.diagnostics:
+        _warn(f"Voice registry: {diagnostic}")
+        warnings += 1
+    speech = SpeechSynthesizer(settings, registry)
+    reason = asyncio.run(speech.check_available())
+    if reason == "disabled":
+        _ok("TTS disabled; text bot needs no CosyVoice dependencies")
+    elif reason:
+        _warn(f"TTS unavailable: {reason}. Check TTS_* paths/limits; ./run.sh install-tts-cosyvoice3")
+        diagnoses = {
+            "missing_python": f"TTS_PYTHON_PATH must be executable: {settings.tts_python_path}",
+            "wrong_python_version": "TTS_PYTHON_PATH must use the separate Python 3.10 environment",
+            "missing_upstream": f"TTS_COSYVOICE_UPSTREAM_DIR needs cosyvoice/cli/cosyvoice.py: {settings.tts_cosyvoice_upstream_dir}",
+            "missing_model": f"TTS_MODEL_DIR needs cosyvoice3.yaml and baseline weights: {settings.tts_model_dir}",
+            "invalid_default_voice": f"TTS_DEFAULT_VOICE is not in the valid registry: {settings.tts_default_voice}",
+            "missing_dependencies": "Reinstall pinned TTS dependencies and upstream submodules in the separate environment",
+            "cuda_unavailable": "Dedicated TTS torch cannot see CUDA; check NVIDIA driver and cu121 torch installation",
+            "missing_rubberband_or_libopus": "Install ffmpeg built with rubberband filter and libopus encoder",
+            "invalid_limits": "All TTS character/duration/execution/encoding/upload limits must be positive integers",
+        }
+        if reason in diagnoses:
+            _warn(diagnoses[reason])
+        if reason == "missing_model":
+            for name in COSYVOICE_MODEL_FILES:
+                path = settings.tts_model_dir / name
+                if not path.is_file() or path.stat().st_size == 0:
+                    _warn(f"Missing/empty TTS model file: {path}")
+        warnings += 1
+    else:
+        _ok("CosyVoice runner/CUDA and ffmpeg libopus/rubberband available (no model synthesis performed)")
+    if settings.tts_enabled and not settings.ollama_unload_after_task:
+        _warn("Resident Ollama may retain VRAM: set OLLAMA_UNLOAD_AFTER_TASK=true for LLM → TTS baseline")
+        warnings += 1
     print(f"Doctor finished: {errors} error(s), {warnings} warning(s)")
     return 1 if errors else 0
 

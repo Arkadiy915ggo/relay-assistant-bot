@@ -8,6 +8,42 @@
 
 Product source of truth: [[01 Product Vision]]. При будущих дизайнах использовать community-first positioning и конструктор chat persona/skills/prompts. Формальный рабочий профиль — один из presets; existing aliases/access/economics contracts не менять лишь из-за нового вижена.
 
+## Handoff после стабилизации и синхронизации веток
+
+Актуализация 2026-10-28: локальная `experiment/qwen3-tts-voice-clone` переименована в
+`release/bot-voice-presets`. Резервный коммит `2d4640b` сохранён веткой
+`backup/before-voice-release-2026-10-28`. Эксперименты остаются локально под
+`.gitignore`, а bundled references находятся в `src/tg_summary_bot/voice_presets/`.
+Для текущего setup использовать README и раздел «Запуск и отключение» Feature 06.
+Ниже — исторический snapshot синхронизации, а не инструкция вливать эксперименты.
+
+Снимок состояния, зафиксированный 2026-10-06 перед этим documentation-only дополнением:
+
+| Изменение | `experiment/qwen3-tts-voice-clone` | `feature/intent-router-casino` |
+| --- | --- | --- |
+| Первый раунд стабилизации | `4ddf173` | `9e19a92` |
+| Пять исправлений полного ревью | `d3c821c` | `142bb38` |
+| Community-first vision и будущие дизайны | `2242915` | `73599a1` |
+
+- Обе ветки были отправлены на `origin`; на точке `2242915` / `73599a1` их tracked file contents полностью совпадали.
+- Все отсутствовавшие TTS-коммиты также cherry-picked в казино-ветку. Она включает runtime fixes, TTS CLI experiments, Product Vision и Features 06-12 drafts.
+- 116 тестов прошли на синхронизированной казино-ветке; `compileall` и `git diff --check` прошли. Полный результат и ограничения: [[Features/05.5 Pre-Merge Stabilization]].
+- Известная ошибка `yt-dlp` successful-download handling исправлена; реальная YouTube availability/cookies/network diagnosis не выполнена. Не считать этот вопрос закрытым только по unit tests.
+- Следующий интеграционный PR: `feature/intent-router-casino` → `main`. PR/merge не создавались в рамках синхронизации. Проверять актуальные refs: этот snapshot не является обещанием, что последующие commits уже перенесены или опубликованы.
+
+Проверка перед дальнейшей интеграцией:
+
+```bash
+git fetch origin
+git status --short --branch
+git diff main...release/bot-voice-presets --stat
+git log --oneline main..release/bot-voice-presets
+```
+
+Cherry-pick создаёт разные commit IDs при одинаковом содержимом. `git diff` проверяет file contents, `git cherry` помогает определить patch-equivalent commits. После merge казино-ветки не вливать старую TTS-ветку повторно только ради уже перенесённого набора изменений; для следующей фичи предпочтительна новая ветка от обновлённого `main`.
+
+При squash merge patch-equivalence отдельных commits может не определиться через `git cherry`; сверять итоговый diff и состав merged PR. Если всё же продолжается старая TTS-ветка, сначала привести её базу в соответствие с новым main и исключить повторное внесение старых изменений. Последующие documentation-only дополнения переносить отдельно при необходимости.
+
 ## Фича 1: алиасы (реализовано)
 
 Документ: [[Features/01 Aliases and Address Detection]]
@@ -90,9 +126,22 @@ Selector failure не должен ломать summary, /compare не начи�
 Не читай .env и data/. Добавь migrations, restart/race/rollback/GPU/lifecycle/bot-casino tests и выполни full verification.
 ```
 
+## Фича 6: голосовые сообщения (план для следующей сессии)
+
+План от 2026-10-12: [[Features/06 Voice Message Generation]]. Runtime ещё не реализован.
+
+Готовый standalone prompt: [06 Voice Message Generation Implementation Prompt.md](Prompts/06%20Voice%20Message%20Generation%20Implementation%20Prompt.md).
+
+```text
+Реализуй Feature 06 по relay-assistant-bot-doc/Prompts/06 Voice Message Generation Implementation Prompt.md и связанной спецификации.
+CosyVoice 3 в отдельном окружении; bundled Anub’арак default с post-processing speed 0.85/pitch −1 semitone/formants preserved. Второй default sample будет позже; дополнительные local voices Git-ignored.
+Добавь /voice <text>, /ask как alias /question, /ask voice [period] <question> с text-first и voice replies на команду, и SQLite chat-scoped /voice_type selection.
+Сохрани общий gpu_lock, unload/process cancellation contracts, один canonical assistant answer и best-effort persistence. Generated own-bot voice не запускает Whisper, включая replied /transcribe. Не читай .env/data/, не трогай untracked user samples, не коммить без запроса.
+Подтверди exact Anub’арак reference перед bundling; выполни isolated tests и отдельно отметь доступность manual GPU/listening/Telegram smoke.
+```
+
 ## Будущие сессии: пока только дизайн
 
-- [[Features/06 Voice Message Generation]] — подключение TTS к голосовым сообщениям; Qwen/CosyVoice остаются экспериментами до отдельной реализации.
 - [[Features/07 Chat Search and Source Links]] — поиск по сообщениям/файлам и выдача ссылок.
 - [[Features/08 Files and Document Understanding]] — индекс документов, PDF extraction и OCR.
 - [[Features/09 Social Video Recognition]] — исследовать sign-in/cookies проблему YouTube, затем TikTok/Instagram adapters.

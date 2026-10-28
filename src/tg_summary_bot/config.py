@@ -21,6 +21,14 @@ def _csv_ints(value: str) -> set[int]:
     return result
 
 
+def _tts_int(name: str, default: int) -> int:
+    # Optional TTS misconfiguration is diagnosed by the synthesizer, not fatal to text startup.
+    try:
+        return int(os.getenv(name, str(default)))
+    except ValueError:
+        return 0
+
+
 def _csv_strings(value: str) -> list[str]:
     return [item.strip() for item in value.split(",") if item.strip()]
 
@@ -134,6 +142,33 @@ class Settings:
     autonomous_joke_announce: bool
     bot_auto_casino_enabled: bool
     bot_auto_casino_chance: float
+    tts_enabled: bool = False
+    tts_provider: str = "cosyvoice3"
+    tts_default_voice: str = "anubarak"
+    tts_local_voices_dir: Path = Path("voices/local")
+    tts_output_dir: Path = Path("data/tts")
+    tts_python_path: Path = Path(".venv-cosyvoice3/bin/python")
+    tts_cosyvoice_upstream_dir: Path = Path("tts/cosyvoice3/upstream")
+    tts_model_dir: Path = Path("tts/cosyvoice3/models/Fun-CosyVoice3-0.5B-2512")
+    tts_max_text_chars: int = 2000
+    tts_max_audio_seconds: int = 180
+    tts_timeout_seconds: int = 180
+    tts_encoding_timeout_seconds: int = 60
+    tts_upload_timeout_seconds: int = 60
+    profile_model: str = ""
+    profile_batch_chars: int = 2000
+    profile_batch_messages: int = 8
+    profile_num_predict: int = 256
+    profile_timeout_seconds: int = 60
+    profile_refresh_interval_seconds: int = 120
+    autonomous_joke_announcement_max_age: timedelta = timedelta(hours=24)
+    autonomous_joke_announce_backlog: bool = False
+    autonomous_joke_announcement_min_interval: timedelta = timedelta(hours=12)
+    autonomous_jokes_run_interval: timedelta = timedelta(hours=6)
+    autonomous_jokes_max_jobs_per_run: int = 4
+    autonomous_jokes_session_max_calls: int = 8
+    autonomous_jokes_session_max_seconds: int = 120
+    autonomous_jokes_max_validation_failures: int = 3
 
     @property
     def resolved_llm_provider(self) -> str:
@@ -167,6 +202,17 @@ def load_settings() -> Settings:
     poll_seconds = int(os.getenv("AUTONOMOUS_JOKES_POLL_SECONDS", "30"))
     if startup_grace_seconds <= 0 or poll_seconds <= 0:
         raise RuntimeError("autonomous joke startup grace and poll interval must be positive")
+    joke_limits = {
+        name: int(os.getenv(name, str(default))) for name, default in (
+            ("AUTONOMOUS_JOKES_MAX_JOBS_PER_RUN", 4),
+            ("AUTONOMOUS_JOKES_SESSION_MAX_CALLS", 8),
+            ("AUTONOMOUS_JOKES_SESSION_MAX_SECONDS", 120),
+            ("AUTONOMOUS_JOKES_MAX_VALIDATION_FAILURES", 3),
+        )
+    }
+    for name, value in joke_limits.items():
+        if value <= 0:
+            raise RuntimeError(f"{name} must be positive")
     chance = float(os.getenv("BOT_AUTO_CASINO_CHANCE", "0.25"))
     if not math.isfinite(chance) or not 0 <= chance <= 1:
         raise RuntimeError("BOT_AUTO_CASINO_CHANCE must be a finite number from 0 through 1")
@@ -272,6 +318,41 @@ def load_settings() -> Settings:
         autonomous_jokes_lease_seconds=lease_seconds,
         autonomous_joke_judge_model=os.getenv("AUTONOMOUS_JOKE_JUDGE_MODEL", "").strip(),
         autonomous_joke_announce=_bool(os.getenv("AUTONOMOUS_JOKE_ANNOUNCE", "true"), default=True),
+        autonomous_jokes_run_interval=_duration(
+            os.getenv("AUTONOMOUS_JOKES_RUN_INTERVAL", "6h"), name="AUTONOMOUS_JOKES_RUN_INTERVAL",
+        ),
+        autonomous_jokes_max_jobs_per_run=joke_limits["AUTONOMOUS_JOKES_MAX_JOBS_PER_RUN"],
+        autonomous_jokes_session_max_calls=joke_limits["AUTONOMOUS_JOKES_SESSION_MAX_CALLS"],
+        autonomous_jokes_session_max_seconds=joke_limits["AUTONOMOUS_JOKES_SESSION_MAX_SECONDS"],
+        autonomous_jokes_max_validation_failures=joke_limits["AUTONOMOUS_JOKES_MAX_VALIDATION_FAILURES"],
         bot_auto_casino_enabled=_bool(os.getenv("BOT_AUTO_CASINO_ENABLED", "true"), default=True),
         bot_auto_casino_chance=chance,
+        tts_enabled=_bool(os.getenv("TTS_ENABLED", "false")),
+        tts_provider=os.getenv("TTS_PROVIDER", "cosyvoice3").strip(),
+        tts_default_voice=os.getenv("TTS_DEFAULT_VOICE", "anubarak").strip(),
+        tts_local_voices_dir=Path(os.getenv("TTS_LOCAL_VOICES_DIR", "voices/local")).resolve(),
+        tts_output_dir=Path(os.getenv("TTS_OUTPUT_DIR", "data/tts")).resolve(),
+        tts_python_path=Path(os.getenv("TTS_PYTHON_PATH", ".venv-cosyvoice3/bin/python")).absolute(),
+        tts_cosyvoice_upstream_dir=Path(os.getenv("TTS_COSYVOICE_UPSTREAM_DIR", "tts/cosyvoice3/upstream")).resolve(),
+        tts_model_dir=Path(os.getenv("TTS_MODEL_DIR", "tts/cosyvoice3/models/Fun-CosyVoice3-0.5B-2512")).resolve(),
+        tts_max_text_chars=_tts_int("TTS_MAX_TEXT_CHARS", 2000),
+        tts_max_audio_seconds=_tts_int("TTS_MAX_AUDIO_SECONDS", 180),
+        tts_timeout_seconds=_tts_int("TTS_TIMEOUT_SECONDS", 180),
+        tts_encoding_timeout_seconds=_tts_int("TTS_ENCODING_TIMEOUT_SECONDS", 60),
+        tts_upload_timeout_seconds=_tts_int("TTS_UPLOAD_TIMEOUT_SECONDS", 60),
+        profile_model=os.getenv("PROFILE_MODEL", "").strip(),
+        profile_batch_chars=max(512, int(os.getenv("PROFILE_BATCH_CHARS", "2000"))),
+        profile_batch_messages=max(1, int(os.getenv("PROFILE_BATCH_MESSAGES", "8"))),
+        profile_num_predict=max(128, int(os.getenv("PROFILE_NUM_PREDICT", "256"))),
+        profile_timeout_seconds=max(1, int(os.getenv("PROFILE_TIMEOUT_SECONDS", "60"))),
+        profile_refresh_interval_seconds=max(1, int(os.getenv("PROFILE_REFRESH_INTERVAL_SECONDS", "120"))),
+        autonomous_joke_announcement_max_age=_duration(
+            os.getenv("AUTONOMOUS_JOKE_ANNOUNCEMENT_MAX_AGE", "24h"),
+            name="AUTONOMOUS_JOKE_ANNOUNCEMENT_MAX_AGE",
+        ),
+        autonomous_joke_announce_backlog=_bool(os.getenv("AUTONOMOUS_JOKE_ANNOUNCE_BACKLOG", "false")),
+        autonomous_joke_announcement_min_interval=_duration(
+            os.getenv("AUTONOMOUS_JOKE_ANNOUNCEMENT_MIN_INTERVAL", "12h"),
+            name="AUTONOMOUS_JOKE_ANNOUNCEMENT_MIN_INTERVAL",
+        ),
     )

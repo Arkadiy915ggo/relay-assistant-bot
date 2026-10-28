@@ -3,6 +3,8 @@ from __future__ import annotations
 import functools
 import json
 import logging
+import time
+from contextlib import asynccontextmanager, contextmanager
 from collections.abc import Awaitable, Callable
 from contextvars import ContextVar
 from dataclasses import asdict, dataclass
@@ -62,6 +64,12 @@ def log_operation_outcome(
     }
     logging.getLogger("tg_summary_bot.operations").info(json.dumps(event, ensure_ascii=False))
     update_opik_span_metadata({key: value for key, value in event.items() if key != "created_at"})
+    if _opik_enabled:
+        try:
+            import opik
+            opik.opik_context.update_current_trace(metadata={key: value for key, value in event.items() if key != "created_at"})
+        except Exception:
+            pass
 
 
 def configure_opik_tracing(*, enabled: bool, project_name: str) -> None:
@@ -76,6 +84,7 @@ def opik_track(
     type: str = "general",
     capture_input: bool = False,
     capture_output: bool = False,
+    create_duplicate_root_span: bool = False,
 ) -> Callable[[F], F]:
     def decorator(func: F) -> F:
         tracked_func: F | None = None
@@ -101,7 +110,7 @@ def opik_track(
                         project_name=_opik_project_name or None,
                         capture_input=capture_input,
                         capture_output=capture_output,
-                        create_duplicate_root_span=False,
+                        create_duplicate_root_span=create_duplicate_root_span,
                     )(func),
                 )
                 tracked_project_name = _opik_project_name
@@ -130,7 +139,39 @@ def opik_track(
     return decorator
 
 
-def update_opik_span_metadata(metadata: dict[str, Any]) -> None:
+class HandledOperationError(RuntimeError):
+    def __init__(self, outcome: OperationOutcome) -> None:
+        super().__init__(outcome.reason)
+        self.outcome = outcome
+
+
+def opik_operation(*, name: str):
+    """Record handled partial/failure outcomes as trace errors, without re-failing the handler.
+
+    Opik's decorator finalization overwrites manually-set root error_info on a normal
+    return. A content-free sentinel passes through that decorator, then is consumed here.
+    """
+    def decorator(func):
+        # A real root span anchors nested spans. A trace-only root is popped by
+        # this SDK when its first parentless child completes, orphaning later work.
+        @opik_track(name=name, create_duplicate_root_span=True)
+        async def tracked(*args, **kwargs):
+            outcome = await func(*args, **kwargs)
+            if _opik_enabled and outcome.status in {"failed", "partial"}:
+                raise HandledOperationError(outcome)
+            return outcome
+
+        @functools.wraps(func)
+        async def wrapper(*args, **kwargs):
+            try:
+                return await tracked(*args, **kwargs)
+            except HandledOperationError as exc:
+                return exc.outcome
+        return wrapper
+    return decorator
+
+
+def update_opik_span_metadata(metadata: dict[str, Any], *, name: str | None = None) -> None:
     if not _opik_enabled:
         return
     try:
@@ -139,16 +180,65 @@ def update_opik_span_metadata(metadata: dict[str, Any]) -> None:
         return
     span_updated = False
     try:
-        opik.opik_context.update_current_span(metadata=metadata)
+        opik.opik_context.update_current_span(metadata=metadata, name=name)
+        if name:
+            opik.opik_context.update_current_trace(name=name, metadata=metadata)
         span_updated = True
     except Exception:
         pass
     if span_updated:
         return
     try:
-        opik.opik_context.update_current_trace(metadata=metadata)
+        opik.opik_context.update_current_trace(metadata=metadata, name=name)
     except Exception:
         return
+
+
+@contextmanager
+def opik_stage(name: str, metadata: dict[str, Any] | None = None):
+    """Content-free orchestration timing; never attach speech, paths or raw exceptions."""
+    started = time.perf_counter()
+    manager = None
+    span = None
+    failed = False
+    if _opik_enabled:
+        try:
+            import opik
+            manager = opik.start_as_current_span(name=name, project_name=_opik_project_name or None,
+                                                 metadata=metadata or {})
+            span = manager.__enter__()
+        except Exception:
+            manager = None
+    try:
+        yield
+    except BaseException as exc:
+        failed = True
+        if span is not None:
+            span.error_info = {"exception_type": type(exc).__name__, "message": f"{name}_failed", "traceback": ""}
+        raise
+    finally:
+        elapsed_ms = round((time.perf_counter() - started) * 1000, 1)
+        if span is not None:
+            span.metadata = {**(metadata or {}), **(span.metadata or {}), "elapsed_ms": elapsed_ms,
+                             "stage_status": "failed" if failed else "succeeded"}
+        if manager is not None:
+            try:
+                manager.__exit__(None, None, None)
+            except Exception:
+                pass
+        if name.startswith("speech."):
+            logging.info("Speech stage=%s elapsed_ms=%s status=%s", name, elapsed_ms,
+                         "failed" if failed else "succeeded")
+
+
+@asynccontextmanager
+async def traced_gpu_lock(lock, operation: str):
+    with opik_stage(f"{operation}.gpu_wait"):
+        await lock.acquire()
+    try:
+        yield
+    finally:
+        lock.release()
 
 
 def update_opik_llm_usage(

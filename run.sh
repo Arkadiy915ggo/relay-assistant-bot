@@ -14,7 +14,9 @@ Usage:
   ./run.sh install-voice
                      Create .venv and install CPU voice transcription dependencies
   ./run.sh install-voice-cuda
-                      Create .venv and install CUDA voice transcription dependencies
+                       Create .venv and install CUDA voice transcription dependencies
+  ./run.sh install-tts-cosyvoice3
+                      Install separate Python 3.10 TTS environment, upstream and model (~5 GB)
   ./run.sh doctor    Check local config, Ollama, models, ffmpeg, and Whisper
   ./run.sh start     Start the Telegram bot
   ./run.sh help      Show this help
@@ -73,6 +75,9 @@ case "$COMMAND" in
     python3 -m venv .venv
     .venv/bin/python -m pip install --upgrade pip
     .venv/bin/python -m pip install -e '.[voice-cuda]'
+    ;;
+  install-tts-cosyvoice3)
+    bash scripts/install_tts_cosyvoice3.sh
     ;;
   doctor)
     ensure_venv

@@ -5,12 +5,16 @@
 __pycache__/
 *.pyc
 data/
-experiments/qwen3-tts/models/
-experiments/qwen3-tts/outputs/
-experiments/cosyvoice3/upstream/
-experiments/cosyvoice3/models/
-experiments/cosyvoice3/outputs/
+# Local experiments, source media and generated comparisons are not release files.
+/experiments/
+/local-model-summary-experiment-plan.md
+# Local chat-summary exports may contain private conversation content.
+/*-chat-summary-*.md
+/gaydev-summary-*.md
 *.sqlite3
 *.db
 *.egg-info/
 relay-assistant-bot-doc/.obsidian/
+/voices/local/
+/tts/
+/build/

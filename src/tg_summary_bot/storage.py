@@ -6,7 +6,7 @@ import random
 import re
 import unicodedata
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -27,6 +27,20 @@ class StoredMessage:
     reply_to_message_id: int | None
     origin: str = "legacy"
     kind: str = "legacy_unclassified"
+
+
+def participant_key(sender_id: int | None, sender_name: str) -> str:
+    if sender_id is not None:
+        return f"id:{sender_id}"
+    normalized = re.sub(r"[^\wа-яА-ЯёЁ]+", "_", sender_name.strip().lower()).strip("_")
+    return f"name:{normalized or 'unknown'}"
+
+
+def profile_message_line(message: StoredMessage) -> str:
+    reply = f" reply_to={message.reply_to_message_id}" if message.reply_to_message_id else ""
+    key = participant_key(message.sender_id, message.sender_name)
+    return (f"[{message.created_at} #{message.message_id}{reply} sender_key={key}] "
+            f"{message.sender_name}: {message.text}")
 
 
 ELIGIBLE_MESSAGE_PROVENANCE: frozenset[tuple[str, str]] = frozenset(
@@ -102,6 +116,9 @@ class JokeJob:
     winner_source_text: str | None
     winner_source_created_at: str | None
     award_ledger_entry_id: int | None
+    completed_at: str | None = None
+    validation_failures: int = 0
+    quarantined_at: str | None = None
 
 
 @dataclass(frozen=True)
@@ -266,6 +283,13 @@ class MessageStore:
         async with aiosqlite.connect(self.database_path) as db:
             await self._prepare_connection(db)
             await db.execute("PRAGMA journal_mode=WAL")
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS chat_voice_settings (
+                    chat_id INTEGER PRIMARY KEY,
+                    voice_id TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+            """)
             await db.execute(
                 f"""
                 CREATE TABLE IF NOT EXISTS messages (
@@ -428,6 +452,8 @@ class MessageStore:
                 )
                 """
             )
+            await self._ensure_column(db, table="autonomous_joke_state", column="next_run_at",
+                                      definition="TEXT")
             await db.execute(
                 """
                 CREATE INDEX IF NOT EXISTS idx_chat_joke_inbox_chat_queue
@@ -491,6 +517,10 @@ class MessageStore:
                 column="bot_spin_id",
                 definition="INTEGER",
             )
+            await self._ensure_column(db, table="chat_joke_jobs", column="validation_failures",
+                                      definition="INTEGER NOT NULL DEFAULT 0")
+            await self._ensure_column(db, table="chat_joke_jobs", column="quarantined_at",
+                                      definition="TEXT")
             await db.execute(
                 """
                 CREATE INDEX IF NOT EXISTS idx_chat_joke_jobs_due
@@ -566,6 +596,22 @@ class MessageStore:
                 ON chat_joke_outbox(status, next_attempt_at, lease_until)
                 """
             )
+            await db.execute("""CREATE TABLE IF NOT EXISTS chat_joke_announcement_state (
+                chat_id INTEGER PRIMARY KEY,
+                last_attempt_at TEXT,
+                last_sent_at TEXT
+            )""")
+            # Seed from confirmed historical deliveries, not award timestamps.
+            # Repeated init merges monotonically and never resets a reserved attempt.
+            await db.execute("""
+                INSERT INTO chat_joke_announcement_state(chat_id, last_sent_at)
+                SELECT j.chat_id, MAX(o.completed_at) FROM chat_joke_outbox o
+                JOIN chat_joke_jobs j ON j.job_id=o.job_id
+                WHERE o.action='award_notification' AND o.status='completed' AND o.completed_at IS NOT NULL
+                GROUP BY j.chat_id
+                ON CONFLICT(chat_id) DO UPDATE SET last_sent_at=
+                    MAX(COALESCE(chat_joke_announcement_state.last_sent_at,''),excluded.last_sent_at)
+            """)
             await db.execute(
                 """
                 CREATE TABLE IF NOT EXISTS chat_bot_aliases (
@@ -698,10 +744,13 @@ class MessageStore:
                 """
                 CREATE TABLE IF NOT EXISTS chat_profile_state (
                     chat_id INTEGER PRIMARY KEY,
-                    processed_until TEXT NOT NULL
+                    processed_until TEXT NOT NULL,
+                    processed_message_id INTEGER
                 )
                 """
             )
+            await self._ensure_column(db, table="chat_profile_state", column="processed_message_id",
+                                      definition="INTEGER")
             await db.execute(
                 """
                 CREATE TABLE IF NOT EXISTS chat_participant_facts (
@@ -1018,6 +1067,30 @@ class MessageStore:
                 await db.commit()
         return deleted
 
+    async def get_chat_voice(self, chat_id: int) -> str | None:
+        async with aiosqlite.connect(self.database_path) as db:
+            await self._prepare_connection(db)
+            async with db.execute("SELECT voice_id FROM chat_voice_settings WHERE chat_id = ?", (chat_id,)) as cursor:
+                row = await cursor.fetchone()
+        return str(row[0]) if row else None
+
+    async def set_chat_voice(self, chat_id: int, voice_id: str) -> None:
+        async with self._write_lock:
+            async with aiosqlite.connect(self.database_path) as db:
+                await self._prepare_connection(db)
+                await db.execute("""
+                    INSERT INTO chat_voice_settings (chat_id, voice_id, updated_at) VALUES (?, ?, ?)
+                    ON CONFLICT(chat_id) DO UPDATE SET voice_id=excluded.voice_id, updated_at=excluded.updated_at
+                """, (chat_id, voice_id, datetime.now(timezone.utc).isoformat()))
+                await db.commit()
+
+    async def reset_chat_voice(self, chat_id: int) -> None:
+        async with self._write_lock:
+            async with aiosqlite.connect(self.database_path) as db:
+                await self._prepare_connection(db)
+                await db.execute("DELETE FROM chat_voice_settings WHERE chat_id = ?", (chat_id,))
+                await db.commit()
+
     async def get_chat_bot_aliases(self, chat_id: int) -> list[ChatBotAlias]:
         async with aiosqlite.connect(self.database_path) as db:
             await self._prepare_connection(db)
@@ -1167,7 +1240,9 @@ class MessageStore:
                     sender_name,
                     text,
                     created_at,
-                    reply_to_message_id
+                    reply_to_message_id,
+                    origin,
+                    kind
                 FROM messages
                 WHERE chat_id = ? AND created_at >= ?
                 ORDER BY created_at ASC, message_id ASC
@@ -1189,6 +1264,8 @@ class MessageStore:
                         text=text,
                         created_at=str(row["created_at"]),
                         reply_to_message_id=row["reply_to_message_id"],
+                        origin=str(row["origin"]),
+                        kind=str(row["kind"]),
                     )
                 )
             await cursor.close()
@@ -1598,9 +1675,13 @@ class MessageStore:
         self, *, worker_id: str, now: datetime, lease_seconds: int,
         allowed_chat_ids: set[int] | None = None, disabled_chat_ids: set[int] | None = None,
         start_after: datetime | None = None,
+        run_interval: timedelta | None = None,
+        exclude_job_ids: set[int] | None = None,
     ) -> JokeJob | None:
         if lease_seconds <= 0:
             raise ValueError("lease_seconds must be positive")
+        if run_interval is not None and run_interval <= timedelta(0):
+            raise ValueError("run_interval must be positive")
         now_iso = now.astimezone(timezone.utc).isoformat()
         lease_until = (now + timedelta(seconds=lease_seconds)).astimezone(timezone.utc).isoformat()
         async with self._write_lock:
@@ -1608,6 +1689,14 @@ class MessageStore:
                 await self._prepare_connection(db)
                 db.row_factory = aiosqlite.Row
                 await db.execute("BEGIN IMMEDIATE")
+                if run_interval is not None:
+                    async with db.execute(
+                        "SELECT next_run_at FROM autonomous_joke_state WHERE singleton=1",
+                    ) as cursor:
+                        schedule = await cursor.fetchone()
+                    if schedule and schedule[0] and str(schedule[0]) > now_iso:
+                        await db.rollback()
+                        return None
                 excluded_clause = ""
                 params: list[object] = [now_iso, now_iso]
                 if allowed_chat_ids:
@@ -1623,10 +1712,14 @@ class MessageStore:
                         start_after = start_after.replace(tzinfo=timezone.utc)
                     excluded_clause += " AND created_at >= ?"
                     params.append(start_after.astimezone(timezone.utc).isoformat())
+                if exclude_job_ids:
+                    placeholders = ",".join("?" for _ in exclude_job_ids)
+                    excluded_clause += f" AND job_id NOT IN ({placeholders})"
+                    params.extend(sorted(exclude_job_ids))
                 cursor = await db.execute(
                     """
                     SELECT * FROM chat_joke_jobs
-                    WHERE ((status IN ('pending', 'retry') AND (next_attempt_at IS NULL OR next_attempt_at <= ?))
+                    WHERE quarantined_at IS NULL AND ((status IN ('pending', 'retry') AND (next_attempt_at IS NULL OR next_attempt_at <= ?))
                        OR (status = 'running' AND (lease_until IS NULL OR lease_until <= ?)))
                     """ + excluded_clause + """
                     ORDER BY job_id ASC LIMIT 1
@@ -1647,8 +1740,52 @@ class MessageStore:
                 cursor = await db.execute("SELECT * FROM chat_joke_jobs WHERE job_id = ?", (int(row["job_id"]),))
                 claimed = await cursor.fetchone()
                 await cursor.close()
+                if run_interval is not None:
+                    await db.execute(
+                        """INSERT INTO autonomous_joke_state(singleton,started_at,next_run_at) VALUES(1,?,?)
+                           ON CONFLICT(singleton) DO UPDATE SET next_run_at=excluded.next_run_at""",
+                        (now_iso, (now + run_interval).astimezone(timezone.utc).isoformat()),
+                    )
                 await db.commit()
         return _joke_job_from_row(claimed)
+
+    async def get_autonomous_joke_next_run_at(self) -> str | None:
+        async with aiosqlite.connect(self.database_path) as db:
+            await self._prepare_connection(db)
+            async with db.execute("SELECT next_run_at FROM autonomous_joke_state WHERE singleton=1") as cursor:
+                row = await cursor.fetchone()
+        return str(row[0]) if row and row[0] else None
+
+    async def fail_joke_job(
+        self, *, job_id: int, lease_token: str, error_code: str, next_attempt_at: datetime,
+        validation_failure: bool, max_validation_failures: int,
+    ) -> bool:
+        """Fence failures and quarantine malformed model output without touching points.
+
+        Keep the existing retry status CHECK compatible with deployed databases;
+        quarantined_at excludes the row from all automatic claims.
+        """
+        if max_validation_failures <= 0:
+            raise ValueError("max_validation_failures must be positive")
+        now = datetime.now(timezone.utc).isoformat()
+        increment = int(validation_failure)
+        async with self._write_lock:
+            async with aiosqlite.connect(self.database_path) as db:
+                await self._prepare_connection(db)
+                cursor = await db.execute(
+                    """UPDATE chat_joke_jobs SET status='retry', next_attempt_at=?, last_error_code=?,
+                       validation_failures=validation_failures+?,
+                       quarantined_at=CASE WHEN validation_failures+? >= ? THEN ? ELSE quarantined_at END,
+                       selector_status=?, lease_owner=NULL, lease_token=NULL, lease_until=NULL, updated_at=?
+                       WHERE job_id=? AND status='running' AND lease_token=?""",
+                    (next_attempt_at.astimezone(timezone.utc).isoformat(), error_code[:100], increment,
+                     increment, max_validation_failures, now,
+                     "invalid" if validation_failure else "error", now, job_id, lease_token),
+                )
+                changed = cursor.rowcount > 0
+                await cursor.close()
+                await db.commit()
+        return changed
 
     async def renew_joke_job_lease(self, *, job_id: int, lease_token: str, now: datetime, lease_seconds: int) -> bool:
         now_iso = now.astimezone(timezone.utc).isoformat()
@@ -1855,6 +1992,7 @@ class MessageStore:
         allowed_chat_ids: set[int] | None = None, disabled_chat_ids: set[int] | None = None,
         start_after: datetime | None = None,
         allowed_actions: set[str] | None = None,
+        prioritize_notifications: bool = False,
     ) -> JokeOutbox | None:
         if allowed_actions is not None and not allowed_actions:
             return None
@@ -1889,7 +2027,11 @@ class MessageStore:
                        JOIN chat_joke_jobs j ON j.job_id=o.job_id
                        WHERE ((o.status IN ('pending','retry') AND (o.next_attempt_at IS NULL OR o.next_attempt_at <= ?))
                           OR (o.status='running' AND (o.lease_until IS NULL OR o.lease_until <= ?)))
-                    """ + excluded_clause + " ORDER BY o.outbox_id ASC LIMIT 1",
+                    """ + excluded_clause + (
+                        " ORDER BY CASE WHEN o.action='award_notification' THEN 0 ELSE 1 END, "
+                        "CASE WHEN o.action='award_notification' THEN j.completed_at END DESC, o.outbox_id ASC LIMIT 1"
+                        if prioritize_notifications else " ORDER BY o.outbox_id ASC LIMIT 1"
+                    ),
                     params,
                 )
                 row = await cursor.fetchone()
@@ -1909,8 +2051,55 @@ class MessageStore:
                 await db.commit()
         return _joke_outbox_from_row(claimed)
 
+    async def reserve_joke_announcement(
+        self, *, chat_id: int, outbox_id: int, lease_token: str,
+        now: datetime, min_interval: timedelta,
+    ) -> datetime | None:
+        """Atomically reserve a chat-wide send attempt; None admits, a date defers.
+
+        Failed/uncertain sends retain the attempt timestamp, preventing rapid replay.
+        BEGIN IMMEDIATE serializes reservations across store instances/processes.
+        """
+        if min_interval <= timedelta(0):
+            raise ValueError("announcement_interval_must_be_positive")
+        now = now.astimezone(timezone.utc)
+        async with self._write_lock:
+            async with aiosqlite.connect(self.database_path) as db:
+                await self._prepare_connection(db)
+                await db.execute("BEGIN IMMEDIATE")
+                async with db.execute("""
+                    SELECT 1 FROM chat_joke_outbox o JOIN chat_joke_jobs j ON j.job_id=o.job_id
+                    WHERE o.outbox_id=? AND o.action='award_notification' AND o.status='running'
+                      AND o.lease_token=? AND o.lease_until>? AND j.chat_id=?
+                """, (outbox_id, lease_token, now.isoformat(), chat_id)) as cursor:
+                    valid = await cursor.fetchone()
+                if not valid:
+                    await db.rollback()
+                    raise RuntimeError("announcement_lost_lease")
+                async with db.execute(
+                    "SELECT last_attempt_at,last_sent_at FROM chat_joke_announcement_state WHERE chat_id=?", (chat_id,),
+                ) as cursor:
+                    row = await cursor.fetchone()
+                timestamps = []
+                for value in row or ():
+                    if value:
+                        parsed = datetime.fromisoformat(str(value))
+                        timestamps.append(parsed.replace(tzinfo=timezone.utc) if parsed.tzinfo is None else parsed.astimezone(timezone.utc))
+                if timestamps:
+                    available_at = max(timestamps) + min_interval
+                    if available_at > now:
+                        await db.rollback()
+                        return available_at
+                await db.execute("""
+                    INSERT INTO chat_joke_announcement_state(chat_id,last_attempt_at) VALUES (?,?)
+                    ON CONFLICT(chat_id) DO UPDATE SET last_attempt_at=excluded.last_attempt_at
+                """, (chat_id, now.isoformat()))
+                await db.commit()
+        return None
+
     async def complete_joke_outbox(
-        self, *, outbox_id: int, lease_token: str, status: str = "completed", telegram_message_id: int | None = None
+        self, *, outbox_id: int, lease_token: str, status: str = "completed", telegram_message_id: int | None = None,
+        reason: str | None = None,
     ) -> bool:
         if status not in {"completed", "skipped"}:
             raise ValueError("invalid terminal outbox status")
@@ -1918,14 +2107,24 @@ class MessageStore:
         async with self._write_lock:
             async with aiosqlite.connect(self.database_path) as db:
                 await self._prepare_connection(db)
+                await db.execute("BEGIN IMMEDIATE")
                 cursor = await db.execute(
                     """UPDATE chat_joke_outbox SET status=?, telegram_message_id=COALESCE(?, telegram_message_id),
-                       completed_at=?, updated_at=?, lease_owner=NULL, lease_token=NULL, lease_until=NULL
+                       completed_at=?, updated_at=?, last_error_code=COALESCE(?,last_error_code),
+                       lease_owner=NULL, lease_token=NULL, lease_until=NULL
                        WHERE outbox_id=? AND status='running' AND lease_token=?""",
-                    (status, telegram_message_id, now, now, outbox_id, lease_token),
+                    (status, telegram_message_id, now, now, reason, outbox_id, lease_token),
                 )
                 changed = cursor.rowcount > 0
                 await cursor.close()
+                if changed and status == "completed":
+                    await db.execute("""
+                        INSERT INTO chat_joke_announcement_state(chat_id,last_sent_at)
+                        SELECT j.chat_id,? FROM chat_joke_outbox o JOIN chat_joke_jobs j ON j.job_id=o.job_id
+                        WHERE o.outbox_id=? AND o.action='award_notification'
+                        ON CONFLICT(chat_id) DO UPDATE SET last_sent_at=
+                            MAX(COALESCE(chat_joke_announcement_state.last_sent_at,''),excluded.last_sent_at)
+                    """, (now, outbox_id))
                 await db.commit()
         return changed
 
@@ -2712,6 +2911,8 @@ class MessageStore:
         after: str,
         before: datetime,
         limit_chars: int,
+        after_message_id: int | None = None,
+        limit_messages: int = 8,
     ) -> list[StoredMessage]:
         if before.tzinfo is None:
             before = before.replace(tzinfo=timezone.utc)
@@ -2732,24 +2933,27 @@ class MessageStore:
                     sender_name,
                     text,
                     created_at,
-                    reply_to_message_id
+                    reply_to_message_id, origin, kind
                 FROM messages
-                WHERE chat_id = ? AND created_at > ? AND created_at <= ?
+                WHERE chat_id = ? AND (created_at > ? OR (created_at = ? AND message_id > ?))
+                      AND created_at <= ?
                 ORDER BY created_at ASC, message_id ASC
                 """,
-                (chat_id, after, before_iso),
+                (chat_id, after, after, after_message_id if after_message_id is not None else 9223372036854775807, before_iso),
             )
             async for row in cursor:
-                text = str(row["text"])
-                row_created_at = str(row["created_at"])
-                if (
-                    total_chars + len(text) > limit_chars
-                    and messages
-                    and row_created_at != messages[-1].created_at
-                ):
+                message = _stored_message_from_row(row)
+                size = len(profile_message_line(message)) + bool(messages)
+                if messages and (total_chars + size > limit_chars or len(messages) >= limit_messages):
                     break
-                total_chars += len(text)
-                messages.append(_stored_message_from_row(row, text=text))
+                if not messages and size > limit_chars:
+                    header_size = size - len(message.text)
+                    if header_size >= limit_chars:
+                        raise ValueError("profile_message_header_exceeds_budget")
+                    message = replace(message, text=message.text[:max(0, limit_chars - header_size - 1)] + "…")
+                    size = len(profile_message_line(message))
+                total_chars += size
+                messages.append(message)
             await cursor.close()
         return messages
 
@@ -2976,18 +3180,29 @@ class MessageStore:
             await cursor.close()
         return str(row[0]) if row else None
 
-    async def save_profile_processed_until(self, chat_id: int, processed_until: str) -> None:
+    async def get_profile_cursor(self, chat_id: int) -> SnapshotBoundary | None:
+        async with aiosqlite.connect(self.database_path) as db:
+            await self._prepare_connection(db)
+            async with db.execute(
+                "SELECT processed_until, processed_message_id FROM chat_profile_state WHERE chat_id = ?", (chat_id,),
+            ) as cursor:
+                row = await cursor.fetchone()
+        return SnapshotBoundary(str(row[0]), int(row[1]) if row[1] is not None else 9223372036854775807) if row else None
+
+    async def save_profile_processed_until(self, chat_id: int, processed_until: str,
+                                          message_id: int | None = None) -> None:
         async with self._write_lock:
             async with aiosqlite.connect(self.database_path) as db:
                 await self._prepare_connection(db)
                 await db.execute(
                     """
-                    INSERT INTO chat_profile_state (chat_id, processed_until)
-                    VALUES (?, ?)
+                    INSERT INTO chat_profile_state (chat_id, processed_until, processed_message_id)
+                    VALUES (?, ?, ?)
                     ON CONFLICT(chat_id) DO UPDATE SET
-                        processed_until = excluded.processed_until
+                        processed_until = excluded.processed_until,
+                        processed_message_id = excluded.processed_message_id
                     """,
-                    (chat_id, processed_until),
+                    (chat_id, processed_until, message_id),
                 )
                 await db.commit()
 
@@ -3739,7 +3954,10 @@ def _joke_job_from_row(row: aiosqlite.Row) -> JokeJob:
         winner_source_created_at=(str(row["winner_source_created_at"])
                                   if row["winner_source_created_at"] is not None else None),
         award_ledger_entry_id=(int(row["award_ledger_entry_id"])
-                               if row["award_ledger_entry_id"] is not None else None),
+                                if row["award_ledger_entry_id"] is not None else None),
+        completed_at=str(row["completed_at"]) if row["completed_at"] is not None else None,
+        validation_failures=int(row["validation_failures"]),
+        quarantined_at=str(row["quarantined_at"]) if row["quarantined_at"] is not None else None,
     )
 
 
