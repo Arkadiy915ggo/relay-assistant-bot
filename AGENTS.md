@@ -61,11 +61,12 @@ Current focused tests:
 4. `MessageStore.init()` creates SQLite tables and indexes in `DATABASE_PATH`.
 5. LLM clients, recognizers, optional Whisper transcriber, and one `asyncio.Lock` for GPU-heavy work are created.
 6. `create_dispatcher()` registers command handlers and passive message/media indexing handlers.
-7. `dp.start_polling(..., allowed_updates=["message", "channel_post"], handle_as_tasks=False)` starts long polling.
+7. `ChatOrderedDispatcher` starts long polling with `handle_as_tasks=True` and a 64-update concurrency bound. Message/channel-post handlers remain ordered within each chat; different chats may progress during model/delivery waits. Shutdown cancels and awaits pending handlers before closing the Telegram session.
 
 ## Module Map
 
 - `src/tg_summary_bot/bot.py`: Telegram handlers, access checks, response logging, media resolution/download, command orchestration, GPU lock usage.
+- `src/tg_summary_bot/update_dispatcher.py`: bounded concurrent polling, per-chat handler ordering, and shutdown cleanup.
 - `src/tg_summary_bot/config.py`: `.env` parsing into frozen `Settings`; provider selection with `resolved_llm_provider`.
 - `src/tg_summary_bot/storage.py`: SQLite schema and async persistence for messages, indexed images/videos, and cached video recognitions.
 - `src/tg_summary_bot/llm.py`: `LLMClient` abstraction plus OpenAI and Ollama clients.
@@ -89,7 +90,7 @@ Current focused tests:
 - `/stats`: show chat id, stored counts, provider/model settings, and media/transcription settings.
 - `/balance`: show the command author's joke-point balance in the current chat.
 - `/top`: show up to ten positive joke-point balances in deterministic order.
-- `/casino`: spin the Telegram `🎰` virtual slot for a fixed 10-point stake; no money, transfers, purchases, or withdrawals.
+- `/casino [stake|all]`, `/casino bot [stake|all]`: spin the Telegram `🎰` virtual slot for a custom or all-in virtual-point stake (default 10); no money, transfers, purchases, or withdrawals.
 - `/summary [period]`: summarize stored messages for the period; default comes from `DEFAULT_SUMMARY_PERIOD`.
 - `/question [period] <text>`: answer using stored chat context when relevant.
 - `/ask [period] <text>`: alias of `/question`; `/ask voice [period] <text>` sends one answer as text then voice replies.
@@ -154,8 +155,10 @@ SQLite tables are initialized in `MessageStore.init()`:
 - Wiki/image/video/YouTube context persistence is best effort: a completed result is still sent with a safe partial-success warning if SQLite persistence fails.
 - A surprise meme has a fixed 2% chance only for a valid routed joke question with an image in the current or replied message.
 - Telegram responses are split below the Telegram message limit by `split_telegram_text()`.
-- Casino uses `telegram_slots_base4_v1`, a fixed stake of 10, gross payouts 0/5/50/250, and RTP 90.625%. An unknown or uncommitted Telegram Dice outcome is void and refunded; there are no real-money, payment, transfer, purchase, or withdrawal features.
+- Casino uses `telegram_slots_base4_v1` for stake 10 and `telegram_slots_base4_stakes_v2` for other positive integer stakes. Gross payouts are 0/floor(stake/2)/5×/25×; even-stake RTP is 90.625%, with rounding lowering odd-stake RTP. Slash and addressed requests support custom stakes and `all`/«на все бабки/очки»; stake parsing is lexical, never model-trusted. All-in balance resolution and debit share one SQLite transaction; replays retain the saved stake. Startup migration preserves history, indexes and spin ids. Automatic bot spins stay at 10. An unknown or uncommitted Telegram Dice outcome is void and refunded; there are no real-money, payment, transfer, purchase, or withdrawal features.
 - Trusted casino settlement has up to three attempts (0.25/0.5-second backoff), never a second Dice. Unconfirmed manual settlement sends a safe warning and preserves pending state for startup refund; startup Telegram refresh respects the current allowlist.
+- Outgoing sends/edits share a 3.1-second per-chat session gate. Explicit Telegram `retry_after` rejections retry the API request up to three times after cooldown; ambiguous network failures are not retried. Settled casino report delivery failure is partial with spin metadata and still attempts leaderboard refresh. Delivery retries are in-memory, without a durable report queue.
+- Stake parsing rejects leading decimal separators, numbers attached to casino words, and misplaced stake expressions rather than silently betting a default. Casino admission includes maximum payouts of all pending spins in the same wallet; manual/autonomous awards preserve that reserved integer capacity. Settlement checks integer capacity before writing any payout and returns `balance_limit` for unsafe legacy/external balance state.
 - YouTube cancellation/timeout cleanup waits for final thread writes, including late success. Cookies/authentication are not configured by the current downloader; upstream sign-in failures remain a known limitation.
 
 ## Product Roadmap

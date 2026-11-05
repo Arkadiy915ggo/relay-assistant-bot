@@ -5,7 +5,7 @@ from pathlib import Path
 
 import aiosqlite
 
-from tg_summary_bot.casino import automatic_casino_trigger
+from tg_summary_bot.casino import SQLITE_MAX_INTEGER, automatic_casino_trigger
 from tg_summary_bot.storage import MessageStore
 
 
@@ -141,6 +141,31 @@ class AutonomousJokeStorageTests(unittest.IsolatedAsyncioTestCase):
                 "SELECT status FROM chat_joke_outbox WHERE outbox_id=?", (row[0],)
             )).fetchone()
         self.assertEqual((job_row[0], outbox_row[0]), ("insufficient_balance", "skipped"))
+
+    async def test_autonomous_award_preserves_pending_jackpot_capacity(self) -> None:
+        stake = (SQLITE_MAX_INTEGER - 250) // 25
+        async with aiosqlite.connect(self.store.database_path) as db:
+            await db.execute("INSERT INTO chat_point_balances VALUES(1, 'id:10', 'Alice', ?, ?)",
+                             (stake + 10, NOW.isoformat()))
+            await db.commit()
+        for message_id, amount in ((10, stake), (11, 10)):
+            result = await self.store.reserve_casino_spin(
+                chat_id=1, request_message_id=message_id, participant_key="id:10", participant_name="Alice", stake=amount,
+            )
+            self.assertEqual(result.status, "created")
+        await self.save(1)
+        await self.store.plan_autonomous_joke_jobs(
+            allowed_chat_ids=set(), block_messages=1, partial_min_messages=1,
+            max_block_age=timedelta(hours=24), now=NOW,
+        )
+        job = await self.store.claim_due_joke_job(worker_id="test", now=NOW, lease_seconds=300)
+        with self.assertRaises(OverflowError):
+            await self.store.finalize_autonomous_joke_job(
+                job_id=job.job_id, lease_token=job.lease_token, source_message_id=1,
+            )
+        self.assertEqual((await self.store.get_point_balance(chat_id=1, participant_key="id:10")).balance, 0)
+        async with aiosqlite.connect(self.store.database_path) as db:
+            self.assertEqual((await (await db.execute("SELECT COUNT(*) FROM chat_point_ledger WHERE reason='best_joke'")).fetchone())[0], 0)
 
     async def test_disabled_chat_is_not_planned(self) -> None:
         for message_id in range(1, 21):
