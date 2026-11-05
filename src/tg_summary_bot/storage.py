@@ -12,7 +12,10 @@ from pathlib import Path
 
 import aiosqlite
 
-from tg_summary_bot.casino import CASINO_RULES_VERSION, CASINO_STAKE, CasinoTrigger, slot_result, user_casino_trigger
+from tg_summary_bot.casino import (
+    CASINO_MAX_STAKE, CASINO_RULES_VERSION, CASINO_STAKE, CASINO_VARIABLE_RULES_VERSION, SQLITE_MAX_INTEGER,
+    CasinoStake, CasinoTrigger, slot_result, user_casino_trigger, validate_casino_stake,
+)
 
 
 @dataclass(frozen=True)
@@ -412,6 +415,7 @@ class MessageStore:
             # The table-copy migration needs an exclusive transaction of its own.
             await db.commit()
             await self._ensure_casino_trigger_schema(db)
+            await self._ensure_casino_stakes_schema(db)
             await db.execute(
                 """
                 CREATE INDEX IF NOT EXISTS idx_chat_casino_spins_pending_created
@@ -801,6 +805,46 @@ class MessageStore:
         existing = {str(row[1]) for row in rows}
         if column not in existing:
             await db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+    async def _ensure_casino_stakes_schema(self, db: aiosqlite.Connection) -> None:
+        """Relax fixed-stake constraints atomically, preserving ids, indexes and history."""
+        try:
+            await db.execute("BEGIN IMMEDIATE")
+            cursor = await db.execute("SELECT sql FROM sqlite_master WHERE name='chat_casino_spins'")
+            schema = str((await cursor.fetchone())[0])
+            await cursor.close()
+            if "stake BETWEEN 1 AND" in schema:
+                await db.commit()
+                return
+            if "CHECK(stake = 10)" not in schema or "CHECK(payout IN (0, 5, 50, 250))" not in schema:
+                raise RuntimeError("unsupported casino stake schema")
+            cursor = await db.execute(
+                "SELECT sql FROM sqlite_master WHERE type='index' AND tbl_name='chat_casino_spins' AND sql IS NOT NULL"
+            )
+            indexes = [str(row[0]) for row in await cursor.fetchall()]
+            await cursor.close()
+            cursor = await db.execute("SELECT seq FROM sqlite_sequence WHERE name='chat_casino_spins'")
+            sequence = await cursor.fetchone()
+            await cursor.close()
+            schema = "CREATE TABLE chat_casino_spins_stakes " + schema[schema.index("("):]
+            schema = schema.replace("CHECK(stake = 10)", f"CHECK(stake BETWEEN 1 AND {CASINO_MAX_STAKE})")
+            schema = schema.replace(
+                "CHECK(payout IN (0, 5, 50, 250))",
+                "CHECK(payout = CASE category WHEN 'none' THEN 0 WHEN 'pair' THEN stake / 2 "
+                "WHEN 'triple' THEN stake * 5 WHEN 'jackpot' THEN stake * 25 ELSE -1 END)",
+            )
+            await db.execute(schema)
+            await db.execute("INSERT INTO chat_casino_spins_stakes SELECT * FROM chat_casino_spins")
+            await db.execute("DROP TABLE chat_casino_spins")
+            await db.execute("ALTER TABLE chat_casino_spins_stakes RENAME TO chat_casino_spins")
+            if sequence:
+                await db.execute("UPDATE sqlite_sequence SET seq=MAX(seq, ?) WHERE name='chat_casino_spins'", (sequence[0],))
+            for index in indexes:
+                await db.execute(index)
+            await db.commit()
+        except BaseException:
+            await db.rollback()
+            raise
 
     async def _ensure_casino_trigger_schema(self, db: aiosqlite.Connection) -> None:
         """Upgrade Feature 04's request-only table without changing historical spin ids."""
@@ -1434,6 +1478,8 @@ class MessageStore:
                             source_text=source_text,
                             balance=int(balance_row[0]) if balance_row else 0,
                         )
+                    if await _balance_with_casino_exposure(db, chat_id, key) + 10 > SQLITE_MAX_INTEGER:
+                        raise OverflowError("point balance capacity exceeded")
                     await db.execute(
                         """
                         INSERT INTO chat_point_balances (
@@ -1911,6 +1957,8 @@ class MessageStore:
                                 await cursor.close()
                                 status = "awarded" if inserted else "already_awarded"
                                 if inserted:
+                                    if await _balance_with_casino_exposure(db, int(source["chat_id"]), key) + 10 > SQLITE_MAX_INTEGER:
+                                        raise OverflowError("point balance capacity exceeded")
                                     await db.execute(
                                         """INSERT INTO chat_point_balances
                                            (chat_id, participant_key, participant_name, balance, updated_at)
@@ -2290,10 +2338,13 @@ class MessageStore:
         participant_name: str,
         trigger: CasinoTrigger | None = None,
         created_at: datetime | None = None,
+        stake: CasinoStake = CASINO_STAKE,
     ) -> CasinoSpinResult:
         trigger = trigger or user_casino_trigger(request_message_id)  # type: ignore[arg-type]
         if trigger.request_message_id != request_message_id:
             raise ValueError("request message id does not match trigger")
+        if stake != "all":
+            validate_casino_stake(stake)
         created_at = created_at or datetime.now(timezone.utc)
         if created_at.tzinfo is None:
             created_at = created_at.replace(tzinfo=timezone.utc)
@@ -2325,6 +2376,21 @@ class MessageStore:
                         return CasinoSpinResult(f"existing_{spin.status}", spin)
 
                     cursor = await db.execute(
+                        "SELECT balance FROM chat_point_balances WHERE chat_id=? AND participant_key=?",
+                        (chat_id, participant_key),
+                    )
+                    balance_row = await cursor.fetchone()
+                    await cursor.close()
+                    balance = int(balance_row[0]) if balance_row else 0
+                    reserved_stake = balance if stake == "all" else stake
+                    if reserved_stake <= 0 or balance < reserved_stake:
+                        await db.rollback()
+                        return CasinoSpinResult("insufficient_balance")
+                    exposure = await _balance_with_casino_exposure(db, chat_id, participant_key)
+                    if reserved_stake > CASINO_MAX_STAKE or exposure + 24 * reserved_stake > SQLITE_MAX_INTEGER:
+                        await db.rollback()
+                        return CasinoSpinResult("invalid_stake")
+                    cursor = await db.execute(
                         """
                         INSERT INTO chat_casino_spins (
                             chat_id, request_message_id, trigger_kind, trigger_key, participant_key, participant_name,
@@ -2338,8 +2404,8 @@ class MessageStore:
                             trigger.key,
                             participant_key,
                             participant_name,
-                            CASINO_RULES_VERSION,
-                            CASINO_STAKE,
+                            CASINO_RULES_VERSION if reserved_stake == CASINO_STAKE else CASINO_VARIABLE_RULES_VERSION,
+                            reserved_stake,
                             now,
                             now,
                         ),
@@ -2352,7 +2418,7 @@ class MessageStore:
                         SET balance = balance - ?, participant_name = ?, updated_at = ?
                         WHERE chat_id = ? AND participant_key = ? AND balance >= ?
                         """,
-                        (CASINO_STAKE, participant_name, now, chat_id, participant_key, CASINO_STAKE),
+                        (reserved_stake, participant_name, now, chat_id, participant_key, reserved_stake),
                     )
                     debited = cursor.rowcount > 0
                     await cursor.close()
@@ -2370,7 +2436,7 @@ class MessageStore:
                             chat_id,
                             participant_key,
                             participant_name,
-                            -CASINO_STAKE,
+                            -reserved_stake,
                             _casino_ledger_source_id(spin_id, trigger.request_message_id),
                             spin_id,
                             now,
@@ -2441,10 +2507,12 @@ class MessageStore:
                         if spin.participant_key != participant_key or spin.trigger_kind != trigger.kind:
                             return CasinoSpinResult("identity_conflict", spin)
                         return CasinoSpinResult(f"existing_{spin.status}", spin)
+                    capacity = await _balance_with_casino_exposure(db, chat_id, participant_key)
                     cursor = await db.execute(
                         """UPDATE chat_point_balances SET balance=balance-?, participant_name=?, updated_at=?
-                           WHERE chat_id=? AND participant_key=? AND balance >= ?""",
-                        (CASINO_STAKE, participant_name, now, chat_id, participant_key, CASINO_STAKE),
+                           WHERE chat_id=? AND participant_key=? AND balance >= ? AND ?""",
+                        (CASINO_STAKE, participant_name, now, chat_id, participant_key, CASINO_STAKE,
+                         capacity + 24 * CASINO_STAKE <= SQLITE_MAX_INTEGER),
                     )
                     debited = cursor.rowcount > 0
                     await cursor.close()
@@ -2518,6 +2586,10 @@ class MessageStore:
                     if spin.status == "refunded":
                         await db.rollback()
                         return CasinoSpinResult("refunded_conflict", spin)
+                    outcome = slot_result(dice_value, rules_version=spin.rules_version, stake=spin.stake)
+                    if not await _casino_credit_fits(db, spin, outcome.payout):
+                        await db.rollback()
+                        return CasinoSpinResult("balance_limit", spin)
                     await db.execute(
                         """
                         INSERT INTO chat_point_ledger (
@@ -3998,6 +4070,37 @@ async def _joke_job_chat_id(db: aiosqlite.Connection, job_id: int) -> int | None
     return int(row[0]) if row else None
 
 
+async def _balance_with_casino_exposure(db: aiosqlite.Connection, chat_id: int, key: str) -> int:
+    """Maximum reachable balance, including every reserved jackpot, in Python integers."""
+    cursor = await db.execute(
+        "SELECT balance FROM chat_point_balances WHERE chat_id=? AND participant_key=?", (chat_id, key),
+    )
+    row = await cursor.fetchone()
+    await cursor.close()
+    total = int(row[0]) if row else 0
+    cursor = await db.execute(
+        "SELECT stake FROM chat_casino_spins WHERE chat_id=? AND participant_key=? AND status='pending'",
+        (chat_id, key),
+    )
+    # SQLite SUM() can itself overflow; use Python integers for the exposure.
+    async for row in cursor:
+        total += 25 * int(row[0])
+    await cursor.close()
+    return total
+
+
+async def _casino_credit_fits(db: aiosqlite.Connection, spin: CasinoSpin, payout: int) -> bool:
+    cursor = await db.execute(
+        "SELECT balance FROM chat_point_balances WHERE chat_id=? AND participant_key=?",
+        (spin.chat_id, spin.participant_key),
+    )
+    row = await cursor.fetchone()
+    await cursor.close()
+    if not row:
+        raise RuntimeError("casino balance disappeared during settlement")
+    return type(row[0]) is int and row[0] + payout <= SQLITE_MAX_INTEGER
+
+
 async def _settle_casino_spin_in_transaction(
     db: aiosqlite.Connection,
     spin_id: int,
@@ -4018,6 +4121,9 @@ async def _settle_casino_spin_in_transaction(
         return CasinoSpinResult("already_completed", spin)
     if spin.status == "refunded":
         return CasinoSpinResult("refunded_conflict", spin)
+    outcome = slot_result(dice_value, rules_version=spin.rules_version, stake=spin.stake)
+    if not await _casino_credit_fits(db, spin, outcome.payout):
+        return CasinoSpinResult("balance_limit", spin)
     await db.execute(
         """INSERT INTO chat_point_ledger (chat_id, participant_key, participant_name, delta, reason,
            source_message_id, casino_spin_id, created_at) VALUES (?, ?, ?, ?, 'casino_payout', ?, ?, ?)""",
