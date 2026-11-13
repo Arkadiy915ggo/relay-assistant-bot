@@ -61,7 +61,7 @@ Current focused tests:
 4. `MessageStore.init()` creates SQLite tables and indexes in `DATABASE_PATH`.
 5. LLM clients, recognizers, optional Whisper transcriber, and one `asyncio.Lock` for GPU-heavy work are created.
 6. `create_dispatcher()` registers command handlers and passive message/media indexing handlers.
-7. `ChatOrderedDispatcher` starts long polling with `handle_as_tasks=True` and a 64-update concurrency bound. Message/channel-post handlers remain ordered within each chat; different chats may progress during model/delivery waits. Shutdown cancels and awaits pending handlers before closing the Telegram session.
+7. `ChatOrderedDispatcher` starts long polling with `handle_as_tasks=True`, a 64-runnable-handler concurrency bound and a separate 1024-update pending bound. Same-chat lock waiters do not consume runnable capacity; the pending bound applies backpressure when full. Message/channel-post handlers remain ordered within each chat; different chats may progress during model/delivery waits. Graceful shutdown drains all accepted updates before closing the Telegram session, so slow handlers can delay shutdown; forced termination is not crash-safe without a durable inbox.
 
 ## Module Map
 

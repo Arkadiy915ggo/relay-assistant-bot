@@ -622,11 +622,13 @@ cannot be delivered, its outcome is logged as partial (`report_delivery_failed`)
 spin metadata, and the leaderboard refresh is still attempted. These delivery retries are in-memory;
 undelivered reports are not queued for restart recovery.
 
-Polling handles up to 64 updates concurrently, with handlers serialized within each chat.
-A delivery cooldown in one active chat therefore allows other active chats to continue. At the
-concurrency bound, polling waits for capacity rather than spawning unlimited handler tasks.
-Shutdown cancels and awaits pending handlers, including their refund/media cleanup, before
-closing the Telegram session.
+Polling runs up to 64 handlers concurrently, with handlers serialized within each chat.
+Same-chat lock waiters do not consume runnable-handler capacity, so a delivery cooldown and
+queued updates in one chat leave capacity for other chats. A separate 1024-update pending
+bound applies backpressure when full rather than spawning unlimited tasks.
+Graceful shutdown stops polling and drains all accepted updates before closing the Telegram
+session, including updates already acknowledged to Telegram but still waiting for their chat.
+Slow handlers can delay shutdown; forced termination is not crash-safe without a durable inbox.
 
 `/casino bot` and an explicitly addressed request with a self-marker such as `Реле, крути себе слот`
 use the bot's own chat balance. Custom and all-in stakes also work here: `/casino bot 50`,
