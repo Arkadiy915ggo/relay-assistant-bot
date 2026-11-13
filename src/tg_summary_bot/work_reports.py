@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -155,11 +156,13 @@ class WorkReportStore:
             await db.execute("UPDATE work_report_outbox SET last_attempt = ? WHERE chat_id = ?", (now.isoformat(), chat_id))
             await db.commit()
 
-    async def delivered(self, chat_id: int, end_id: int, day: str) -> None:
+    async def delivered(self, chat_id: int, end_id: int) -> None:
         async with aiosqlite.connect(self.database_path, timeout=30) as db:
             await db.execute("BEGIN IMMEDIATE")
-            await db.execute("UPDATE work_report_state SET cursor_id = ?, checked_day = ? WHERE chat_id = ?",
-                             (end_id, day, chat_id))
+            # Delivery may belong to an earlier day. Only generation admission
+            # (checked()) owns checked_day; retries must not consume today's check.
+            await db.execute("UPDATE work_report_state SET cursor_id = ? WHERE chat_id = ?",
+                             (end_id, chat_id))
             await db.execute("DELETE FROM work_report_outbox WHERE chat_id = ?", (chat_id,))
             await db.commit()
 
@@ -178,17 +181,19 @@ def log_report_worker_failure(task: asyncio.Task[None]) -> None:
 
 class WorkReportWorker:
     def __init__(self, *, settings: Settings, store: MessageStore, reporter: WorkReporter,
-                 bot: Bot, gpu_lock: asyncio.Lock) -> None:
+                 bot: Bot, gpu_lock: asyncio.Lock,
+                 clock: Callable[[], datetime] | None = None) -> None:
         self.settings = settings
         self.store = WorkReportStore(store)
         self.reporter = reporter
         self.bot = bot
         self.gpu_lock = gpu_lock
+        self.clock = clock or (lambda: datetime.now(timezone.utc))
 
     async def run(self) -> None:
         await self.store.init()
         while True:
-            await self.tick(datetime.now(timezone.utc))
+            await self.tick(self.clock())
             await asyncio.sleep(60)
 
     async def tick(self, now: datetime) -> None:
@@ -238,14 +243,16 @@ class WorkReportWorker:
             await self.store.enqueue(chat_id, day, max(m.message_id for m in messages), markdown)
             pending = await self.store.pending(chat_id)
         assert pending is not None
-        if pending["last_attempt"] and now - datetime.fromisoformat(pending["last_attempt"]) < timedelta(hours=1):
+        retry_now = self.clock().astimezone(timezone.utc)
+        if (pending["last_attempt"]
+                and retry_now - datetime.fromisoformat(pending["last_attempt"]) < timedelta(hours=1)):
             return
         path = (self.settings.work_report_output_dir / str(chat_id)
                 / f"work-report-{pending['report_day']}-{pending['end_id']}.md")
         await asyncio.to_thread(save_report, path, pending["markdown"])
         # Durable retry throttle also covers uncertain Telegram sends and restart.
-        await self.store.attempted(chat_id, now)
+        await self.store.attempted(chat_id, self.clock().astimezone(timezone.utc))
         await self.bot.send_document(chat_id=chat_id, document=FSInputFile(path),
                                      caption=f"Рабочий отчет за {pending['report_day']}")
-        await self.store.delivered(chat_id, pending["end_id"], day)
+        await self.store.delivered(chat_id, pending["end_id"])
         logging.info("Work report delivered chat_id=%s end_id=%s", chat_id, pending["end_id"])

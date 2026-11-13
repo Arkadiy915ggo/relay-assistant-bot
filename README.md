@@ -1267,8 +1267,11 @@ WORK_REPORT_OUTPUT_DIR=data/work_reports
   or other `/summary` side effects run.
 - SQLite checkpoints survive restart. Generation failures retain the input for the
   next daily check. Delivery failures retain the generated report and retry no
-  more than hourly without another model call. Pending delivery blocks another
-  report for that chat; other chats continue. Telegram offers no send-document
+  more than hourly from the actual upload-attempt time without another model call.
+  Pending delivery blocks another report for that chat; other chats continue.
+  Delivery of an older pending report advances only its source checkpoint, not
+  today's generation admission: today's scheduled check remains eligible.
+  Telegram offers no send-document
   idempotency key, so a lost response after an accepted upload can cause a duplicate.
   Run only **one bot process per database**.
 - Local Ollama reports share the existing GPU lock; remote reports do not hold it.

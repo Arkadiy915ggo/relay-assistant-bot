@@ -5,7 +5,7 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import httpx
 from openai import AsyncOpenAI
@@ -39,12 +39,18 @@ class WorkReportWorkerTests(unittest.IsolatedAsyncioTestCase):
         self.reporter = SimpleNamespace(summarize=AsyncMock(return_value="## Проект\n### Задачи\n- Проверить"),
                                         llm=SimpleNamespace(unload=AsyncMock()))
         self.lock = asyncio.Lock()
+        self.clock = Mock(return_value=NOW)
         self.worker = self.make_worker()
         await self.worker.store.init()
 
     def make_worker(self, **changes):
         return WorkReportWorker(settings=settings(work_report_output_dir=self.root / "reports", **changes),
-                                store=self.store, reporter=self.reporter, bot=self.bot, gpu_lock=self.lock)
+                                store=self.store, reporter=self.reporter, bot=self.bot, gpu_lock=self.lock,
+                                clock=self.clock)
+
+    async def tick(self, now):
+        self.clock.return_value = now
+        await self.worker.tick(now)
 
     async def save(self, mid, *, chat_id=1, origin="incoming", kind="text", at=None):
         await self.store.save_message(chat_id=chat_id, message_id=mid, chat_type="group",
@@ -55,7 +61,7 @@ class WorkReportWorkerTests(unittest.IsolatedAsyncioTestCase):
     async def test_daily_report_file_delivery_restart_and_new_only(self):
         await self.save(1)
         await self.save(2)
-        await self.worker.tick(NOW)
+        await self.tick(NOW)
         path = self.root / "reports/1/work-report-2026-11-13-2.md"
         self.assertIn("Рабочий отчет", path.read_text())
         self.assertIn("Сообщений: 2", path.read_text())
@@ -63,33 +69,33 @@ class WorkReportWorkerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.worker.store.pending(1), None)
         self.worker = self.make_worker()
         await self.save(3, at=NOW + timedelta(hours=1))
-        await self.worker.tick(NOW + timedelta(hours=2))
+        await self.tick(NOW + timedelta(hours=2))
         self.assertEqual(self.bot.send_document.await_count, 1)
         await self.save(4, at=NOW + timedelta(hours=2))
-        await self.worker.tick(NOW + timedelta(days=1))
+        await self.tick(NOW + timedelta(days=1))
         self.assertEqual([m.message_id for m in self.reporter.summarize.call_args.args[0]], [3, 4])
 
     async def test_skipped_messages_accumulate_but_same_day_is_not_rechecked(self):
         await self.save(1)
-        await self.worker.tick(NOW)
+        await self.tick(NOW)
         await self.save(2)
-        await self.worker.tick(NOW + timedelta(minutes=1))
+        await self.tick(NOW + timedelta(minutes=1))
         self.reporter.summarize.assert_not_awaited()
-        await self.worker.tick(NOW + timedelta(days=2))
+        await self.tick(NOW + timedelta(days=2))
         self.assertEqual([m.message_id for m in self.reporter.summarize.call_args.args[0]], [1, 2])
 
     async def test_upload_failure_retries_cached_report_after_restart(self):
         await self.save(1)
         await self.save(2)
         self.bot.send_document.side_effect = RuntimeError("fake failure")
-        await self.worker.tick(NOW)
+        await self.tick(NOW)
         self.assertIsNotNone(await self.worker.store.pending(1))
         self.assertEqual((await self.worker.store.state(1, NOW))["cursor_id"], 0)
         self.worker = self.make_worker()
-        await self.worker.tick(NOW + timedelta(minutes=30))
+        await self.tick(NOW + timedelta(minutes=30))
         self.assertEqual(self.bot.send_document.await_count, 1)
         self.bot.send_document.side_effect = None
-        await self.worker.tick(NOW + timedelta(hours=1))
+        await self.tick(NOW + timedelta(hours=1))
         self.reporter.summarize.assert_awaited_once()
         self.assertEqual((await self.worker.store.state(1, NOW))["cursor_id"], 2)
 
@@ -97,12 +103,86 @@ class WorkReportWorkerTests(unittest.IsolatedAsyncioTestCase):
         await self.save(1)
         await self.save(2)
         self.bot.send_document.side_effect = RuntimeError()
-        await self.worker.tick(NOW)
+        await self.tick(NOW)
         self.bot.send_document.reset_mock()
         self.worker = self.make_worker(allowed_chat_ids={2})
-        await self.worker.tick(NOW + timedelta(hours=2))
+        await self.tick(NOW + timedelta(hours=2))
         self.bot.send_document.assert_not_awaited()
         self.assertIsNotNone(await self.worker.store.pending(1))
+
+    async def test_older_delivery_does_not_consume_today_generation_after_restart(self):
+        await self.save(1)
+        await self.save(2)
+        self.bot.send_document.side_effect = RuntimeError("uncertain upload")
+        await self.tick(NOW)
+        tomorrow_morning = NOW + timedelta(hours=14)  # 08:00 the next day
+        self.worker = self.make_worker()
+        self.bot.send_document.side_effect = None
+        await self.tick(tomorrow_morning)
+        state = await self.worker.store.state(1, tomorrow_morning)
+        self.assertEqual(state["cursor_id"], 2)
+        self.assertEqual(state["checked_day"], "2026-11-13")
+        await self.save(3, at=tomorrow_morning)
+        await self.save(4, at=tomorrow_morning)
+        self.worker = self.make_worker()
+        await self.tick(NOW + timedelta(days=1))
+        self.assertEqual([m.message_id for m in self.reporter.summarize.call_args.args[0]], [3, 4])
+        self.assertEqual(self.reporter.summarize.await_count, 2)
+        await self.tick(NOW + timedelta(days=1, minutes=1))
+        self.assertEqual(self.reporter.summarize.await_count, 2)
+
+    async def test_slow_generation_and_file_write_use_actual_attempt_time(self):
+        await self.save(1)
+        await self.save(2)
+        async def slow_generation(messages):
+            self.clock.return_value = NOW + timedelta(minutes=25)
+            return "## Отчет"
+        self.reporter.summarize.side_effect = slow_generation
+        self.bot.send_document.side_effect = RuntimeError("uncertain upload")
+        from tg_summary_bot.work_reports import save_report
+        def slow_write(path, markdown):
+            save_report(path, markdown)
+            self.clock.return_value = NOW + timedelta(minutes=35)
+        with patch("tg_summary_bot.work_reports.save_report", side_effect=slow_write):
+            await self.tick(NOW)
+        pending = await self.worker.store.pending(1)
+        self.assertEqual(datetime.fromisoformat(pending["last_attempt"]), NOW + timedelta(minutes=35))
+        self.worker = self.make_worker()
+        await self.tick(NOW + timedelta(minutes=94))
+        self.assertEqual(self.bot.send_document.await_count, 1)
+        await self.tick(NOW + timedelta(minutes=95))
+        self.assertEqual(self.bot.send_document.await_count, 2)
+        self.reporter.summarize.assert_awaited_once()
+
+    async def test_retry_eligibility_uses_fresh_clock_not_tick_snapshot(self):
+        await self.save(1)
+        await self.save(2)
+        self.bot.send_document.side_effect = RuntimeError("uncertain upload")
+        await self.tick(NOW)
+        self.clock.return_value = NOW + timedelta(hours=1)
+        # The tick snapshot is stale, as it can be after processing slow chats.
+        await self.worker.tick(NOW + timedelta(minutes=30))
+        self.assertEqual(self.bot.send_document.await_count, 2)
+        pending = await self.worker.store.pending(1)
+        self.assertEqual(datetime.fromisoformat(pending["last_attempt"]), NOW + timedelta(hours=1))
+
+    async def test_multiple_slow_chats_get_independent_fresh_attempt_timestamps(self):
+        for chat_id in (1, 2):
+            await self.save(1, chat_id=chat_id)
+            await self.save(2, chat_id=chat_id)
+        async def slow_generation(messages):
+            self.clock.return_value += timedelta(minutes=40)
+            return "## Отчет"
+        self.reporter.summarize.side_effect = slow_generation
+        self.bot.send_document.side_effect = RuntimeError("uncertain upload")
+        self.worker = self.make_worker(work_report_chat_ids={1, 2})
+        await self.tick(NOW)
+        for chat_id, minutes in ((1, 40), (2, 80)):
+            pending = await self.worker.store.pending(chat_id)
+            self.assertEqual(datetime.fromisoformat(pending["last_attempt"]),
+                             NOW + timedelta(minutes=minutes))
+        await self.tick(NOW + timedelta(minutes=81))
+        self.assertEqual(self.bot.send_document.await_count, 2)
 
     async def test_chat_selection_threshold_overrides_and_provenance(self):
         for mid in (1, 2):
@@ -111,32 +191,32 @@ class WorkReportWorkerTests(unittest.IsolatedAsyncioTestCase):
         await self.save(2, origin="assistant", kind="assistant_answer")
         await self.save(3, origin="legacy", kind="legacy_unclassified")
         await self.save(4)
-        await self.worker.tick(NOW)
+        await self.tick(NOW)
         self.reporter.summarize.assert_not_awaited()
         self.worker = self.make_worker(work_report_chat_ids={2}, work_report_min_messages=3,
                                        work_report_chat_min_messages={2: 2})
-        await self.worker.tick(NOW)
+        await self.tick(NOW)
         self.assertEqual(self.bot.send_document.call_args.kwargs["chat_id"], 2)
 
     async def test_schedule_timezone_disabled_and_initial_lookback(self):
         await self.save(1, at=NOW - timedelta(days=2))
         await self.save(2)
         self.worker = self.make_worker(work_report_hour=22, work_report_timezone="Europe/Moscow")
-        await self.worker.tick(NOW)  # 21:00 local, too early
+        await self.tick(NOW)  # 21:00 local, too early
         self.reporter.summarize.assert_not_awaited()
-        await self.worker.tick(NOW + timedelta(hours=1))
+        await self.tick(NOW + timedelta(hours=1))
         self.reporter.summarize.assert_not_awaited()  # old row does not count
         await self.save(3)
         self.worker = self.make_worker(work_reports_enabled=False)
-        await self.worker.tick(NOW + timedelta(days=1))
+        await self.tick(NOW + timedelta(days=1))
         self.reporter.summarize.assert_not_awaited()
 
     async def test_bounded_batch_carries_over_remaining_same_timestamp_messages(self):
         for mid in range(1, 6):
             await self.save(mid)
         self.worker = self.make_worker(work_report_max_messages=2)
-        await self.worker.tick(NOW)
-        await self.worker.tick(NOW + timedelta(days=1))
+        await self.tick(NOW)
+        await self.tick(NOW + timedelta(days=1))
         self.assertEqual([m.message_id for m in self.reporter.summarize.call_args.args[0]], [3, 4])
         self.assertEqual((await self.worker.store.state(1, NOW))["cursor_id"], 4)
 
@@ -148,18 +228,18 @@ class WorkReportWorkerTests(unittest.IsolatedAsyncioTestCase):
             raise RuntimeError("fake model failure")
         self.reporter.summarize.side_effect = fail
         self.worker = self.make_worker(work_report_provider="ollama")
-        await self.worker.tick(NOW)
+        await self.tick(NOW)
         self.reporter.llm.unload.assert_awaited_once()
         self.assertFalse(self.lock.locked())
         self.assertEqual((await self.worker.store.state(1, NOW))["cursor_id"], 0)
-        await self.worker.tick(NOW + timedelta(minutes=1))
+        await self.tick(NOW + timedelta(minutes=1))
         self.reporter.summarize.assert_awaited_once()
 
     async def test_remote_model_does_not_hold_gpu_lock(self):
         await self.save(1)
         await self.save(2)
         async with self.lock:
-            await self.worker.tick(NOW)
+            await self.tick(NOW)
         self.bot.send_document.assert_awaited_once()
 
     async def test_timeout_preserves_cursor_and_does_not_block_other_chats(self):
@@ -172,7 +252,7 @@ class WorkReportWorkerTests(unittest.IsolatedAsyncioTestCase):
             return "## Отчет"
         self.reporter.summarize.side_effect = summarize
         self.worker = self.make_worker(work_report_chat_ids={1, 2}, work_report_timeout_seconds=0.5)
-        await self.worker.tick(NOW)
+        await self.tick(NOW)
         self.assertEqual((await self.worker.store.state(1, NOW))["cursor_id"], 0)
         self.assertEqual(self.bot.send_document.call_args.kwargs["chat_id"], 2)
 
@@ -180,10 +260,10 @@ class WorkReportWorkerTests(unittest.IsolatedAsyncioTestCase):
         await self.save(1)
         await self.save(2)
         with patch("tg_summary_bot.work_reports.save_report", side_effect=OSError()):
-            await self.worker.tick(NOW)
+            await self.tick(NOW)
         self.bot.send_document.assert_not_awaited()
         self.assertIsNotNone(await self.worker.store.pending(1))
-        await self.worker.tick(NOW + timedelta(minutes=1))
+        await self.tick(NOW + timedelta(minutes=1))
         self.bot.send_document.assert_awaited_once()
         self.reporter.summarize.assert_awaited_once()
 
