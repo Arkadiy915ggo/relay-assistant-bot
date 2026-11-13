@@ -8,6 +8,7 @@ from datetime import timedelta
 from typing import Literal, Protocol
 
 from tg_summary_bot.llm import LLMClient
+from tg_summary_bot.casino import CASINO_OBJECT_RE
 from tg_summary_bot.periods import parse_period
 
 
@@ -34,7 +35,6 @@ CASINO_VERB_RE = re.compile(
     r"\b(?:крути\w*|крутан\w*|крутануть\w*|прокрути\w*|запусти\w*|сыграй\w*)\b",
     re.IGNORECASE,
 )
-CASINO_OBJECT_RE = re.compile(r"\b(?:казино\w*|казик\w*|слот\w*)\b", re.IGNORECASE)
 CASINO_SELF_RE = re.compile(r"\b(?:себе|сам|сама|свой|своя|своё|свое)\b", re.IGNORECASE)
 
 ROUTER_SYSTEM_PROMPT = """Ты маршрутизатор действий Telegram-бота. Верни только один JSON object без Markdown и текста.
@@ -51,6 +51,8 @@ profile_show для просмотра профиля участника; имя
 «найди в википедии Ada Lovelace» -> {"action":"wiki","period":null,"query":"Ada Lovelace"};
  «распознай это YouTube видео https://youtu.be/example» -> {"action":"video","period":null,"query":null};
  «прокрути казино», «крутань слот» или «крутануть казик» -> {"action":"casino","period":null,"query":null};
+ «крутани казик на 50 очков» или «крутани казик на все бабки» -> {"action":"casino","period":null,"query":null}.
+ Для casino и casino_bot всегда оставляй period=null и query=null: ставку разбирает код из исходного запроса.
  «просто расскажи шутку» -> {"action":"question","period":null,"query":null}."""
 
 

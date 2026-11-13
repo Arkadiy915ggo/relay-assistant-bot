@@ -16,14 +16,16 @@ from pathlib import Path
 from weakref import WeakKeyDictionary, WeakValueDictionary
 
 from aiogram import Bot, Dispatcher, F
-from aiogram.exceptions import TelegramBadRequest
+from aiogram.exceptions import TelegramAPIError, TelegramBadRequest
 from aiogram.filters import Command
 from aiogram.types import FSInputFile, Message
 
 from tg_summary_bot.addressing import remove_aliases_from_text, split_aliases
 from tg_summary_bot.autonomous_jokes import AutonomousJokeWorker, log_worker_failure
 from tg_summary_bot.assistant import ChatAssistant
-from tg_summary_bot.casino import CASINO_STAKE, CasinoTrigger, bot_request_casino_trigger, slot_result
+from tg_summary_bot.casino import (
+    CASINO_STAKE, CasinoStake, CasinoTrigger, bot_request_casino_trigger, parse_casino_stake, slot_result,
+)
 from tg_summary_bot.config import Settings, load_settings
 from tg_summary_bot.image_recognizer import ImageRecognizer
 from tg_summary_bot.intent_router import (
@@ -51,6 +53,8 @@ from tg_summary_bot.observability import (
 from tg_summary_bot.periods import format_period, parse_period
 from tg_summary_bot.storage import CasinoSpin, CasinoSpinResult, MessageStore, PointBalance, StoredImage, StoredVideo
 from tg_summary_bot.summarizer import Summarizer
+from tg_summary_bot.telegram_delivery import TelegramDeliveryMiddleware
+from tg_summary_bot.update_dispatcher import ChatOrderedDispatcher, POLLING_CONCURRENCY_LIMIT
 from tg_summary_bot.speech_synthesizer import SpeechSynthesizer, speech_text
 from tg_summary_bot.voice_presets import VoicePreset, VoiceRegistry
 from tg_summary_bot.transcriber import FasterWhisperTranscriber
@@ -900,6 +904,8 @@ async def spin_casino(
     *,
     participant: tuple[str, str] | None = None,
     trigger: CasinoTrigger | None = None,
+    stake: CasinoStake = CASINO_STAKE,
+    request: str | None = None,
 ) -> OperationOutcome:
     """Run one idempotent virtual slot operation without the shared GPU lock."""
     if not is_allowed(settings, message.chat.id):
@@ -917,6 +923,12 @@ async def spin_casino(
     ):
         return OperationOutcome("casino", "rejected", "invalid_sender")
     key, name = participant or participant_ref(message)
+    if request is not None:
+        try:
+            stake = parse_casino_stake(request, addressed=True)
+        except ValueError:
+            response = await reply_logged(message, "Укажи целую положительную ставку: «казик на 50 очков» или «казик на все бабки».")
+            return OperationOutcome("casino", "rejected", "invalid_stake", response_message_id=response.message_id)
     trigger = trigger or None
     reserve = await store.reserve_casino_spin(
         chat_id=message.chat.id,
@@ -924,10 +936,16 @@ async def spin_casino(
         participant_key=key,
         participant_name=name,
         trigger=trigger,
+        stake=stake,
     )
     if reserve.status == "insufficient_balance":
-        response = await reply_logged(message, f"Для слота нужно {CASINO_STAKE} очков.")
+        response = await reply_logged(
+            message, "Нет очков для ставки ва-банк." if stake == "all" else f"Для этой ставки нужно {stake} очков.",
+        )
         return OperationOutcome("casino", "rejected", "insufficient_balance", response_message_id=response.message_id)
+    if reserve.status == "invalid_stake":
+        response = await reply_logged(message, "Ставка слишком велика. Укажи меньшую сумму очков.")
+        return OperationOutcome("casino", "rejected", "invalid_stake", response_message_id=response.message_id)
     if reserve.status == "identity_conflict":
         logging.error("Casino invariant identity_conflict chat_id=%s message_id=%s", message.chat.id, message.message_id)
         response = await reply_logged(message, "Не удалось безопасно обработать повторный спин.")
@@ -963,14 +981,23 @@ async def spin_casino(
             "casino", "failed", terminal.status if terminal else outcome_reason,
             response_message_id=response.message_id,
         )
-    response = await reply_logged(message, render_casino_spin(terminal.spin))
+    response = None
+    try:
+        response = await reply_logged(message, render_casino_spin(terminal.spin))
+    except TelegramAPIError as exc:
+        logging.error(
+            "Casino report delivery failed chat_id=%s spin_id=%s exception_type=%s",
+            message.chat.id, spin.spin_id, type(exc).__name__,
+        )
     try:
         await refresh_pinned_leaderboard(bot=bot, store=store, source_message=message)
     except Exception:  # noqa: BLE001
         logging.exception("Casino leaderboard refresh failed chat_id=%s", message.chat.id)
     return OperationOutcome(
-        "casino", "succeeded" if outcome_reason == "completed" else "partial", outcome_reason,
-        response_message_id=response.message_id, metadata=casino_outcome_metadata(terminal.spin),
+        "casino", "succeeded" if outcome_reason == "completed" and response else "partial",
+        outcome_reason if response else "report_delivery_failed",
+        response_message_id=response.message_id if response else None,
+        metadata=casino_outcome_metadata(terminal.spin),
     )
 
 
@@ -992,7 +1019,7 @@ async def create_dispatcher(
     speech_synthesizer: SpeechSynthesizer | None = None,
     voice_registry: VoiceRegistry | None = None,
 ) -> Dispatcher:
-    dp = Dispatcher()
+    dp = ChatOrderedDispatcher()
     profile_refresh_tasks: set[asyncio.Task[None]] = set()
     profile_refresh_by_chat: dict[int, asyncio.Task[None]] = {}
     profile_refresh_attempted_at: dict[int, float] = {}
@@ -1268,8 +1295,8 @@ async def create_dispatcher(
             "`/summary today` - today in UTC\n"
             "`/balance` - your joke points in this chat\n"
             "`/top` - top joke points in this chat\n"
-            "`/casino` - spin the virtual slot for 10 chat points\n"
-            "`/casino bot` - let the bot spin with its own points\n"
+            "`/casino [stake|all]` - spin for chat points; default stake: 10\n"
+            "`/casino bot [stake|all]` - let the bot spin with its own points\n"
             "`/question 24h <text>` - chat with the assistant using recent context\n"
             "`/ask [period] <question>` — то же, что /question\n"
             "`/ask voice [period] <question>` — текстовый ответ и его озвучка\n"
@@ -1459,13 +1486,17 @@ async def create_dispatcher(
     async def casino_command(message: Message, bot: Bot) -> None:
         if not is_allowed(settings, message.chat.id):
             return
-        args = (message.text or "").split()
-        if len(args) > 2 or (len(args) == 2 and args[1].lower() != "bot"):
-            await answer_logged(message, "Использование: `/casino` или `/casino bot`.")
+        args = (message.text or "").split()[1:]
+        requested_bot = bool(args and args[0].lower() == "bot")
+        if requested_bot:
+            args = args[1:]
+        try:
+            stake = parse_casino_stake(" ".join(args))
+        except ValueError:
+            await answer_logged(message, "Использование: `/casino [ставка|all]` или `/casino bot [ставка|all]`.")
             return
-        requested_bot = len(args) == 2
         if not requested_bot:
-            await execute_slash_operation(message, "casino", spin_casino(settings, store, bot, message))
+            await execute_slash_operation(message, "casino", spin_casino(settings, store, bot, message, stake=stake))
             return
         identity = await bot_participant(message, bot)
         if not identity:
@@ -1477,6 +1508,7 @@ async def create_dispatcher(
             spin_casino(
                 settings, store, bot, message, participant=identity,
                 trigger=bot_request_casino_trigger(message.message_id),
+                stake=stake,
             ),
         )
 
@@ -2174,7 +2206,7 @@ async def create_dispatcher(
                 message,
                 route,
                 "casino",
-                spin_casino(settings, store, bot, message),
+                spin_casino(settings, store, bot, message, request=request),
                 started=started,
             )
             return True
@@ -2189,6 +2221,7 @@ async def create_dispatcher(
                 spin_casino(
                     settings, store, bot, message, participant=identity,
                     trigger=bot_request_casino_trigger(message.message_id),
+                    request=request,
                 ),
                 started=started,
             )
@@ -3848,6 +3881,7 @@ async def run_bot(settings: Settings) -> None:
     await store.init()
     startup_cutoff = datetime.now(timezone.utc)
     bot = Bot(token=settings.telegram_bot_token)
+    bot.session.middleware(TelegramDeliveryMiddleware())
     recovery = await store.refund_pending_casino_spins(created_before=startup_cutoff)
     automatic_recovery = await store.recover_pending_automatic_casino_spins(created_before=startup_cutoff)
     await cached_bot_identity(bot)
@@ -3948,7 +3982,8 @@ async def run_bot(settings: Settings) -> None:
         await dp.start_polling(
             bot,
             allowed_updates=["message", "channel_post"],
-            handle_as_tasks=False,
+            handle_as_tasks=True,
+            tasks_concurrency_limit=POLLING_CONCURRENCY_LIMIT,
         )
     finally:
         if worker_task:

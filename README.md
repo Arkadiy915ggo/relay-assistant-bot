@@ -9,7 +9,7 @@ A safe Telegram bot that stores new chat messages and produces short AI summarie
 - compares summaries from multiple Ollama models with `/compare 10m`;
 - optionally awards `+10` chat-scoped virtual points from durable autonomous joke blocks;
 - shows personal joke points with `/balance` and a deterministic top-10 with `/top`;
-- spins one virtual Telegram slot with `/casino` for a fixed 10-point stake;
+- spins one virtual Telegram slot with `/casino [stake|all]` for a custom or all-in stake (default 10 points);
 - works in direct chats, groups, supergroups, and channels;
 - supports OpenAI API or a local Ollama model;
 - splits long discussions into chunks and merges the final summary;
@@ -591,18 +591,49 @@ needs Telegram permission to pin messages; without it, it still keeps and update
 ## Virtual Casino Slot
 
 `/casino` and an explicitly addressed request such as `Реле, прокрути слот` use one Telegram `🎰`
-Dice animation. The fixed stake is 10 virtual points. Gross payouts are 0 for no match, 5 for one pair,
-50 for three equal non-seven symbols, and 250 for `seven/seven/seven`; the corresponding net outcomes
-after stake are -10, -5, +40, and +240. The v1 return-to-player is 90.625%.
+Dice animation. The default stake is 10 virtual points. Set a positive whole-point stake with
+`/casino 50` or `Алёша крутани казик на 50 очков` (using an alias configured for your chat).
+Use `/casino all`, `Алёша крутани казик на все бабки`, or `Алёша крутани казик на все очки`
+to bet the author's entire available balance. All-in is resolved atomically when the bet is reserved;
+duplicate requests reuse the original saved stake, even if the balance has changed.
+
+Gross payouts are 0 for no match, half the stake rounded down for one pair, 5× for three equal
+non-seven symbols, and 25× for `seven/seven/seven`. At the default stake these remain 0/5/50/250,
+with net outcomes -10/-5/+40/+240. Return-to-player is 90.625% for even stakes and lower
+for odd stakes because pair payouts are rounded down. Zero, negative, fractional, ambiguous,
+unaffordable, and SQLite-overflowing stakes are rejected without a spin or balance debit.
+Malformed amounts such as `/casino .50`, `/casino ,5`, or `крутани казик50` are rejected;
+they never become a different amount or a default bet. Capacity checks include maximum payouts
+of all pending spins in the same wallet, and joke awards preserve that reserved capacity.
 
 The mapping is the versioned community contract `telegram_slots_base4_v1`. Telegram does not formally
-document it, so every spin stores that rules version; jackpot is only `Dice.value=64`. If Telegram may
+document it, so every spin stores its rules version (`telegram_slots_base4_v1` for stake 10,
+`telegram_slots_base4_stakes_v2` for other stakes); jackpot is only `Dice.value=64`. Historical spins
+retain their saved stakes, payouts and rules during the automatic startup migration. If Telegram may
 have shown Dice but the bot has no committed SQLite settlement, the spin is void and the stake is
 refunded. This intentionally does not promise exactly-once Telegram Dice delivery. The casino has no
-real money, payments, purchases, transfers, arbitrary stakes, or withdrawals.
+real money, payments, purchases, transfers, or withdrawals.
+
+Outgoing text, Dice, media sends and edits share a per-chat delivery gate, spaced by at least
+3.1 seconds. Explicit Telegram flood-control rejections (`retry_after`) get up to three retries
+after the requested cooldown; timeouts and ambiguous network failures are not retried. Retrying
+a result report never repeats the spin or its balance changes. If a settled spin's report still
+cannot be delivered, its outcome is logged as partial (`report_delivery_failed`) with the saved
+spin metadata, and the leaderboard refresh is still attempted. These delivery retries are in-memory;
+undelivered reports are not queued for restart recovery.
+
+Polling runs up to 64 handlers concurrently, with handlers serialized within each chat.
+Same-chat lock waiters do not consume runnable-handler capacity, so a delivery cooldown and
+queued updates in one chat leave capacity for other chats. A separate 1024-update pending
+bound applies backpressure when full rather than spawning unlimited tasks.
+Graceful shutdown stops polling and drains all accepted updates before closing the Telegram
+session, including updates already acknowledged to Telegram but still waiting for their chat.
+Slow handlers can delay shutdown; forced termination is not crash-safe without a durable inbox.
 
 `/casino bot` and an explicitly addressed request with a self-marker such as `Реле, крути себе слот`
-use the bot's own chat balance. The bot identity is always `id:<Telegram bot id>`; its current display
+use the bot's own chat balance. Custom and all-in stakes also work here: `/casino bot 50`,
+`/casino bot all`, `Алёша крути себе слот на 50 очков`, or `Алёша крути себе слот на все бабки`.
+Automatic background bot spins keep the default stake of 10. The bot identity is always `id:<Telegram bot id>`; its current display
 name in leaderboards is the first configured chat alias, then its Telegram name. After a non-shadow
 autonomous award, the bot records one durable automatic casino decision with the configured 25% chance;
 retries never resample it. A missing balance skips that decision.
