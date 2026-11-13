@@ -39,6 +39,7 @@ The repository uses the standard-library `unittest` framework with fakes and tem
 Current focused tests:
 
 - `tests/test_addressing.py`: aliases, mentions, token boundaries, and one-total-typo behavior.
+- `tests/test_work_reports.py`: daily schedules, threshold carry-forward, chat isolation/provenance, durable upload retries, local files, GPU locking, bounded prompts and fake-HTTP OpenCode Go requests (no live bot/model calls).
 - `tests/test_storage_aliases.py`: chat-scoped alias persistence.
 - `tests/test_intent_router.py`: strict routing, explicit meme/profile guards, GPU sequencing, surprise meme policy, and command admission.
 - `tests/test_operation_stabilization.py`: generated-context persistence and content-free terminal outcomes.
@@ -71,6 +72,7 @@ Current focused tests:
 - `src/tg_summary_bot/llm.py`: `LLMClient` abstraction plus OpenAI and Ollama clients.
 - `src/tg_summary_bot/observability.py`: local operation logs and generic tracing hooks; no vendor SDK imports. `dev/opik` is a separate opt-in development distribution, not a bot dependency.
 - `src/tg_summary_bot/summarizer.py`: Russian summary prompts, chunking, partial summary merge.
+- `src/tg_summary_bot/work_reports.py`: opt-in daily work-topic Markdown reports, per-chat thresholds, SQLite checkpoint/outbox, local files and document uploads. Uses a separate provider/model; Ollama shares `gpu_lock`. Single process per database; uncertain Telegram sends can duplicate on retry.
 - `src/tg_summary_bot/assistant.py`: `/question` flow with relevant-context extraction for long histories.
 - `src/tg_summary_bot/image_recognizer.py`: manual `/image` and `/ocr` recognition through Ollama vision.
 - `src/tg_summary_bot/video_recognizer.py`: manual `/video` and `/vocr` key-frame recognition through Ollama vision with adaptive compression.
@@ -119,6 +121,7 @@ SQLite tables are initialized in `MessageStore.init()`:
 - `chat_casino_spins`: idempotent virtual slot reserve/settle/refund records linked to ledger rows by `casino_spin_id`.
 - `chat_joke_inbox`, `chat_joke_jobs`, `chat_joke_job_items`, `chat_joke_outbox`: durable autonomous joke queue, immutable blocks, fenced leases, and post-award delivery.
 - `chat_voice_settings`: chat-scoped voice preset ID and update timestamp; created idempotently at startup.
+- `work_report_state`, `work_report_outbox`: initialized by the opt-in report worker; durable initial lookback, source cursor, daily admission and pending Markdown document uploads.
 
 ## Important Behavior
 
@@ -179,6 +182,7 @@ Use `.env.example` as the source of truth for documented environment variables. 
 - Summary limits: `MAX_MESSAGE_CHARS`, `MAX_SUMMARY_INPUT_CHARS`, `CHUNK_CHARS`, `DEFAULT_SUMMARY_PERIOD`.
 - Memory settings in code: `MEMORY_ENABLED`, `MEMORY_RECENT_PERIOD`, `MEMORY_CHUNK_CHARS`, `MEMORY_MAX_BLOCKS`, `MEMORY_SEARCH_LIMIT`.
 - Profile refresh: `PROFILE_MODEL`, `PROFILE_BATCH_CHARS`, `PROFILE_BATCH_MESSAGES`, `PROFILE_NUM_PREDICT`, `PROFILE_TIMEOUT_SECONDS`, `PROFILE_REFRESH_INTERVAL_SECONDS`.
+- Work reports: `WORK_REPORTS_ENABLED`, `WORK_REPORT_CHAT_IDS`, `WORK_REPORT_MIN_MESSAGES`, JSON `WORK_REPORT_CHAT_MIN_MESSAGES`, `WORK_REPORT_HOUR`, `WORK_REPORT_TIMEZONE`, `WORK_REPORT_OUTPUT_DIR`, `WORK_REPORT_PROVIDER`, `WORK_REPORT_MODEL`, `WORK_REPORT_CHUNK_CHARS`, `WORK_REPORT_MAX_MESSAGES`, `WORK_REPORT_TIMEOUT_SECONDS`. `opencode_go` uses `OPENCODE_GO_*`; confirm non-coding use is permitted before enabling Go.
 
 ## Common Debug Entry Points
 

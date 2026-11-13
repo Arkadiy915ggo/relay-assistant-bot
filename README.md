@@ -6,6 +6,7 @@ A safe Telegram bot that stores new chat messages and produces short AI summarie
 
 - stores new text messages and media captions in SQLite;
 - creates summaries with `/summary 24h`, `/summary 7d`, `/summary today`;
+- optionally sends daily work-topic reports as locally saved Markdown documents;
 - compares summaries from multiple Ollama models with `/compare 10m`;
 - optionally awards `+10` chat-scoped virtual points from durable autonomous joke blocks;
 - shows personal joke points with `/balance` and a deterministic top-10 with `/top`;
@@ -1221,3 +1222,83 @@ AI participant with useful skills, growing into a configurable builder of chat p
 voices, capabilities, and introductory prompts; a formal work profile is one possible preset.
 The [pre-merge stabilization notes](relay-assistant-bot-doc/Features/05.5%20Pre-Merge%20Stabilization.md)
 describe the current reliability fixes and regression checks.
+## Automatic work-chat reports
+
+This optional feature is separate from `/summary`. It produces Russian Markdown
+reports grouped by work topic, covering problems/blockers, explicit decisions,
+tasks (owner, deadline, status when stated), and open questions. The model is
+instructed to exclude jokes and personal/off-topic discussions and not invent facts.
+This filtering is model-based, so review report quality before relying on it.
+
+Example `.env` settings (replace the example chat ID):
+
+```dotenv
+WORK_REPORTS_ENABLED=true
+WORK_REPORT_CHAT_IDS=-1001234567890
+WORK_REPORT_MIN_MESSAGES=200
+WORK_REPORT_CHAT_MIN_MESSAGES='{"-1001234567890":100}'
+WORK_REPORT_HOUR=18
+WORK_REPORT_TIMEZONE=Europe/Moscow
+WORK_REPORT_PROVIDER=ollama
+WORK_REPORT_MODEL=
+WORK_REPORT_OUTPUT_DIR=data/work_reports
+```
+
+- Chat IDs are an explicit opt-in list; empty means **no chats**. The normal
+  `ALLOWED_CHAT_IDS` restriction also applies. Per-chat threshold overrides are optional.
+- Once daily at/after the configured hour, the worker checks for at least the
+  configured number of **new stored incoming text/caption/voice-transcript messages**.
+  The threshold counts all such messages, before model-based off-topic filtering.
+  Pure media without stored text, generated bot output and legacy/unclassified rows
+  do not count. The Bot API cannot supply history from before the bot joined.
+- Initial activation starts with the preceding 24 hours. Skipped days do not advance
+  the source checkpoint: messages accumulate until the threshold is reached.
+  A skipped daily check is not retried later that same day. Startup after the
+  scheduled hour runs the current day's check; missed calendar days are not replayed.
+- At most `WORK_REPORT_MAX_MESSAGES` (default 5000) oldest unreported messages are
+  included per report; the remainder carries forward. This must be at least every
+  configured threshold. Input and hierarchical merges are chunked using
+  `WORK_REPORT_CHUNK_CHARS` (default 18000). Each chat pass has a total timeout
+  (`WORK_REPORT_TIMEOUT_SECONDS`, default 1800), including waiting for the GPU.
+- The exact Markdown is persisted in a SQLite outbox, saved atomically under
+  `WORK_REPORT_OUTPUT_DIR/<chat_id>/work-report-<date>-<last-message-id>.md`, then
+  uploaded as a document to that same chat. Bot permissions must allow documents.
+  The source checkpoint advances only after a confirmed upload. No joke awards
+  or other `/summary` side effects run.
+- SQLite checkpoints survive restart. Generation failures retain the input for the
+  next daily check. Delivery failures retain the generated report and retry no
+  more than hourly without another model call. Pending delivery blocks another
+  report for that chat; other chats continue. Telegram offers no send-document
+  idempotency key, so a lost response after an accepted upload can cause a duplicate.
+  Run only **one bot process per database**.
+- Local Ollama reports share the existing GPU lock; remote reports do not hold it.
+  `WORK_REPORT_PROVIDER` and `WORK_REPORT_MODEL` are independent of the normal bot
+  provider. Choose `openai` to use `OPENAI_*` (including a compatible base URL),
+  or `ollama` to use `OLLAMA_*`. Blank model selects the provider default.
+- Reports contain chat information, and the durable outbox temporarily contains
+  report text. Protect the database and output folder; no automatic report-file
+  retention/deletion is configured. Selecting a remote provider sends the chosen
+  chats' message text to that provider: get appropriate workplace consent first.
+
+### OpenCode Go endpoint
+
+The `opencode_go` provider uses the documented OpenAI-compatible endpoint:
+`https://opencode.ai/inference/go/openai/v1/chat/completions`.
+Set `OPENCODE_GO_API_KEY` from the OpenCode Console, not a Telegram token or a
+ChatGPT credential. `OPENCODE_GO_BASE_URL` and `OPENCODE_GO_MODEL` are configurable.
+Requests identify this application and send a stable `x-opencode-session` header
+for the client lifetime; they do not impersonate OpenCode or execute a coding agent.
+
+**Eligibility caveat:** [Go's official documentation](https://opencode.ai/docs/go/)
+says it is designed for coding agents and clients should send typical coding-agent
+traffic. Automatic general chat reports may not be covered. Confirm this use with
+OpenCode before enabling it; use Ollama or an appropriate general-purpose API
+otherwise. Having a $10 subscription alone does not establish permission.
+
+If permitted, `glm-5.3-flash` is the economical default candidate: the currently
+documented $10 Go plan lists $0.15/M input tokens, $0.50/M output tokens and a $60
+monthly model allowance, with shorter-window limits. This is a cost-based starting
+point, not a quality benchmark; validate Russian report quality on your main
+machine. Model availability, prices and subscription limits can change. Go's
+**Extra Usage** can spend pay-as-you-go credit after the allowance is exhausted;
+disable it in the Console if you do not want overage spending.

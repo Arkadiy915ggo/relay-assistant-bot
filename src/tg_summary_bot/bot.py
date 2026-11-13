@@ -57,6 +57,7 @@ from tg_summary_bot.transcriber import FasterWhisperTranscriber
 from tg_summary_bot.transcript_formatter import TranscriptFormatter
 from tg_summary_bot.video_recognizer import VideoRecognizer
 from tg_summary_bot.web_search import WikipediaSearchClient, format_wiki_results
+from tg_summary_bot.work_reports import WorkReporter, WorkReportWorker, log_report_worker_failure
 from tg_summary_bot.youtube import (
     YouTubeDownloadError,
     download_youtube_video,
@@ -3932,6 +3933,18 @@ async def run_bot(settings: Settings) -> None:
 
     logging.info("Bot started with LLM provider: %s", settings.resolved_llm_provider)
     worker_task: asyncio.Task[None] | None = None
+    report_task: asyncio.Task[None] | None = None
+    if settings.work_reports_enabled and settings.work_report_chat_ids:
+        report_worker = WorkReportWorker(
+            settings=settings, store=store, bot=bot, gpu_lock=gpu_lock,
+            reporter=WorkReporter(build_llm_client(
+                settings, provider=settings.work_report_provider,
+                model=settings.work_report_model or None, num_predict=4096,
+                max_output_tokens=4096,
+            ), settings.work_report_chunk_chars),
+        )
+        report_task = asyncio.create_task(report_worker.run())
+        report_task.add_done_callback(log_report_worker_failure)
     if settings.autonomous_jokes_enabled:
         autonomous_selector = JokeSelector(
             build_llm_client(settings, model=settings.autonomous_joke_judge_model or None,
@@ -3951,6 +3964,9 @@ async def run_bot(settings: Settings) -> None:
             handle_as_tasks=False,
         )
     finally:
+        if report_task:
+            report_task.cancel()
+            await asyncio.gather(report_task, return_exceptions=True)
         if worker_task:
             stop_event.set()
             worker_task.cancel()
