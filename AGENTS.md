@@ -93,6 +93,7 @@ Current focused tests:
 - `/casino [stake|all]`, `/casino bot [stake|all]`: spin the Telegram `🎰` virtual slot for a custom or all-in virtual-point stake (default 10); no money, transfers, purchases, or withdrawals.
 - `/summary [period]`: summarize stored messages for the period; default comes from `DEFAULT_SUMMARY_PERIOD`.
 - `/question [period] <text>`: answer using stored chat context when relevant.
+- `/search [period] <request>`: two-stage AI search over incoming/legacy messages in the current allowed chat. Up to six AI query expansions (30s) plus original-query FTS5 retrieval across all history, up to 30 candidates, then contextual AI selection/ranking with exact ID/quote validation. Startup backfills the index; SQLite triggers maintain insert/update/delete, with bounded aiosqlite-worker fallback without FTS5. Question LLM/shared GPU lock, released/unloaded per call; 180s overall / 90s selection calls. Explicit leading alias search commands and Telegram-ID-scoped “my messages” are supported. Reply to best source, at most five results even on timeout; report incomplete processing honestly. No embeddings or pre-bot history access.
 - `/ask [period] <text>`: alias of `/question`; `/ask voice [period] <text>` sends one answer as text then voice replies.
 - `/voice <text>`: optional CosyVoice 3 speech reply; `/voice_type [id|reset]` manages chat-scoped voice selection.
 - `/memory`: show compressed chat memory status; `/memory rebuild` resets memory blocks/state so they can be rebuilt from stored raw messages.
