@@ -17,6 +17,9 @@ from weakref import WeakKeyDictionary, WeakValueDictionary
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.exceptions import TelegramAPIError, TelegramBadRequest
+from aiogram.types import ReplyParameters
+from tg_summary_bot.chat_search import SELF_SEARCH_RE, is_chat_search_request, source_link
+from tg_summary_bot.semantic_search import semantic_search
 from aiogram.filters import Command
 from aiogram.types import FSInputFile, Message
 
@@ -558,6 +561,8 @@ async def route_under_gpu_lock(
     request: str,
 ) -> IntentRoute:
     """Route and unload while holding the shared GPU lock; actions run afterwards."""
+    if is_chat_search_request(request):
+        return IntentRoute(action="search")
     async with gpu_lock:
         try:
             return await router.route(request)
@@ -1293,6 +1298,7 @@ async def create_dispatcher(
             "`/summary 6h` - last 6 hours\n"
             "`/summary 7d` - last 7 days\n"
             "`/summary today` - today in UTC\n"
+            "`/search [period] <слова>` — найти сообщение в этом чате\n"
             "`/balance` - your joke points in this chat\n"
             "`/top` - top joke points in this chat\n"
             "`/casino [stake|all]` - spin for chat points; default stake: 10\n"
@@ -1321,6 +1327,74 @@ async def create_dispatcher(
             "recognize media, make a meme, transcribe a replied voice/audio, or show a profile.\n\n"
             f"Current chat_id: `{message.chat.id}`"
         )
+
+    async def run_search(message: Message, query: str, *, period: str | None = None) -> OperationOutcome:
+        if not is_allowed(settings, message.chat.id):
+            return OperationOutcome("search", "rejected", "access_denied")
+        mine = bool(SELF_SEARCH_RE.search(query))
+        if mine and not message.from_user:
+            await reply_logged(message, "Не удалось определить автора запроса. Попробуйте /search <слова>.")
+            return OperationOutcome("search", "rejected", "missing_author")
+        try:
+            since = datetime.now(timezone.utc) - parse_period(period) if period else None
+            if not query.strip() or len(query) > 500:
+                raise ValueError("invalid search query")
+            await reply_logged(message, "Ищу кандидатов по всей сохранённой истории, затем проверю их смысл и контекст с помощью ИИ. Это может занять несколько минут.")
+            result = await semantic_search(
+                store, chat_assistant.llm, gpu_lock,
+                chat_id=message.chat.id, query=query, before_id=message.message_id,
+                sender_id=message.from_user.id if mine else None,
+                since=since,
+            )
+            hits = result.messages
+        except (ValueError, OverflowError):
+            await reply_logged(message, "Использование: /search [период] <что найти>. Например: /search где я рассказывал про покупку компьютера. До 500 символов.")
+            return OperationOutcome("search", "rejected", "invalid_query")
+        except Exception:
+            logging.exception("Chat search failed chat_id=%s", message.chat.id)
+            await reply_logged(message, "Поиск не завершился. Попробуйте сузить запрос или указать период.")
+            return OperationOutcome("search", "failed", "query_failed")
+        if not hits:
+            text = (f"Успел проверить {result.scanned} кандидатов, но пока не нашёл подходящего. Поиск неполный: уточните запрос."
+                    if result.incomplete else "Среди найденных кандидатов не нашёл подходящего сообщения по смыслу. Попробуйте уточнить запрос. История до добавления бота недоступна.")
+            response = await reply_logged(message, text)
+            return OperationOutcome("search", "partial" if result.incomplete else "succeeded", "scan_incomplete" if result.incomplete else "no_results", response_message_id=response.message_id)
+        best = hits[0]
+        lines = ["По смыслу похоже на это сообщение:" if len(hits) == 1 else "Возможные сообщения по смыслу:",
+                 f"{best.sender_name} · {best.created_at[:16]} UTC", best.text[:700]]
+        if result.incomplete:
+            lines.append(f"Поиск неполный: проверено {result.scanned} кандидатов. Не все этапы поиска удалось завершить; уточните запрос.")
+        for hit in hits[1:]:
+            link = source_link(message.chat.id, str(message.chat.type), hit.message_id, getattr(message.chat, "username", None))
+            lines.append(f"Ещё: {hit.sender_name} · {hit.created_at[:10]} · {hit.text[:180]}\n{link or f'Сообщение #{hit.message_id}'}")
+        text = "\n\n".join(lines)
+        try:
+            response = await message.answer(
+                text, parse_mode=None,
+                reply_parameters=ReplyParameters(message_id=best.message_id, allow_sending_without_reply=False),
+            )
+        except TelegramBadRequest as exc:
+            if not any(marker in str(exc).lower() for marker in ("message to be replied not found", "message to reply not found", "reply message not found")):
+                raise
+            link = source_link(message.chat.id, str(message.chat.type), best.message_id, getattr(message.chat, "username", None))
+            text += f"\n\nОригинал недоступен для ответа: {link or f'сообщение #{best.message_id}'}. Возможно, он удалён."
+            response = await message.answer(text, parse_mode=None)
+        log_bot_response(action="search", text=text, response_message=response, source_message=message)
+        return OperationOutcome("search", "partial" if result.incomplete else "succeeded", "scan_incomplete" if result.incomplete else "results", response_message_id=response.message_id)
+
+    @dp.message(Command("search"))
+    async def search_command(message: Message) -> None:
+        query = (message.text or "").partition(" ")[2].strip()
+        period = None
+        first, _, rest = query.partition(" ")
+        if first:
+            try:
+                parse_period(first)
+            except (ValueError, OverflowError):
+                pass
+            else:
+                period, query = first, rest.strip()
+        await execute_slash_operation(message, "search", run_search(message, query, period=period))
 
     @dp.message(Command("alias"))
     async def alias_command(message: Message, bot: Bot) -> None:
@@ -2170,6 +2244,11 @@ async def create_dispatcher(
                     exclude_message_id=message.message_id,
                 ),
                 started=started,
+            )
+            return True
+        if route.action == "search":
+            await execute_routed_operation(
+                message, route, "search", run_search(message, request, period=route.period), started=started,
             )
             return True
         if route.action == "question":

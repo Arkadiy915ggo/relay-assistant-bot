@@ -277,6 +277,7 @@ class MessageStore:
         self._write_lock = asyncio.Lock()
         self._memory_fts_available = False
         self._participant_facts_fts_available = False
+        self._message_search_fts_available = False
 
     async def _prepare_connection(self, db: aiosqlite.Connection) -> None:
         await db.execute("PRAGMA busy_timeout=10000")
@@ -789,6 +790,8 @@ class MessageStore:
                 """
             )
             await self._init_fts_tables(db)
+            from tg_summary_bot.search_index import init_search_index
+            self._message_search_fts_available = await init_search_index(db)
             await db.commit()
 
     async def _ensure_column(
@@ -1257,6 +1260,37 @@ class MessageStore:
                     ),
                 )
                 await db.commit()
+
+    async def get_search_candidates(
+        self, *, chat_id: int, before_id: int, queries: list[str],
+        sender_id: int | None = None, since: datetime | None = None, limit: int = 30,
+    ) -> list[StoredMessage]:
+        from tg_summary_bot.search_index import retrieve_candidates
+        async with aiosqlite.connect(self.database_path) as db:
+            await self._prepare_connection(db)
+            db.row_factory = aiosqlite.Row
+            rows = await retrieve_candidates(db, fts=self._message_search_fts_available,
+                chat_id=chat_id, before_id=before_id, queries=queries, sender_id=sender_id, since=since, limit=limit)
+        return [StoredMessage(**row) for row in rows]
+
+    async def get_search_context(
+        self, *, chat_id: int, message_id: int, before_id: int, reply_to: int | None = None,
+    ) -> list[StoredMessage]:
+        async with aiosqlite.connect(self.database_path) as db:
+            await self._prepare_connection(db)
+            db.row_factory = aiosqlite.Row
+            # Read only a small neighbourhood; generated rows cannot be search evidence.
+            eligible = "(origin='legacy' OR (origin='incoming' AND kind IN ('text','caption','voice_transcript')))"
+            rows = []
+            for condition, args, order in (
+                ('message_id<?', (message_id,), 'DESC'),
+                ('message_id>? AND message_id<?', (message_id, before_id), 'ASC'),
+                ('message_id=? AND message_id<?', (reply_to, before_id), 'ASC'),
+            ):
+                cursor = await db.execute(f'SELECT * FROM messages WHERE chat_id=? AND {eligible} AND {condition} ORDER BY message_id {order} LIMIT 2', (chat_id, *args))
+                rows.extend(await cursor.fetchall())
+                await cursor.close()
+        return [StoredMessage(**dict(row)) for row in {row['message_id']: row for row in rows}.values()]
 
     async def get_messages_since(
         self,

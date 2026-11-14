@@ -10,13 +10,14 @@ from typing import Literal, Protocol
 from tg_summary_bot.llm import LLMClient
 from tg_summary_bot.casino import CASINO_OBJECT_RE
 from tg_summary_bot.periods import parse_period
+from tg_summary_bot.chat_search import is_chat_search_request
 
 
 Action = Literal[
-    "question", "summary", "wiki", "image", "meme", "video", "transcribe", "profile_show", "casino", "casino_bot", "none"
+    "question", "summary", "search", "wiki", "image", "meme", "video", "transcribe", "profile_show", "casino", "casino_bot", "none"
 ]
 ALLOWED_ACTIONS: frozenset[str] = frozenset(
-    {"question", "summary", "wiki", "image", "meme", "video", "transcribe", "profile_show", "casino", "casino_bot", "none"}
+    {"question", "summary", "search", "wiki", "image", "meme", "video", "transcribe", "profile_show", "casino", "casino_bot", "none"}
 )
 MAX_ROUTER_INPUT_CHARS = 2000
 MAX_QUERY_CHARS = 500
@@ -38,7 +39,9 @@ CASINO_VERB_RE = re.compile(
 CASINO_SELF_RE = re.compile(r"\b(?:себе|сам|сама|свой|своя|своё|свое)\b", re.IGNORECASE)
 
 ROUTER_SYSTEM_PROMPT = """Ты маршрутизатор действий Telegram-бота. Верни только один JSON object без Markdown и текста.
-    Схема: {"action":"question|summary|wiki|image|meme|video|transcribe|profile_show|casino|casino_bot|none","period":string|null,"query":string|null}.
+    Схема: {"action":"question|summary|search|wiki|image|meme|video|transcribe|profile_show|casino|casino_bot|none","period":string|null,"query":string|null}.
+Для явного поиска сообщения в чате выбирай search, query — только искомые слова, без служебных слов.
+«найди сообщение где я говорил про покупку видеокарты» -> {"action":"search","period":null,"query":"покупка видеокарты"}.
 Выбирай summary для просьб о саммари, wiki для поиска в Wikipedia, image для OCR/описания картинки,
 meme для мема из картинки, video для анализа видео, transcribe для расшифровки replied voice/audio,
 profile_show для просмотра профиля участника; имя участника верни в query, а для профиля автора оставь query=null.
@@ -133,6 +136,9 @@ class IntentRouter:
         self.client = client
 
     async def route(self, text: str) -> IntentRoute:
+        if is_chat_search_request(text):
+            # Explicit message search remains available even when the model is offline.
+            return IntentRoute(action="search")
         try:
             async with asyncio.timeout(ROUTER_TIMEOUT_SECONDS):
                 response = await self.client.complete(
@@ -145,6 +151,8 @@ class IntentRouter:
         except Exception:  # noqa: BLE001
             return fallback_route("model_error")
         route = parse_route_response(response)
+        if route.action == "search" and not is_chat_search_request(text):
+            return fallback_route("search_not_explicit")
         if route.action == "meme" and not MEME_REQUEST_RE.search(text):
             return fallback_route("meme_not_explicit")
         if route.action == "profile_show" and not PROFILE_REQUEST_RE.search(text):
