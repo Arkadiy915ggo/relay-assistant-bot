@@ -27,6 +27,8 @@ class StoredMessage:
     reply_to_message_id: int | None
     origin: str = "legacy"
     kind: str = "legacy_unclassified"
+    message_thread_id: int | None = None
+    topic_name: str | None = None
 
 
 def participant_key(sender_id: int | None, sender_name: str) -> str:
@@ -319,6 +321,11 @@ class MessageStore:
                 column="kind",
                 definition="TEXT NOT NULL DEFAULT 'legacy_unclassified'",
             )
+            await self._ensure_column(db, table="messages", column="message_thread_id", definition="INTEGER")
+            await db.execute("""CREATE TABLE IF NOT EXISTS chat_forum_topics (
+                chat_id INTEGER NOT NULL, message_thread_id INTEGER NOT NULL,
+                name TEXT NOT NULL, PRIMARY KEY (chat_id, message_thread_id)
+            )""")
             await db.execute(
                 """
                 CREATE INDEX IF NOT EXISTS idx_messages_chat_created
@@ -953,6 +960,7 @@ class MessageStore:
         reply_to_message_id: int | None,
         origin: str = "legacy",
         kind: str = "legacy_unclassified",
+        message_thread_id: int | None = None,
         replace: bool = False,
     ) -> None:
         if created_at.tzinfo is None:
@@ -965,15 +973,15 @@ class MessageStore:
                 sql = """
                     INSERT OR IGNORE INTO messages (
                         chat_id, message_id, chat_type, sender_id, sender_name,
-                        text, created_at, reply_to_message_id, origin, kind
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        text, created_at, reply_to_message_id, origin, kind, message_thread_id
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """
                 if replace:
                     sql = """
                     INSERT INTO messages (
                         chat_id, message_id, chat_type, sender_id, sender_name,
-                        text, created_at, reply_to_message_id, origin, kind
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        text, created_at, reply_to_message_id, origin, kind, message_thread_id
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(chat_id, message_id) DO UPDATE SET
                         chat_type = excluded.chat_type,
                         sender_id = excluded.sender_id,
@@ -982,7 +990,8 @@ class MessageStore:
                         created_at = excluded.created_at,
                         reply_to_message_id = excluded.reply_to_message_id,
                         origin = excluded.origin,
-                        kind = excluded.kind
+                        kind = excluded.kind,
+                        message_thread_id = COALESCE(excluded.message_thread_id, messages.message_thread_id)
                     """
                 try:
                     await db.execute("BEGIN")
@@ -999,6 +1008,7 @@ class MessageStore:
                             reply_to_message_id,
                             origin,
                             kind,
+                            message_thread_id,
                         ),
                     )
                     # Read the persisted row: a replace may alter eligibility.
@@ -1020,6 +1030,16 @@ class MessageStore:
                 except Exception:
                     await db.rollback()
                     raise
+
+    async def save_forum_topic(self, chat_id: int, message_thread_id: int, name: str, *, overwrite: bool = True) -> None:
+        async with self._write_lock:
+            async with aiosqlite.connect(self.database_path) as db:
+                await self._prepare_connection(db)
+                conflict = "DO UPDATE SET name=excluded.name" if overwrite else "DO NOTHING"
+                await db.execute(f"""INSERT INTO chat_forum_topics VALUES (?, ?, ?)
+                    ON CONFLICT(chat_id, message_thread_id) {conflict}""",
+                    (chat_id, message_thread_id, name))
+                await db.commit()
 
     async def add_chat_bot_alias(
         self,

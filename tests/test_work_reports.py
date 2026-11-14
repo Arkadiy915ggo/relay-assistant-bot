@@ -1,5 +1,6 @@
 import asyncio
 import os
+import sqlite3
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -12,8 +13,8 @@ from openai import AsyncOpenAI
 
 from tg_summary_bot.config import load_settings
 from tg_summary_bot.llm import build_llm_client
-from tg_summary_bot.storage import MessageStore
-from tg_summary_bot.work_reports import WorkReporter, WorkReportWorker, split_report_text
+from tg_summary_bot.storage import MessageStore, StoredMessage
+from tg_summary_bot.work_reports import WorkReportError, WorkReporter, WorkReportWorker, split_report_text
 
 
 NOW = datetime(2026, 11, 13, 18, tzinfo=timezone.utc)
@@ -21,8 +22,10 @@ NOW = datetime(2026, 11, 13, 18, tzinfo=timezone.utc)
 
 def settings(**changes):
     values = dict(work_reports_enabled=True, work_report_chat_ids={1}, allowed_chat_ids=set(),
+                  work_report_chat_start_message_ids={},
                   work_report_min_messages=2, work_report_chat_min_messages={},
                   work_report_hour=18, work_report_timezone="UTC", work_report_max_messages=5000,
+                  work_report_messages_per_document=500,
                   work_report_timeout_seconds=10, work_report_provider="openai")
     values.update(changes)
     return SimpleNamespace(**values)
@@ -74,6 +77,45 @@ class WorkReportWorkerTests(unittest.IsolatedAsyncioTestCase):
         await self.save(4, at=NOW + timedelta(hours=2))
         await self.tick(NOW + timedelta(days=1))
         self.assertEqual([m.message_id for m in self.reporter.summarize.call_args.args[0]], [3, 4])
+
+    async def test_topic_storage_names_are_chat_scoped_and_survive_replacement(self):
+        for chat_id in (1, 2):
+            await self.store.save_message(chat_id=chat_id, message_id=100, chat_type="supergroup",
+                sender_id=7, sender_name="Name", text="source", created_at=NOW,
+                reply_to_message_id=None, origin="incoming", kind="text", message_thread_id=10)
+        await self.store.save_forum_topic(1, 10, "Art")
+        await self.store.save_forum_topic(2, 10, "Sound")
+        await self.store.save_forum_topic(1, 10, "Art renamed")
+        await self.store.save_forum_topic(1, 10, "Art", overwrite=False)  # Old reply root after rename.
+        await self.store.save_message(chat_id=1, message_id=100, chat_type="supergroup",
+            sender_id=7, sender_name="Name", text="updated", created_at=NOW,
+            reply_to_message_id=None, origin="incoming", kind="voice_transcript", replace=True)
+        await self.store.init()  # Idempotent startup must retain topic metadata.
+        for chat_id, expected in ((1, "Art renamed"), (2, "Sound")):
+            state = await self.worker.store.state(chat_id, NOW)
+            rows = await self.worker.store.messages(chat_id, state, NOW, 5000)
+            self.assertEqual([(m.message_thread_id, m.topic_name) for m in rows], [(10, expected)])
+
+    async def test_legacy_database_migrates_without_guessing_old_topics(self):
+        path = self.root / "legacy.sqlite3"
+        with sqlite3.connect(path) as db:
+            db.execute("""CREATE TABLE messages (
+                chat_id INTEGER NOT NULL, message_id INTEGER NOT NULL, chat_type TEXT NOT NULL,
+                sender_id INTEGER, sender_name TEXT NOT NULL, text TEXT NOT NULL,
+                created_at TEXT NOT NULL, reply_to_message_id INTEGER,
+                origin TEXT NOT NULL DEFAULT 'legacy', kind TEXT NOT NULL DEFAULT 'legacy_unclassified',
+                PRIMARY KEY(chat_id,message_id))""")
+            db.execute("INSERT INTO messages VALUES (1,1,'supergroup',7,'Name','old',?,NULL,'incoming','text')",
+                       (NOW.isoformat(),))
+        migrated = MessageStore(path)
+        await migrated.init()
+        from tg_summary_bot.work_reports import WorkReportStore
+        reports = WorkReportStore(migrated)
+        await reports.init()
+        rows = await reports.messages(1, await reports.state(1, NOW), NOW, 5000)
+        self.assertEqual(len(rows), 1)
+        self.assertIsNone(rows[0].message_thread_id)
+        self.assertIsNone(rows[0].topic_name)
 
     async def test_skipped_messages_accumulate_but_same_day_is_not_rechecked(self):
         await self.save(1)
@@ -220,6 +262,122 @@ class WorkReportWorkerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([m.message_id for m in self.reporter.summarize.call_args.args[0]], [3, 4])
         self.assertEqual((await self.worker.store.state(1, NOW))["cursor_id"], 4)
 
+    async def test_explicit_start_is_inclusive_and_includes_old_saved_history(self):
+        for mid in (4543, 4544, 4545):
+            await self.save(mid, at=NOW - timedelta(days=10))
+        self.worker = self.make_worker(work_report_chat_start_message_ids={1: 4544})
+        await self.tick(NOW)
+        self.assertEqual([m.message_id for m in self.reporter.summarize.call_args.args[0]], [4544, 4545])
+        self.assertEqual((await self.worker.store.state(1, NOW))["cursor_id"], 4545)
+        await self.save(4546, at=NOW - timedelta(days=9))
+        await self.save(4547, at=NOW - timedelta(days=9))
+        self.worker = self.make_worker(work_report_chat_start_message_ids={1: 4544})
+        await self.tick(NOW + timedelta(days=1))
+        self.assertEqual([m.message_id for m in self.reporter.summarize.call_args.args[0]], [4546, 4547])
+
+    async def test_daily_range_splits_across_restart_including_short_tail(self):
+        for mid in range(1, 6):
+            await self.save(mid)
+        self.worker = self.make_worker(work_report_messages_per_document=2)
+        await self.tick(NOW)
+        state = await self.worker.store.state(1, NOW)
+        self.assertEqual((state["cursor_id"], state["batch_end_id"]), (2, 5))
+        await self.save(6)  # Arrived after the daily range was admitted.
+        self.worker = self.make_worker(work_report_messages_per_document=2)
+        await self.tick(NOW + timedelta(minutes=1))
+        await self.tick(NOW + timedelta(minutes=2))
+        self.assertEqual([[m.message_id for m in call.args[0]] for call in
+                          self.reporter.summarize.call_args_list], [[1, 2], [3, 4], [5]])
+        self.assertEqual(self.bot.send_document.await_count, 3)
+        state = await self.worker.store.state(1, NOW)
+        self.assertEqual((state["cursor_id"], state["batch_end_id"]), (5, None))
+        await self.tick(NOW + timedelta(minutes=3))
+        self.assertEqual(self.reporter.summarize.await_count, 3)
+
+    async def test_split_delivery_retry_does_not_regenerate_or_skip_next_document(self):
+        for mid in range(1, 6):
+            await self.save(mid)
+        self.worker = self.make_worker(work_report_messages_per_document=2)
+        self.bot.send_document.side_effect = RuntimeError("uncertain upload")
+        await self.tick(NOW)
+        self.assertEqual((await self.worker.store.state(1, NOW))["cursor_id"], 0)
+        self.worker = self.make_worker(work_report_messages_per_document=2)
+        self.bot.send_document.side_effect = None
+        await self.tick(NOW + timedelta(hours=1))
+        self.reporter.summarize.assert_awaited_once()
+        await self.tick(NOW + timedelta(hours=1, minutes=1))
+        self.assertEqual([m.message_id for m in self.reporter.summarize.call_args.args[0]], [3, 4])
+        await self.tick(NOW + timedelta(hours=1, minutes=2))
+        self.assertEqual([m.message_id for m in self.reporter.summarize.call_args.args[0]], [5])
+
+    async def test_failed_split_generation_waits_until_next_day_at_same_cursor(self):
+        for mid in range(1, 6):
+            await self.save(mid)
+        self.worker = self.make_worker(work_report_messages_per_document=2)
+        await self.tick(NOW)
+        self.reporter.summarize.side_effect = RuntimeError("model failed")
+        await self.tick(NOW + timedelta(minutes=1))
+        self.worker = self.make_worker(work_report_messages_per_document=2)
+        await self.tick(NOW + timedelta(minutes=2))
+        self.assertEqual(self.reporter.summarize.await_count, 2)
+        self.assertEqual((await self.worker.store.state(1, NOW))["cursor_id"], 2)
+        self.reporter.summarize.side_effect = None
+        await self.tick(NOW + timedelta(days=1))
+        self.assertEqual([m.message_id for m in self.reporter.summarize.call_args.args[0]], [3, 4])
+        await self.tick(NOW + timedelta(days=1, minutes=1))
+        self.assertEqual([m.message_id for m in self.reporter.summarize.call_args.args[0]], [5])
+
+    async def test_old_report_schema_preserves_pending_upload_and_cursor(self):
+        from tg_summary_bot.work_reports import WorkReportStore
+        path = self.root / "old-reports.sqlite3"
+        with sqlite3.connect(path) as db:
+            db.executescript("""
+                CREATE TABLE work_report_state(chat_id INTEGER PRIMARY KEY, since TEXT NOT NULL,
+                    cursor_id INTEGER NOT NULL DEFAULT 0, checked_day TEXT NOT NULL DEFAULT '');
+                CREATE TABLE work_report_outbox(chat_id INTEGER PRIMARY KEY, report_day TEXT NOT NULL,
+                    end_id INTEGER NOT NULL, markdown TEXT NOT NULL, last_attempt TEXT);
+                INSERT INTO work_report_state VALUES(1,'1970-01-01T00:00:00+00:00',100,'2026-11-13');
+                INSERT INTO work_report_outbox VALUES(1,'2026-11-13',200,'cached',NULL);
+            """)
+        reports = WorkReportStore(SimpleNamespace(database_path=path))
+        await reports.init()
+        await reports.init()
+        state = await reports.state(1, NOW)
+        self.assertEqual((state["cursor_id"], state["checked_day"], state["batch_end_id"]),
+                         (100, "2026-11-13", None))
+        self.assertEqual((await reports.pending(1))["markdown"], "cached")
+
+    async def test_explicit_start_accumulates_and_pending_retry_does_not_overlap(self):
+        self.worker = self.make_worker(work_report_chat_start_message_ids={1: 100})
+        await self.save(99, at=NOW - timedelta(days=10))
+        await self.save(100, at=NOW - timedelta(days=10))
+        await self.tick(NOW)
+        self.reporter.summarize.assert_not_awaited()
+        await self.save(101)
+        await self.tick(NOW + timedelta(minutes=1))
+        self.reporter.summarize.assert_not_awaited()
+        self.bot.send_document.side_effect = RuntimeError("upload failed")
+        await self.tick(NOW + timedelta(days=1))
+        self.assertEqual([m.message_id for m in self.reporter.summarize.call_args.args[0]], [100, 101])
+        self.assertEqual((await self.worker.store.state(1, NOW))["cursor_id"], 99)
+        self.worker = self.make_worker(work_report_chat_start_message_ids={1: 100})
+        self.bot.send_document.side_effect = None
+        await self.tick(NOW + timedelta(days=1, hours=1))
+        self.reporter.summarize.assert_awaited_once()
+        self.assertEqual((await self.worker.store.state(1, NOW))["cursor_id"], 101)
+
+    async def test_start_is_chat_scoped_and_does_not_reset_existing_state(self):
+        state = await self.worker.store.state(1, NOW, start_message_id=100)
+        self.assertEqual(state["cursor_id"], 99)
+        await self.worker.store.checked(1, "2026-11-13")
+        await self.worker.store.delivered(1, 200)
+        updated = await self.worker.store.state(1, NOW, start_message_id=300)
+        self.assertEqual(updated["cursor_id"], 200)
+        self.assertEqual(updated["checked_day"], "2026-11-13")
+        other = await self.worker.store.state(2, NOW)
+        self.assertEqual(other["cursor_id"], 0)
+        self.assertEqual(other["since"], (NOW - timedelta(days=1)).isoformat())
+
     async def test_local_provider_uses_shared_gpu_lock_and_unloads_on_failure(self):
         await self.save(1)
         await self.save(2)
@@ -268,7 +426,124 @@ class WorkReportWorkerTests(unittest.IsolatedAsyncioTestCase):
         self.reporter.summarize.assert_awaited_once()
 
 
+    async def test_compression_failure_preserves_checkpoint_and_has_safe_reason(self):
+        await self.save(1)
+        await self.save(2)
+        self.reporter.summarize.side_effect = WorkReportError("notes_budget_exceeded")
+        with self.assertLogs(level="WARNING") as logs:
+            await self.tick(NOW)
+        self.assertIn("reason=notes_budget_exceeded", "\n".join(logs.output))
+        self.assertEqual((await self.worker.store.state(1, NOW))["cursor_id"], 0)
+        self.assertIsNone(await self.worker.store.pending(1))
+        self.bot.send_document.assert_not_awaited()
+
+
 class ReporterTests(unittest.IsolatedAsyncioTestCase):
+    async def test_oversized_notes_retry_original_source_then_render_final_report(self):
+        from tg_summary_bot.work_reports import WORK_NOTES_PROMPT, WORK_REPORT_PROMPT
+        llm = SimpleNamespace(complete=AsyncMock(side_effect=[
+            "x" * 1500, "Задача | проверить #1", "Решение | принято #1", "### Итог\nПроверить #1",
+        ]))
+        message = SimpleNamespace(created_at="date", message_id=1, reply_to_message_id=None,
+                                  sender_name="Name", text="SOURCE " * 200)
+        result = await WorkReporter(llm, 1000).summarize([message])
+        self.assertIn("### Итог", result)
+        calls = llm.complete.call_args_list
+        self.assertEqual(len(calls), 4)
+        self.assertEqual(calls[0].kwargs["system"], WORK_NOTES_PROMPT)
+        self.assertEqual(calls[1].kwargs["system"], WORK_NOTES_PROMPT)
+        original = calls[0].kwargs["user"].split("<source>\n")[1]
+        self.assertEqual(original, calls[1].kwargs["user"].split("<source>\n")[1])
+        self.assertIn("Предыдущая попытка", calls[1].kwargs["user"])
+        self.assertEqual(calls[-1].kwargs["system"], WORK_REPORT_PROMPT)
+
+    async def test_persistent_oversize_is_bounded_and_never_returns_clipped_notes(self):
+        llm = SimpleNamespace(complete=AsyncMock(return_value="x" * 18000))
+        reporter = WorkReporter(llm, 18000)
+        with self.assertRaises(WorkReportError) as error:
+            await reporter._notes("source " * 2500)
+        self.assertEqual(error.exception.reason, "notes_budget_exceeded")
+        self.assertEqual(llm.complete.await_count, 2)
+
+    async def test_many_chunks_converge_with_compact_notes(self):
+        from tg_summary_bot.work_reports import WORK_NOTES_PROMPT
+        async def complete(*, system, user):
+            return "факт #1; " * 20 if system == WORK_NOTES_PROMPT else "### Итог\nРешение #1"
+        llm = SimpleNamespace(complete=AsyncMock(side_effect=complete))
+        message = SimpleNamespace(created_at="date", message_id=1, reply_to_message_id=None,
+                                  sender_name="Name", text="a" * 12500)
+        result = await WorkReporter(llm, 1000).summarize([message])
+        self.assertIn("### Итог", result)
+        # 13 original chunks -> 3 chunks of notes -> one final report.
+        self.assertEqual(llm.complete.await_count, 17)
+        for call in llm.complete.call_args_list:
+            source = call.kwargs["user"].split("<source>\n")[1].rsplit("\n</source>", 1)[0]
+            self.assertLessEqual(len(source), 1000)
+
+    async def test_topics_are_summarized_independently_with_deterministic_headings(self):
+        llm = SimpleNamespace(complete=AsyncMock(return_value="### Задачи\n- Проверить"))
+        messages = [StoredMessage(mid, 1, "supergroup", 7, "Name", text, NOW.isoformat(), None,
+                                  "incoming", "text", thread, name)
+                    for mid, text, thread, name in (
+                        (1, "ART_ONLY", 10, "Art"), (2, "SOUND_ONLY", 20, "Sound"),
+                        (3, "ART_AGAIN", 10, "Art"), (4, "UNKNOWN_ONLY", None, None),
+                        (5, "GENERAL_ONLY", 1, None), (6, "UNNAMED_ONLY", 30, None))]
+        result = await WorkReporter(llm, 18000).summarize(messages)
+        self.assertEqual(llm.complete.await_count, 5)
+        calls = [call.kwargs["user"] for call in llm.complete.call_args_list]
+        self.assertIn("ART_ONLY", calls[0])
+        self.assertIn("ART_AGAIN", calls[0])
+        self.assertNotIn("SOUND_ONLY", calls[0])
+        self.assertIn("SOUND_ONLY", calls[1])
+        self.assertNotIn("ART_ONLY", calls[1])
+        for heading in ("## Art", "## Sound", "## Общий чат / тема не сохранена", "## General", "## Тема #30"):
+            self.assertIn(heading.replace("#30", "\\#30"), result)
+
+    async def test_topic_names_from_service_events_reply_roots_and_general(self):
+        from tg_summary_bot.bot import save_message_topic
+        store = SimpleNamespace(save_forum_topic=AsyncMock())
+        chat = SimpleNamespace(id=1, is_forum=True)
+        created = SimpleNamespace(chat=chat, message_id=10, forum_topic_created=SimpleNamespace(name="Art"))
+        self.assertEqual(await save_message_topic(store, created), 10)
+        store.save_forum_topic.assert_awaited_with(1, 10, "Art", overwrite=True)
+        reply = SimpleNamespace(chat=chat, message_thread_id=10, reply_to_message=created)
+        self.assertEqual(await save_message_topic(store, reply), 10)
+        store.save_forum_topic.assert_awaited_with(1, 10, "Art", overwrite=False)
+        edited = SimpleNamespace(chat=chat, message_thread_id=10, forum_topic_edited=SimpleNamespace(name="New Art"))
+        await save_message_topic(store, edited)
+        store.save_forum_topic.assert_awaited_with(1, 10, "New Art", overwrite=True)
+        self.assertEqual(await save_message_topic(store, SimpleNamespace(chat=chat)), 1)
+        self.assertIsNone(await save_message_topic(store, SimpleNamespace(chat=SimpleNamespace(id=2))))
+
+    async def test_model_diagnostics_report_safe_reason_and_usage_without_content(self):
+        for finish, output, reason in (
+            ("length", "PRIVATE_RESPONSE", "output_truncated"),
+            ("content_filter", "PRIVATE_RESPONSE", "output_filtered"),
+            ("stop", "", "empty_output"),
+        ):
+            with self.subTest(finish=finish):
+                llm = SimpleNamespace(complete=AsyncMock(return_value=output),
+                                      last_metadata={"finish_reason": finish},
+                                      last_usage={"prompt_tokens": 123, "completion_tokens": 4096},
+                                      max_output_tokens=4096)
+                reporter = WorkReporter(llm, 1000)
+                with self.assertLogs(level="INFO") as logs, self.assertRaises(WorkReportError) as error:
+                    await reporter._complete("PRIVATE_SOURCE", partial=True)
+                self.assertEqual(error.exception.reason, reason)
+                rendered = "\n".join(logs.output)
+                self.assertIn(f"finish_reason={finish}", rendered)
+                self.assertIn("completion_tokens=4096", rendered)
+                self.assertIn("max_output_tokens=4096", rendered)
+                self.assertNotIn("PRIVATE_", rendered)
+
+    async def test_request_failure_diagnostics_do_not_log_exception_text(self):
+        llm = SimpleNamespace(complete=AsyncMock(side_effect=RuntimeError("PRIVATE_KEY")))
+        with self.assertLogs(level="INFO") as logs, self.assertRaises(RuntimeError):
+            await WorkReporter(llm, 1000)._complete("PRIVATE_SOURCE", partial=False)
+        rendered = "\n".join(logs.output)
+        self.assertIn("stage=final error_type=RuntimeError", rendered)
+        self.assertNotIn("PRIVATE_", rendered)
+
     async def test_truncated_output_is_rejected(self):
         llm = SimpleNamespace(complete=AsyncMock(return_value="## Incomplete"),
                               last_metadata={"finish_reason": "length"})
@@ -292,7 +567,8 @@ class ReporterTests(unittest.IsolatedAsyncioTestCase):
         with patch.dict(os.environ, {"TELEGRAM_BOT_TOKEN": "fake", "OPENCODE_GO_API_KEY": "fake-go"}, clear=True), \
              patch("tg_summary_bot.config.load_dotenv"):
             config = load_settings()
-        client = build_llm_client(config, provider="opencode_go", max_output_tokens=4096)
+        client = build_llm_client(config, provider="opencode_go",
+                                  max_output_tokens=config.work_report_max_output_tokens)
         headers = dict(client.client.default_headers)
         await client.client.close()
         client.client = AsyncOpenAI(api_key="fake-go", base_url=config.opencode_go_base_url,
@@ -308,7 +584,7 @@ class ReporterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(seen[0].headers["x-opencode-session"], seen[1].headers["x-opencode-session"])
         payload = json.loads(seen[0].content)
         self.assertEqual(payload["model"], "glm-5.3-flash")
-        self.assertEqual(payload["max_tokens"], 4096)
+        self.assertEqual(payload["max_tokens"], 32768)
         self.assertEqual(client.last_metadata["finish_reason"], "stop")
 
     async def test_chunk_and_merge_requests_are_bounded(self):
@@ -320,7 +596,7 @@ class ReporterTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Тема", result)
         self.assertEqual(llm.complete.await_count, 5)
         for call in llm.complete.call_args_list:
-            self.assertLessEqual(len(call.kwargs["user"]), 1200)
+            self.assertLessEqual(len(call.kwargs["user"]), 1300)
             self.assertIn("нерабочие", call.kwargs["system"])
 
     async def test_empty_or_noncompressing_response_is_not_delivered(self):
@@ -349,9 +625,34 @@ class WorkReportConfigTests(unittest.TestCase):
         self.assertEqual(config.work_report_chat_ids, {-100, 2})
         self.assertEqual(config.work_report_chat_min_messages, {-100: 100})
         self.assertEqual(config.work_report_min_messages, 200)
+        self.assertEqual(config.work_report_max_output_tokens, 32768)
+        self.assertEqual(config.work_report_messages_per_document, 500)
+        self.assertEqual(self.load(WORK_REPORT_MESSAGES_PER_DOCUMENT="400").work_report_messages_per_document, 400)
+
+    def test_report_token_budget_is_independent_and_positive(self):
+        config = self.load(WORK_REPORT_MAX_OUTPUT_TOKENS="8192", OLLAMA_NUM_PREDICT="512")
+        self.assertEqual(config.work_report_max_output_tokens, 8192)
+        self.assertEqual(config.ollama_num_predict, 512)
+        report = build_llm_client(config, provider="ollama", num_predict=config.work_report_max_output_tokens)
+        ordinary = build_llm_client(config, provider="ollama")
+        self.assertEqual(getattr(report, "wrapped", report).num_predict, 8192)
+        self.assertEqual(getattr(ordinary, "wrapped", ordinary).num_predict, 512)
+        for value in ("0", "-1"):
+            with self.subTest(value=value), self.assertRaises(RuntimeError):
+                self.load(WORK_REPORT_MAX_OUTPUT_TOKENS=value)
+        self.assertEqual(config.work_report_chat_start_message_ids, {})
+
+    def test_explicit_start_message_ids(self):
+        config = self.load(WORK_REPORT_CHAT_START_MESSAGE_IDS='{"-1004361551668":4544,"2":1}')
+        self.assertEqual(config.work_report_chat_start_message_ids, {-1004361551668: 4544, 2: 1})
+        for value in ('[]', '{"1":true}', '{"1":0}', '{"1":-1}', '{"1":"4544"}',
+                      '{"bad":1}', '{"1":9223372036854775808}', 'invalid'):
+            with self.subTest(value=value), self.assertRaises(RuntimeError):
+                self.load(WORK_REPORT_CHAT_START_MESSAGE_IDS=value)
 
     def test_invalid_limits_and_provider_are_rejected(self):
         for env in ({"WORK_REPORT_HOUR": "24"}, {"WORK_REPORT_MIN_MESSAGES": "0"},
+                    {"WORK_REPORT_MESSAGES_PER_DOCUMENT": "0"},
                     {"WORK_REPORT_MAX_MESSAGES": "100"}, {"WORK_REPORT_PROVIDER": "unknown"},
                     {"WORK_REPORT_CHAT_MIN_MESSAGES": "[]"},
                     {"WORK_REPORT_CHAT_MIN_MESSAGES": '{"1":true}'},

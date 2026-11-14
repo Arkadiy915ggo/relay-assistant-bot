@@ -1230,11 +1230,26 @@ tasks (owner, deadline, status when stated), and open questions. The model is
 instructed to exclude jokes and personal/off-topic discussions and not invent facts.
 This filtering is model-based, so review report quality before relying on it.
 
+In forum groups, reports have separate `##` blocks for Telegram topics (for example,
+General, Art, Sound), each summarized independently so discussions from different
+topics are not mixed in the model input. Working subtopics and the usual sections
+appear inside each block. The 200-message threshold and source checkpoint still
+apply to the whole chat, not separately to each topic. Reports are uploaded to the
+chat without an explicit destination topic (normally General).
+
+Newly stored messages retain `message_thread_id`. Topic names are learned from
+topic creation/rename service messages and creation events attached to reply roots;
+an unknown name is shown as `Тема #<id>`, and General defaults to `General`.
+Previously stored messages have no topic metadata and appear under
+`Общий чат / тема не сохранена`; their original topic cannot be reconstructed from
+the existing stored text. Restarting migrates the schema without guessing topics.
+
 Example `.env` settings (replace the example chat ID):
 
 ```dotenv
 WORK_REPORTS_ENABLED=true
 WORK_REPORT_CHAT_IDS=-1001234567890
+WORK_REPORT_CHAT_START_MESSAGE_IDS='{"-1001234567890":4544}'
 WORK_REPORT_MIN_MESSAGES=200
 WORK_REPORT_CHAT_MIN_MESSAGES='{"-1001234567890":100}'
 WORK_REPORT_HOUR=18
@@ -1251,20 +1266,46 @@ WORK_REPORT_OUTPUT_DIR=data/work_reports
   The threshold counts all such messages, before model-based off-topic filtering.
   Pure media without stored text, generated bot output and legacy/unclassified rows
   do not count. The Bot API cannot supply history from before the bot joined.
-- Initial activation starts with the preceding 24 hours. Skipped days do not advance
+- `WORK_REPORT_CHAT_START_MESSAGE_IDS` optionally maps chat IDs to an **inclusive**
+  first message ID. For example, `4544` includes saved eligible messages with ID
+  4544 or greater, even if they are older than 24 hours; the exact ID need not
+  exist. To continue after a manual report ending at ID 4543, set 4544.
+  This initializes each chat's state only once. Changing or removing the setting
+  later does not reset existing progress, daily admission, or pending uploads.
+  Set it before the first run with work reports enabled for that chat.
+- Without an explicit start, initial activation starts with the preceding 24 hours. Skipped days do not advance
   the source checkpoint: messages accumulate until the threshold is reached.
   A skipped daily check is not retried later that same day. Startup after the
   scheduled hour runs the current day's check; missed calendar days are not replayed.
 - At most `WORK_REPORT_MAX_MESSAGES` (default 5000) oldest unreported messages are
-  included per report; the remainder carries forward. This must be at least every
-  configured threshold. Input and hierarchical merges are chunked using
+  admitted in one daily range; the remainder carries forward to another day's check.
+  This must be at least every configured threshold. The admitted range is frozen
+  by its final source ID and split into independent documents of at most
+  `WORK_REPORT_MESSAGES_PER_DOCUMENT` messages (default 500). For example, 1351
+  messages produce documents of 500, 500 and 351 messages; there is no overall
+  merge across these documents. The threshold applies only to daily admission,
+  so even a final part with fewer than 200 messages is sent. Each document retains
+  the per-topic blocks and states its source ID range. Input and hierarchical merges are chunked using
   `WORK_REPORT_CHUNK_CHARS` (default 18000). Each chat pass has a total timeout
   (`WORK_REPORT_TIMEOUT_SECONDS`, default 1800), including waiting for the GPU.
+  `WORK_REPORT_MAX_OUTPUT_TOKENS` (default 32768) sets the output budget per
+  report model call, including partial extraction and final merges. For Ollama it
+  sets `num_predict`; for OpenAI/Go it sets `max_tokens`. Other bot functions keep
+  their existing limits. Truncated output is rejected without advancing the cursor.
+  Intermediate calls use a separate compact fact-note format instead of the final
+  report template. Each note is limited to one quarter of the chunk budget (4500
+  characters with the default settings), or half of a shorter input, with a minimum
+  budget of 128 characters. Oversized notes get one retry from the original input;
+  repeated violations fail with `notes_budget_exceeded`, preserving the checkpoint.
+  Notes are never mechanically clipped. Only the final call produces the full report.
 - The exact Markdown is persisted in a SQLite outbox, saved atomically under
   `WORK_REPORT_OUTPUT_DIR/<chat_id>/work-report-<date>-<last-message-id>.md`, then
   uploaded as a document to that same chat. Bot permissions must allow documents.
   The source checkpoint advances only after a confirmed upload. No joke awards
   or other `/summary` side effects run.
+- Delivered report ranges do not overlap: subsequent reports select only message
+  IDs after the last delivered range. Late transcripts saved under IDs in a closed
+  range are intentionally not included in later reports.
 - SQLite checkpoints survive restart. Generation failures retain the input for the
   next daily check. Delivery failures retain the generated report and retry no
   more than hourly from the actual upload-attempt time without another model call.
@@ -1274,6 +1315,13 @@ WORK_REPORT_OUTPUT_DIR=data/work_reports
   Telegram offers no send-document
   idempotency key, so a lost response after an accepted upload can cause a duplicate.
   Run only **one bot process per database**.
+- One document is processed per chat per worker pass (60 seconds between passes),
+  with its own generation timeout. The checkpoint advances after each confirmed
+  upload, and remaining parts continue on later passes after the scheduled hour,
+  including after restart. Newly arriving messages beyond the frozen daily range
+  wait for the next daily admission. A failed generation at the same cursor is not
+  attempted again that day; completed parts are not regenerated. Upload retries
+  keep their existing hourly throttle and do not call the model again.
 - Local Ollama reports share the existing GPU lock; remote reports do not hold it.
   `WORK_REPORT_PROVIDER` and `WORK_REPORT_MODEL` are independent of the normal bot
   provider. Choose `openai` to use `OPENAI_*` (including a compatible base URL),

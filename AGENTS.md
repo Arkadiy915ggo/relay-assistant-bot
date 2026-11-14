@@ -72,7 +72,7 @@ Current focused tests:
 - `src/tg_summary_bot/llm.py`: `LLMClient` abstraction plus OpenAI and Ollama clients.
 - `src/tg_summary_bot/observability.py`: local operation logs and generic tracing hooks; no vendor SDK imports. `dev/opik` is a separate opt-in development distribution, not a bot dependency.
 - `src/tg_summary_bot/summarizer.py`: Russian summary prompts, chunking, partial summary merge.
-- `src/tg_summary_bot/work_reports.py`: opt-in daily work-topic Markdown reports, per-chat thresholds, SQLite checkpoint/outbox, local files and document uploads. Uses a separate provider/model; Ollama shares `gpu_lock`. Single process per database; uncertain Telegram sends can duplicate on retry.
+- `src/tg_summary_bot/work_reports.py`: opt-in daily work-topic Markdown reports, per-chat thresholds, SQLite checkpoint/outbox, local files and document uploads. `WORK_REPORT_CHAT_START_MESSAGE_IDS` sets an inclusive initial ID per chat, including older saved history; existing durable state is never reset by config changes. Delivered ranges do not overlap; late transcripts below the cursor stay excluded. Uses a separate provider/model; Ollama shares `gpu_lock`. Single process per database; uncertain Telegram sends can duplicate on retry.
 - `src/tg_summary_bot/assistant.py`: `/question` flow with relevant-context extraction for long histories.
 - `src/tg_summary_bot/image_recognizer.py`: manual `/image` and `/ocr` recognition through Ollama vision.
 - `src/tg_summary_bot/video_recognizer.py`: manual `/video` and `/vocr` key-frame recognition through Ollama vision with adaptive compression.
@@ -108,6 +108,7 @@ Current focused tests:
 SQLite tables are initialized in `MessageStore.init()`:
 
 - `messages`: primary key `(chat_id, message_id)`, stores normalized text/captions/transcripts/OCR results with UTC `created_at` and optional `reply_to_message_id`.
+- `messages.message_thread_id` and `chat_forum_topics`: forum topic IDs for newly saved messages and chat-scoped names learned from service/reply-root creation events and rename events. Work reports summarize each topic separately; historical rows without metadata remain explicitly unclassified. Thresholds/checkpoints stay chat-scoped.
 - `messages.origin`/`messages.kind`: explicit provenance. Only `incoming/text`, `incoming/caption`, `incoming/voice_transcript`, and `assistant/assistant_answer` are eligible Joke Points sources; migrated legacy rows remain ineligible.
 - `images`: primary key `(chat_id, message_id)`, stores Telegram `file_id` and metadata for later manual recognition.
 - `videos`: primary key `(chat_id, message_id)`, stores Telegram `file_id`, duration, size, and metadata for later manual recognition.
@@ -122,6 +123,7 @@ SQLite tables are initialized in `MessageStore.init()`:
 - `chat_joke_inbox`, `chat_joke_jobs`, `chat_joke_job_items`, `chat_joke_outbox`: durable autonomous joke queue, immutable blocks, fenced leases, and post-award delivery.
 - `chat_voice_settings`: chat-scoped voice preset ID and update timestamp; created idempotently at startup.
 - `work_report_state`, `work_report_outbox`: initialized by the opt-in report worker; durable initial lookback, source cursor, daily admission and pending Markdown document uploads.
+- Work-report daily ranges have a durable `batch_end_id`/`batch_day` and generation-attempt cursor/day; `WORK_REPORT_MESSAGES_PER_DOCUMENT` (default 500) splits them into independent documents, including short tails. Each confirmed upload advances the cursor; restart resumes the remaining range without daily threshold rechecks. `WORK_REPORT_MAX_MESSAGES` caps daily admission, not individual documents.
 
 ## Important Behavior
 

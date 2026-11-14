@@ -178,6 +178,7 @@ class Settings:
     tracing_endpoint: str = ""
     work_reports_enabled: bool = False
     work_report_chat_ids: set[int] = field(default_factory=set)
+    work_report_chat_start_message_ids: dict[int, int] = field(default_factory=dict)
     work_report_min_messages: int = 200
     work_report_chat_min_messages: dict[int, int] = field(default_factory=dict)
     work_report_hour: int = 18
@@ -187,7 +188,9 @@ class Settings:
     work_report_model: str = ""
     work_report_chunk_chars: int = 18000
     work_report_max_messages: int = 5000
+    work_report_messages_per_document: int = 500
     work_report_timeout_seconds: int = 1800
+    work_report_max_output_tokens: int = 32768
     opencode_go_api_key: str = field(default="", repr=False)
     opencode_go_base_url: str = "https://opencode.ai/inference/go/openai/v1"
     opencode_go_model: str = "glm-5.3-flash"
@@ -245,6 +248,8 @@ def load_settings() -> Settings:
     report_limits = {name: int(os.getenv(name, str(default))) for name, default in (
         ("WORK_REPORT_MIN_MESSAGES", 200), ("WORK_REPORT_CHUNK_CHARS", 18000),
         ("WORK_REPORT_MAX_MESSAGES", 5000), ("WORK_REPORT_TIMEOUT_SECONDS", 1800),
+        ("WORK_REPORT_MAX_OUTPUT_TOKENS", 32768),
+        ("WORK_REPORT_MESSAGES_PER_DOCUMENT", 500),
     )}
     if any(value <= 0 for value in report_limits.values()):
         raise RuntimeError("WORK_REPORT limits must be positive")
@@ -265,10 +270,21 @@ def load_settings() -> Settings:
     if any(not 1 <= value <= report_limits["WORK_REPORT_MAX_MESSAGES"] for value in
            [report_limits["WORK_REPORT_MIN_MESSAGES"], *report_overrides.values()]):
         raise RuntimeError("Work report thresholds must be between 1 and WORK_REPORT_MAX_MESSAGES")
+    try:
+        starts = json.loads(os.getenv("WORK_REPORT_CHAT_START_MESSAGE_IDS", "{}"))
+        if not isinstance(starts, dict) or any(
+            type(value) is not int or not 1 <= value <= 9223372036854775807
+            for value in starts.values()
+        ):
+            raise ValueError("expected positive SQLite integer message IDs")
+        report_starts = {int(chat_id): value for chat_id, value in starts.items()}
+    except (ValueError, TypeError) as exc:
+        raise RuntimeError("WORK_REPORT_CHAT_START_MESSAGE_IDS must be a JSON chat-id/positive-message-id object") from exc
 
     return Settings(
         work_reports_enabled=_bool(os.getenv("WORK_REPORTS_ENABLED", "false")),
         work_report_chat_ids=_csv_ints(os.getenv("WORK_REPORT_CHAT_IDS", "")),
+        work_report_chat_start_message_ids=report_starts,
         work_report_min_messages=report_limits["WORK_REPORT_MIN_MESSAGES"],
         work_report_chat_min_messages=report_overrides,
         work_report_hour=report_hour,
@@ -278,7 +294,9 @@ def load_settings() -> Settings:
         work_report_model=os.getenv("WORK_REPORT_MODEL", "").strip(),
         work_report_chunk_chars=report_limits["WORK_REPORT_CHUNK_CHARS"],
         work_report_max_messages=report_limits["WORK_REPORT_MAX_MESSAGES"],
+        work_report_messages_per_document=report_limits["WORK_REPORT_MESSAGES_PER_DOCUMENT"],
         work_report_timeout_seconds=report_limits["WORK_REPORT_TIMEOUT_SECONDS"],
+        work_report_max_output_tokens=report_limits["WORK_REPORT_MAX_OUTPUT_TOKENS"],
         opencode_go_api_key=os.getenv("OPENCODE_GO_API_KEY", "").strip(),
         opencode_go_base_url=os.getenv("OPENCODE_GO_BASE_URL", "https://opencode.ai/inference/go/openai/v1").strip().rstrip("/"),
         opencode_go_model=os.getenv("OPENCODE_GO_MODEL", "glm-5.3-flash").strip(),
