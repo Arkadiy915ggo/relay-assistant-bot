@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import uuid
 from abc import ABC, abstractmethod
 from typing import Any
 
@@ -33,11 +34,15 @@ class OpenAIClient(LLMClient):
         model: str,
         *,
         base_url: str = "",
+        default_headers: dict[str, str] | None = None,
+        max_output_tokens: int | None = None,
     ) -> None:
         if not api_key and not base_url:
             raise RuntimeError("OPENAI_API_KEY is required for LLM_PROVIDER=openai")
-        self.client = AsyncOpenAI(api_key=api_key or "not-needed", base_url=base_url or None)
+        self.client = AsyncOpenAI(api_key=api_key or "not-needed", base_url=base_url or None,
+                                  default_headers=default_headers)
         self.model = model
+        self.max_output_tokens = max_output_tokens
         self.last_usage: dict[str, int] = {}
         self.last_metadata: dict[str, Any] = {}
 
@@ -65,6 +70,8 @@ class OpenAIClient(LLMClient):
         }
         if response_format == "json":
             request["response_format"] = {"type": "json_object"}
+        if self.max_output_tokens is not None:
+            request["max_tokens"] = self.max_output_tokens
         response = await self.client.chat.completions.create(
             **request,
         )
@@ -75,6 +82,7 @@ class OpenAIClient(LLMClient):
                 "total_tokens": int(response.usage.total_tokens or 0),
             }
         content = response.choices[0].message.content
+        self.last_metadata["finish_reason"] = response.choices[0].finish_reason
         result = content.strip() if content else "Failed to get a response from the model."
         self.last_metadata["output_chars"] = len(result)
         return result
@@ -243,6 +251,7 @@ def build_llm_client(
     provider: str | None = None,
     num_ctx: int | None = None,
     num_predict: int | None = None,
+    max_output_tokens: int | None = None,
 ) -> LLMClient:
     provider = provider or settings.resolved_llm_provider
     if provider == "openai":
@@ -250,6 +259,17 @@ def build_llm_client(
             settings.openai_api_key,
             model or settings.openai_model,
             base_url=settings.openai_base_url,
+            max_output_tokens=max_output_tokens,
+        )
+    elif provider == "opencode_go":
+        if not settings.opencode_go_api_key:
+            raise RuntimeError("OPENCODE_GO_API_KEY is required for opencode_go")
+        client = OpenAIClient(
+            settings.opencode_go_api_key, model or settings.opencode_go_model,
+            base_url=settings.opencode_go_base_url,
+            default_headers={"User-Agent": "relay-assistant-bot/0.1",
+                             "x-opencode-session": str(uuid.uuid4())},
+            max_output_tokens=max_output_tokens,
         )
     elif provider == "ollama":
         client = OllamaClient(

@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import os
 import math
+import json
 from dataclasses import dataclass, field
 from datetime import timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
 
@@ -174,6 +176,24 @@ class Settings:
     tracing_api_key: str = field(default="", repr=False)
     tracing_workspace: str = ""
     tracing_endpoint: str = ""
+    work_reports_enabled: bool = False
+    work_report_chat_ids: set[int] = field(default_factory=set)
+    work_report_chat_start_message_ids: dict[int, int] = field(default_factory=dict)
+    work_report_min_messages: int = 200
+    work_report_chat_min_messages: dict[int, int] = field(default_factory=dict)
+    work_report_hour: int = 18
+    work_report_timezone: str = "UTC"
+    work_report_output_dir: Path = Path("data/work_reports")
+    work_report_provider: str = "ollama"
+    work_report_model: str = ""
+    work_report_chunk_chars: int = 18000
+    work_report_max_messages: int = 5000
+    work_report_messages_per_document: int = 500
+    work_report_timeout_seconds: int = 1800
+    work_report_max_output_tokens: int = 32768
+    opencode_go_api_key: str = field(default="", repr=False)
+    opencode_go_base_url: str = "https://opencode.ai/inference/go/openai/v1"
+    opencode_go_model: str = "glm-5.3-flash"
 
     @property
     def resolved_llm_provider(self) -> str:
@@ -222,7 +242,64 @@ def load_settings() -> Settings:
     if not math.isfinite(chance) or not 0 <= chance <= 1:
         raise RuntimeError("BOT_AUTO_CASINO_CHANCE must be a finite number from 0 through 1")
 
+    report_provider = os.getenv("WORK_REPORT_PROVIDER", "ollama").strip().lower()
+    if report_provider not in {"openai", "ollama", "opencode_go"}:
+        raise RuntimeError("WORK_REPORT_PROVIDER must be openai, ollama, or opencode_go")
+    report_limits = {name: int(os.getenv(name, str(default))) for name, default in (
+        ("WORK_REPORT_MIN_MESSAGES", 200), ("WORK_REPORT_CHUNK_CHARS", 18000),
+        ("WORK_REPORT_MAX_MESSAGES", 5000), ("WORK_REPORT_TIMEOUT_SECONDS", 1800),
+        ("WORK_REPORT_MAX_OUTPUT_TOKENS", 32768),
+        ("WORK_REPORT_MESSAGES_PER_DOCUMENT", 500),
+    )}
+    if any(value <= 0 for value in report_limits.values()):
+        raise RuntimeError("WORK_REPORT limits must be positive")
+    if report_limits["WORK_REPORT_CHUNK_CHARS"] < 1000:
+        raise RuntimeError("WORK_REPORT_CHUNK_CHARS must be at least 1000")
+    report_hour = int(os.getenv("WORK_REPORT_HOUR", "18"))
+    if not 0 <= report_hour <= 23:
+        raise RuntimeError("WORK_REPORT_HOUR must be between 0 and 23")
+    report_timezone = os.getenv("WORK_REPORT_TIMEZONE", "UTC").strip()
+    ZoneInfo(report_timezone)
+    try:
+        overrides = json.loads(os.getenv("WORK_REPORT_CHAT_MIN_MESSAGES", "{}"))
+        if not isinstance(overrides, dict) or any(type(v) is not int for v in overrides.values()):
+            raise ValueError("expected an object with integer thresholds")
+        report_overrides = {int(k): v for k, v in overrides.items()}
+    except (ValueError, TypeError) as exc:
+        raise RuntimeError("WORK_REPORT_CHAT_MIN_MESSAGES must be a JSON chat-id/threshold object") from exc
+    if any(not 1 <= value <= report_limits["WORK_REPORT_MAX_MESSAGES"] for value in
+           [report_limits["WORK_REPORT_MIN_MESSAGES"], *report_overrides.values()]):
+        raise RuntimeError("Work report thresholds must be between 1 and WORK_REPORT_MAX_MESSAGES")
+    try:
+        starts = json.loads(os.getenv("WORK_REPORT_CHAT_START_MESSAGE_IDS", "{}"))
+        if not isinstance(starts, dict) or any(
+            type(value) is not int or not 1 <= value <= 9223372036854775807
+            for value in starts.values()
+        ):
+            raise ValueError("expected positive SQLite integer message IDs")
+        report_starts = {int(chat_id): value for chat_id, value in starts.items()}
+    except (ValueError, TypeError) as exc:
+        raise RuntimeError("WORK_REPORT_CHAT_START_MESSAGE_IDS must be a JSON chat-id/positive-message-id object") from exc
+
     return Settings(
+        work_reports_enabled=_bool(os.getenv("WORK_REPORTS_ENABLED", "false")),
+        work_report_chat_ids=_csv_ints(os.getenv("WORK_REPORT_CHAT_IDS", "")),
+        work_report_chat_start_message_ids=report_starts,
+        work_report_min_messages=report_limits["WORK_REPORT_MIN_MESSAGES"],
+        work_report_chat_min_messages=report_overrides,
+        work_report_hour=report_hour,
+        work_report_timezone=report_timezone,
+        work_report_output_dir=Path(os.getenv("WORK_REPORT_OUTPUT_DIR", "data/work_reports")),
+        work_report_provider=report_provider,
+        work_report_model=os.getenv("WORK_REPORT_MODEL", "").strip(),
+        work_report_chunk_chars=report_limits["WORK_REPORT_CHUNK_CHARS"],
+        work_report_max_messages=report_limits["WORK_REPORT_MAX_MESSAGES"],
+        work_report_messages_per_document=report_limits["WORK_REPORT_MESSAGES_PER_DOCUMENT"],
+        work_report_timeout_seconds=report_limits["WORK_REPORT_TIMEOUT_SECONDS"],
+        work_report_max_output_tokens=report_limits["WORK_REPORT_MAX_OUTPUT_TOKENS"],
+        opencode_go_api_key=os.getenv("OPENCODE_GO_API_KEY", "").strip(),
+        opencode_go_base_url=os.getenv("OPENCODE_GO_BASE_URL", "https://opencode.ai/inference/go/openai/v1").strip().rstrip("/"),
+        opencode_go_model=os.getenv("OPENCODE_GO_MODEL", "glm-5.3-flash").strip(),
         telegram_bot_token=token,
         allowed_chat_ids=_csv_ints(os.getenv("ALLOWED_CHAT_IDS", "")),
         joke_awards_disabled_chat_ids=_csv_ints(os.getenv("JOKE_AWARDS_DISABLED_CHAT_IDS", "")),

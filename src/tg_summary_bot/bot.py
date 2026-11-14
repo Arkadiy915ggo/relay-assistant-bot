@@ -61,6 +61,7 @@ from tg_summary_bot.transcriber import FasterWhisperTranscriber
 from tg_summary_bot.transcript_formatter import TranscriptFormatter
 from tg_summary_bot.video_recognizer import VideoRecognizer
 from tg_summary_bot.web_search import WikipediaSearchClient, format_wiki_results
+from tg_summary_bot.work_reports import WorkReporter, WorkReportWorker, log_report_worker_failure
 from tg_summary_bot.youtube import (
     YouTubeDownloadError,
     download_youtube_video,
@@ -3504,6 +3505,11 @@ async def create_dispatcher(
     async def save_channel_post(message: Message) -> None:
         await save_incoming_message(settings, store, message)
 
+    @dp.message(F.forum_topic_created | F.forum_topic_edited)
+    async def save_forum_topic_event(message: Message) -> None:
+        if is_allowed(settings, message.chat.id):
+            await save_message_topic(store, message)
+
     @dp.message(F.text | F.caption)
     async def save_regular_message(message: Message, bot: Bot) -> None:
         if has_bot_command_entity(message) or (message.text and message.text.startswith("/")):
@@ -3618,6 +3624,24 @@ async def save_incoming_video(settings: Settings, store: MessageStore, message: 
     )
 
 
+async def save_message_topic(store: MessageStore, message: Message) -> int | None:
+    thread_id = getattr(message, "message_thread_id", None)
+    if not thread_id and getattr(message, "forum_topic_created", None):
+        thread_id = message.message_id
+    if not thread_id and getattr(message.chat, "is_forum", False):
+        thread_id = 1  # Telegram's General topic.
+    if thread_id:
+        event = getattr(message, "forum_topic_created", None) or getattr(message, "forum_topic_edited", None)
+        from_root = False
+        root = getattr(message, "reply_to_message", None)
+        if event is None and root and root.message_id == thread_id:
+            event = getattr(root, "forum_topic_created", None)
+            from_root = True
+        if event and event.name:
+            await store.save_forum_topic(message.chat.id, thread_id, event.name, overwrite=not from_root)
+    return thread_id
+
+
 async def save_message_text(
     settings: Settings,
     store: MessageStore,
@@ -3632,6 +3656,7 @@ async def save_message_text(
     limit = settings.max_message_chars if limit_chars is None else limit_chars
     text = " ".join(text.split())[:limit]
     sender_id, name = sender_name(message)
+    thread_id = await save_message_topic(store, message)
     await store.save_message(
         chat_id=message.chat.id,
         message_id=message.message_id,
@@ -3647,6 +3672,7 @@ async def save_message_text(
         ),
         origin=origin,
         kind=kind,
+        message_thread_id=thread_id,
         replace=replace_existing,
     )
 
@@ -3966,6 +3992,19 @@ async def run_bot(settings: Settings) -> None:
 
     logging.info("Bot started with LLM provider: %s", settings.resolved_llm_provider)
     worker_task: asyncio.Task[None] | None = None
+    report_task: asyncio.Task[None] | None = None
+    if settings.work_reports_enabled and settings.work_report_chat_ids:
+        report_worker = WorkReportWorker(
+            settings=settings, store=store, bot=bot, gpu_lock=gpu_lock,
+            reporter=WorkReporter(build_llm_client(
+                settings, provider=settings.work_report_provider,
+                model=settings.work_report_model or None,
+                num_predict=settings.work_report_max_output_tokens,
+                max_output_tokens=settings.work_report_max_output_tokens,
+            ), settings.work_report_chunk_chars),
+        )
+        report_task = asyncio.create_task(report_worker.run())
+        report_task.add_done_callback(log_report_worker_failure)
     if settings.autonomous_jokes_enabled:
         autonomous_selector = JokeSelector(
             build_llm_client(settings, model=settings.autonomous_joke_judge_model or None,
@@ -3986,6 +4025,9 @@ async def run_bot(settings: Settings) -> None:
             tasks_concurrency_limit=POLLING_CONCURRENCY_LIMIT,
         )
     finally:
+        if report_task:
+            report_task.cancel()
+            await asyncio.gather(report_task, return_exceptions=True)
         if worker_task:
             stop_event.set()
             worker_task.cancel()
