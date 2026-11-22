@@ -22,6 +22,7 @@
 | 10, идея / базовый дизайн | [[Features/10 Message Reactions]] | Telegram capabilities и политика чата | Явные и опциональные автоматические реакции. |
 | 11, идея / базовый дизайн | [[Features/11 Proactive Chat Messages]] | Durable scheduler и настройки чата | Редкие уместные сообщения от бота без обращения. |
 | 12, продуктовый трек / базовый дизайн | [[Features/12 Product UX and Portfolio]] | Community-first вижен; стабильный API-only путь | Конструктор навыков/persona/prompts, установка, GUI, onboarding, optional local compute и портфолио PM. |
+| 13, черновой план | [[Features/13 Deployment Environments and Bot Orchestrator]] | Согласование конфигурации и релизной базы; развитие Feature 12 | Версионная поставка, изолированный test, GUI-оркестратор и chat-scoped функции/Markdown-промпты. |
 
 Фичи 1-5 реализованы. Feature 05 включает durable inbox/jobs/outbox, shadow rollout, read-only `/summary` при enabled worker и bot casino; PR 5D prefilter остаётся отложенным до shadow-метрик.
 
@@ -36,6 +37,8 @@ Feature 06 имеет runtime MVP от 2026-10-12 и [standalone prompt](Prompts
 3. Уточнить first-run journey владельца комьюнити и простые chat profiles/toggles из Feature 12.
 4. Проверить реакции и один редкий proactive-сценарий как community-first social capabilities. Поиск и media understanding развивать по реальным запросам чата; документы — по спросу.
 5. Отдельно уточнить будущие сценарии community meetings и fact-based/шуточного разбора споров из Product Vision.
+
+План Feature 13 фиксирует отдельное направление по поставке, тестовому окружению и управлению ботом; его очередность и открытые решения ещё согласуются.
 
 Это предложение по приоритетам, а не обязательство реализовать весь backlog. Для каждой фичи сначала уточняются MVP, ограничения, критерии приёмки и измеримая гипотеза.
 

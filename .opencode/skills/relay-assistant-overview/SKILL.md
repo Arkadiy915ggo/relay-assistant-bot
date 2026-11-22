@@ -81,6 +81,23 @@ If `TRANSCRIPTION_FORMAT_ENABLED=true`, the raw Whisper transcript is sent first
 
 `memory.py` contains `ChatMemory` and `should_use_memory()` for compressing older messages into reusable memory blocks. `config.py` exposes `MEMORY_ENABLED`, `MEMORY_RECENT_PERIOD`, `MEMORY_CHUNK_CHARS`, `MEMORY_MAX_BLOCKS`, and `MEMORY_SEARCH_LIMIT`; `storage.py` has the backing tables and queries.
 
+## Explicit bot startup
+
+- Before starting or restarting the bot, check whether `python -m tg_summary_bot`
+  is already running. The launcher shell and its Python child are one instance,
+  not two bots; inspect PID/PPID when needed.
+- Tell the user before starting it: give the command and whether the process will
+  stay running after the tool call. Use a visible foreground terminal with logs by
+  default. Do not silently detach it with `nohup`, `&`, tmux, or a new service.
+- If no persistent foreground terminal is available, give the user `./run.sh start`
+  to run in their terminal, or ask whether they want a background launch. A general
+  request to start the bot does not by itself request background execution.
+- If the user explicitly requests a background launch, report the confirmed bot
+  PID, launch method, log location, and exact stop command. Clearly say that it is
+  already running and that starting it again would create a second instance.
+- After a start/restart, verify the process and startup logs before claiming it is
+  running. Do not stop or change an existing instance just to document this rule.
+
 ## Verification Commands
 
 - Syntax check: `.venv/bin/python -m compileall src`.
