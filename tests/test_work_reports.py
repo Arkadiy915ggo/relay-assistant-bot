@@ -499,6 +499,19 @@ class ReporterTests(unittest.IsolatedAsyncioTestCase):
         for heading in ("## Art", "## Sound", "## Общий чат / тема не сохранена", "## General", "## Тема #30"):
             self.assertIn(heading.replace("#30", "\\#30"), result)
 
+    async def test_empty_topics_are_omitted_and_all_empty_has_one_summary(self):
+        from tg_summary_bot.work_reports import NO_WORK_FACTS
+        messages = [StoredMessage(mid, 1, "supergroup", 7, "Name", "text", NOW.isoformat(), None,
+                                  "incoming", "text", thread, name)
+                    for mid, thread, name in ((1, 10, "Art"), (2, 20, "Sound"))]
+        llm = SimpleNamespace(complete=AsyncMock(side_effect=[NO_WORK_FACTS, "Краткий итог."]))
+        reporter = WorkReporter(llm, 18000)
+        result = await reporter.summarize(messages)
+        self.assertNotIn("## Art", result)
+        self.assertEqual(result, "## Sound\n\nКраткий итог.")
+        llm.complete = AsyncMock(return_value=NO_WORK_FACTS)
+        self.assertEqual(await reporter.summarize(messages), "За этот период рабочих фактов не обнаружено.")
+
     async def test_topic_names_from_service_events_reply_roots_and_general(self):
         from tg_summary_bot.bot import save_message_topic
         store = SimpleNamespace(save_forum_topic=AsyncMock())
